@@ -1,0 +1,19 @@
+# deps / build
+node_modules/
+dist/
+*.tsbuildinfo
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# data / logs
+data/
+*.log
+
+# claude local
+.claude/settings.local.json
+
+# os
+.DS_Store

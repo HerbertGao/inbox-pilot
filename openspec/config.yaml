@@ -1,0 +1,36 @@
+schema: spec-driven
+
+context: |
+  项目：mail-router（仓库目录 inbox-pilot）——无 GUI 的 AI 邮件路由器后台服务。
+  接入 Gmail + IMAP，轮询未读邮件，用 OpenRouter 做 AI 分类，按优先级执行
+  通知 / 标已读 / 打标签或移动文件夹 / 每日摘要。完整需求见 PROJECT_INIT.md。
+
+  技术栈：
+  - Runtime: Node.js 22 + TypeScript
+  - DB: PostgreSQL 16 + Prisma
+  - IMAP: imapflow | Gmail: googleapis
+  - AI: 只通过 OpenRouter（OpenAI 兼容 SDK），禁止直连 OpenAI/Claude/Gemini
+  - Scheduler: node-cron | Config: dotenv + yaml | Validation: zod | Log: pino
+  - HTTP: fastify | 部署: docker-compose（mail-router + postgres，无 Redis）
+
+  优先级模型：P0 立即通知不标已读 / P1 入摘要不标已读 / P2 标已读入摘要 /
+  P3 静默标已读只计数 / P4 风险邮件立即通知不标已读。
+
+  不可违反的安全约束（规则引擎 > LLM）：
+  - 绝不自动发送/回复邮件。
+  - LLM 只给建议，最终动作由 applySafetyRules 规则引擎决定。
+  - P4、敏感域名（银行/医院/保险/支付/合同）永不自动标已读。
+  - AI 分类失败或 confidence < 0.65 时：降级 P1、不标已读、入摘要。
+  - 所有 provider 原始邮件先转成 NormalizedEmail 再进分类器。
+  - 去重键 (accountId, providerMessageId)；重启不重复处理。
+  - 通知不泄露完整正文；OPENROUTER_API_KEY 等密钥只从环境变量读。
+
+  范围：MVP 不做 GUI、规则学习、向量库、MCP、自动回信、附件深解析、多用户。
+
+rules:
+  proposal:
+    - 始终包含「非目标」部分，明确不纳入 MVP 的能力
+  spec:
+    - 任何涉及标已读/发送动作的需求，必须显式声明规则引擎兜底场景
+  tasks:
+    - 按 PROJECT_INIT.md 的 Phase 1-5 顺序拆分，每个任务可独立验证
