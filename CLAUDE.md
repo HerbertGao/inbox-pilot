@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-inbox-pilot（仓库目录 `inbox-pilot`）：无 GUI 的 AI 邮件路由器后台服务。
+inbox-pilot：无 GUI 的 AI 邮件路由器后台服务。
 
 权威上下文见：
 - **[PROJECT_INIT.md](./PROJECT_INIT.md)** —— 完整需求、数据模型、目录结构、Prompt、验收标准。

@@ -1,7 +1,7 @@
 schema: spec-driven
 
 context: |
-  项目：inbox-pilot（仓库目录 inbox-pilot）——无 GUI 的 AI 邮件路由器后台服务。
+  项目：inbox-pilot——无 GUI 的 AI 邮件路由器后台服务。
   接入 Gmail + IMAP，轮询未读邮件，用 OpenRouter 做 AI 分类，按优先级执行
   通知 / 标已读 / 打标签或移动文件夹 / 每日摘要。完整需求见 PROJECT_INIT.md。
 
