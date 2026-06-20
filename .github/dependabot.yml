@@ -4,9 +4,20 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      # prisma CLI 与 @prisma/client 必须同主版本——分组成一个 PR，杜绝拆开升级导致的 CLI/client 错配。
+      prisma:
+        patterns:
+          - "prisma"
+          - "@prisma/client"
     ignore:
       # @types/node major must track the deployed Node runtime major (Node 24); bump it deliberately with the runtime.
       - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
+      # Prisma major（7+）是 breaking 且需配合 Node 26，留作有计划迁移（见 ROADMAP）；在此之前忽略其 major。
+      - dependency-name: "prisma"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "@prisma/client"
         update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: "/"

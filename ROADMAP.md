@@ -75,3 +75,14 @@
   `never_mark_read_domains` / `security_keywords` / `marketing_keywords`）喂给 `applySafetyRules`；
   失败重试与退避；OpenRouter 超时处理；单账号同步互斥锁；结构化日志完善。
 - **验收**：[PROJECT_INIT.md §19](./PROJECT_INIT.md) 全部验收项通过；改 YAML 即时生效；并发轮询不重入同一账号。
+
+---
+
+## 后续技术演进（非 MVP 阻塞，留作有计划迁移）
+
+- **Prisma 7 + Node 26 升级**：Prisma 7 是 breaking major（新客户端生成模型 / ESM、引擎走 wasm、会拖入
+  `react`/`@types/react` 传递依赖），需改 `prisma/schema.prisma` 的 generator/output、`src/db/prisma.ts`，并随真库验证
+  `prisma migrate`。Prisma 7 才支持 **Node 26**（Node 26 约 2026-10 转 Active LTS）。建议**待 Node 26 转 LTS 后，把
+  「runtime 24→26 + Prisma 6→7」作为一次专门变更一起做**：CLI 与 `@prisma/client` 同步升、跑通迁移与全量测试。
+  在此之前，dependabot 已忽略 Prisma 与 `@types/node` 的 major，并把 `prisma` + `@prisma/client` 分组（见
+  `.github/dependabot.yml`），避免被拆开 auto-bump 推着走。
