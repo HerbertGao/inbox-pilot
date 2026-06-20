@@ -80,9 +80,10 @@
 
 ## 后续技术演进（非 MVP 阻塞，留作有计划迁移）
 
-- **Prisma 7 + Node 26 升级**：Prisma 7 是 breaking major（新客户端生成模型 / ESM、引擎走 wasm、会拖入
+- **Prisma 7 升级（可选与 Node 26 一并做）**：Prisma 7 是 breaking major（新客户端生成模型 / ESM、引擎走 wasm、会拖入
   `react`/`@types/react` 传递依赖），需改 `prisma/schema.prisma` 的 generator/output、`src/db/prisma.ts`，并随真库验证
-  `prisma migrate`。Prisma 7 才支持 **Node 26**（Node 26 约 2026-10 转 Active LTS）。建议**待 Node 26 转 LTS 后，把
-  「runtime 24→26 + Prisma 6→7」作为一次专门变更一起做**：CLI 与 `@prisma/client` 同步升、跑通迁移与全量测试。
-  在此之前，dependabot 已忽略 Prisma 与 `@types/node` 的 major，并把 `prisma` + `@prisma/client` 分组（见
-  `.github/dependabot.yml`），避免被拆开 auto-bump 推着走。
+  `prisma migrate`。Prisma 7 **仍支持当前 LTS**（Node `^20.19`/`^22.12`/`^24`，含现用的 Node 24），并新增对 Node 26 的支持——
+  故 **Prisma 7 迁移在 Node 24 上即可进行，不以 Node 26 为前提**。推迟它纯因其是 breaking major（需专门迁移）；**可选**地
+  与未来 Node 26 升级（Node 26 约 2026-10 转 Active LTS）一并做以减少 churn，但二者**并非互为前提**：CLI 与 `@prisma/client`
+  须同主版本同步升、跑通迁移与全量测试。在此之前，dependabot 已忽略 Prisma 与 `@types/node` 的 major、并把
+  `prisma` + `@prisma/client` 分组（见 `.github/dependabot.yml`），避免被拆开 auto-bump 推着走。
