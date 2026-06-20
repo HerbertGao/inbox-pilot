@@ -51,4 +51,8 @@ export const SENSITIVE_DOMAINS: readonly string[] = [
   'bank.com',
   'hospital.com',
   'insurance.com',
+  // 支付/合同类（硬约束「银行/医院/保险/支付/合同」明列五类，发件域轴需对齐枚举）。
+  // 占位示例，真实/完整名单 P6 YAML 可配（内容轴另由 SECURITY_PAYMENT_KEYWORDS 覆盖）。
+  'payment.com',
+  'contract.com',
 ];

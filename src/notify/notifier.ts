@@ -74,6 +74,16 @@ function projectPayload(decision: FinalDecision, email: NormalizedEmail): Notifi
 }
 
 /**
+ * 渠道 error 在 notifier 边界的脱敏：NotificationChannel 是可注入 seam（telegram 已只产
+ * 安全 token，但未来渠道如 bark 不可信）。只放行紧凑机器安全 token（如 telegram-http-500 /
+ * telegram-fetch-error-TimeoutError），其余一律替换为定值——杜绝渠道把正文/凭据经 error
+ * 字段泄进日志或 mail_actions（硬约束：密钥/正文不入日志）。
+ */
+function sanitizeChannelError(error: string): string {
+  return /^[a-z0-9._-]{1,120}$/i.test(error) ? error : 'notify-channel-error-redacted';
+}
+
+/**
  * 默认 Notifier。选渠道：传入 channel（或默认从 config 构造 telegram）存在 → 推送；
  * 否则降级——记一条结构化日志（不含凭据/正文）并返回 skipped，不抛、不崩。
  *
@@ -106,16 +116,17 @@ export function createNotifier(args?: {
       }
       // 推送失败：不抛、记结构化日志（只含脱敏 error 摘要 + kind/priority/channel），
       // 禁含凭据/正文。终态落 mail_actions 由 executeActions（组 E）负责。
+      const safeError = sanitizeChannelError(result.error);
       logger.warn(
         {
           kind: 'notify-failed',
           channel: channel.name,
           priority: decision.priority,
-          error: result.error,
+          error: safeError,
         },
         '通知推送失败',
       );
-      return { outcome: 'failed', channel: channel.name, error: result.error };
+      return { outcome: 'failed', channel: channel.name, error: safeError };
     },
   };
 }

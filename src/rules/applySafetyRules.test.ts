@@ -173,6 +173,21 @@ test('敏感域名覆盖 P3 的标已读 → shouldMarkRead=false', () => {
   assert.equal(d.shouldMarkRead, false);
 });
 
+test('支付/合同敏感域名（无关键词命中）也覆盖 P2/P3 标已读', () => {
+  // 发件域命中支付/合同类敏感域、但主题/正文无任何关键词 → 仍必须不标已读（硬约束枚举对齐）。
+  const p2 = applySafetyRules(
+    makeEmail({ fromEmail: 'noreply@payment.com', subject: '账户更新' }),
+    makeClassification({ priority: 'P2' }),
+  );
+  const p3 = applySafetyRules(
+    makeEmail({ fromEmail: 'docs@contract.com', subject: 'document ready' }),
+    makeClassification({ priority: 'P3' }),
+  );
+  assert.equal(p2.shouldMarkRead, false);
+  assert.ok(p2.appliedRules.includes('sensitive-domain→no-mark-read'));
+  assert.equal(p3.shouldMarkRead, false);
+});
+
 test('支付/安全关键词（主题）覆盖 P2 标已读 → shouldMarkRead=false', () => {
   const d = applySafetyRules(
     makeEmail({ subject: 'Your invoice is ready' }), // invoice ∈ SECURITY_PAYMENT_KEYWORDS

@@ -16,6 +16,9 @@ export type ChannelSendResult =
 
 const TELEGRAM_API_BASE = 'https://api.telegram.org';
 
+// 单次推送硬超时：Node 全局 fetch 默认无超时，连接卡死会无限挂住动作流水线。
+const TELEGRAM_TIMEOUT_MS = 10_000;
+
 /**
  * 把白名单 payload 渲染为 §13 文案。
  *   P0 → [P0 邮件] subject / 发件人 / 原因 / 分类 / 置信度
@@ -77,6 +80,9 @@ export function createTelegramChannel(args: {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ chat_id: chatId, text }),
+          // 硬超时：超时 → AbortSignal 抛 TimeoutError → 下方 catch 经 errorKind 记
+          // telegram-fetch-error-TimeoutError（不含 token/正文），纳入 executeActions 有界重试。
+          signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
         });
         if (!response.ok) {
           // 只记 HTTP 状态码（不含 token/chat_id/正文/响应体）作为脱敏 error 摘要。
