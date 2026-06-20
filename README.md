@@ -27,7 +27,7 @@ cron 轮询未读 → NormalizedEmail → OpenRouter 分类 → 规则引擎兜�
 
 ## 技术栈
 
-Node.js 22 + TypeScript · PostgreSQL 16 + Prisma · imapflow · googleapis ·
+Node.js 24 + TypeScript · PostgreSQL 16 + Prisma · imapflow · googleapis ·
 OpenRouter（OpenAI 兼容 SDK）· node-cron · zod · pino · fastify。
 
 ## 快速开始
@@ -51,6 +51,7 @@ curl localhost:3000/health  # 两容器就绪后返 {"status":"ok"}（200）
 ### 本地开发（宿主直跑）
 
 ```bash
+nvm use                      # 仓库带 .nvmrc，固定 Node 24（Active LTS）
 pnpm install
 cp .env.example .env         # 确认 DATABASE_URL 指向本机可达的 postgres（localhost 形态）
 docker compose up -d postgres # 仅起 postgres（宿主 5432 被占时加 POSTGRES_HOST_PORT 前缀，并同步改 .env 的端口）
@@ -61,10 +62,12 @@ pnpm dev                      # tsx 起服务；或 pnpm build && pnpm start 跑
 > 完整需求、数据模型、目录结构、分类 Prompt 与验收标准见
 > **[PROJECT_INIT.md](./PROJECT_INIT.md)**；开发约定见 **[CLAUDE.md](./CLAUDE.md)**。
 
-## 开发阶段
+## 开发阶段（详见 [ROADMAP.md](./ROADMAP.md)）
 
-1. IMAP 跑通（拉取未读 → 分类 → 标已读 → 推送）
-2. Gmail 轮询（OAuth → 标签 → 去 UNREAD）
-3. 每日定时摘要
-4. YAML 规则（VIP / 重要域名 / 永不标已读 / 关键词）
-5. 稳定性（重试、去重、超时、互斥锁、结构化日志）
+- **P0** 项目骨架（服务启动 + DB + docker）
+- **P1** 邮件模型 + AI 分类内核（`NormalizedEmail` + OpenRouter 分类，离线可测）
+- **P2** 规则引擎 + 处理流水线 + 通知
+- **P3** IMAP 端到端
+- **P4** Gmail 端到端
+- **P5** 每日定时摘要
+- **P6** YAML 规则 + 稳定性收尾

@@ -4,6 +4,10 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # @types/node major must track the deployed Node runtime major (Node 24); bump it deliberately with the runtime.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

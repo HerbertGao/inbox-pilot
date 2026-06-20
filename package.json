@@ -3,10 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": "^24"
+  },
   "packageManager": "pnpm@10.28.2",
   "scripts": {
     "dev": "tsx src/main.ts",
     "build": "tsc",
+    "test": "tsx --test 'src/**/*.test.ts'",
     "start": "node dist/main.js",
     "postinstall": "prisma generate",
     "migrate": "prisma migrate dev",
@@ -16,11 +20,12 @@
     "@prisma/client": "^6.1.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.2.0",
+    "openai": "^6.44.0",
     "pino": "^10.3.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^22.10.5",
+    "@types/node": "^24",
     "prisma": "^6.1.0",
     "tsx": "^4.19.2",
     "typescript": "^6.0.3"

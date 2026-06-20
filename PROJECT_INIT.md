@@ -59,7 +59,7 @@
 优先使用：
 
 ```text
-Node.js 22 + TypeScript
+Node.js 24 + TypeScript
 ```
 
 原因：
@@ -72,7 +72,7 @@ Node.js 22 + TypeScript
 ### 3.2 核心依赖建议
 
 ```text
-Runtime: Node.js 22
+Runtime: Node.js 24
 Language: TypeScript
 Database: PostgreSQL 16
 ORM: Prisma

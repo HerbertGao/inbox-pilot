@@ -6,7 +6,7 @@ context: |
   通知 / 标已读 / 打标签或移动文件夹 / 每日摘要。完整需求见 PROJECT_INIT.md。
 
   技术栈：
-  - Runtime: Node.js 22 + TypeScript
+  - Runtime: Node.js 24 + TypeScript
   - DB: PostgreSQL 16 + Prisma
   - IMAP: imapflow | Gmail: googleapis
   - AI: 只通过 OpenRouter（OpenAI 兼容 SDK），禁止直连 OpenAI/Claude/Gemini
