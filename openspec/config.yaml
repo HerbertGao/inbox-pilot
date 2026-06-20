@@ -30,7 +30,7 @@ context: |
 rules:
   proposal:
     - 始终包含「非目标」部分，明确不纳入 MVP 的能力
-  spec:
+  specs:
     - 任何涉及标已读/发送动作的需求，必须显式声明规则引擎兜底场景
   tasks:
     - 按 PROJECT_INIT.md 的 Phase 1-5 顺序拆分，每个任务可独立验证
