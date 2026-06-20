@@ -19,4 +19,7 @@ jobs:
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec prisma validate
+        # prisma validate resolves env("DATABASE_URL") but does not connect; a placeholder satisfies it.
+        env:
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
       - run: pnpm build
