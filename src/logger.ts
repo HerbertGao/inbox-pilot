@@ -21,6 +21,10 @@ export const logger = pino({
       '*.GMAIL_CLIENT_SECRET',
       'TELEGRAM_BOT_TOKEN',
       '*.TELEGRAM_BOT_TOKEN',
+      // CHAT_ID 非密钥（泄露无法冒充 bot），但 notifications spec 把 TELEGRAM_* 并列为凭据、
+      // 要求失败日志禁含；当前 chat_id 结构上不入任何日志，此处为与 spec 措辞一致的兜底。
+      'TELEGRAM_CHAT_ID',
+      '*.TELEGRAM_CHAT_ID',
     ],
     censor: '[REDACTED]',
   },
