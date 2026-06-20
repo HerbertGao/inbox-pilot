@@ -32,15 +32,33 @@ OpenRouter（OpenAI 兼容 SDK）· node-cron · zod · pino · fastify。
 
 ## 快速开始
 
+P0 必需变量仅 `DATABASE_URL`（须为合法 `postgresql://` / `postgres://` 连接串）；
+缺失或 scheme 非法即 fail-fast 退出。`.env.example` 里的后续阶段变量（OPENROUTER /
+GMAIL / TELEGRAM / BARK / POLL / DIGEST）P0 可留空。宿主侧命令一律用 `localhost`
+形态的 `DATABASE_URL`；docker compose 下 app 容器会自动覆盖为 `@postgres:5432`。
+
+### 一键起（docker compose）
+
 ```bash
-pnpm install
-cp .env.example .env        # 填 OPENROUTER_API_KEY、DATABASE_URL、通知渠道等
-docker compose up -d postgres
-npx prisma migrate dev
-pnpm dev
+cp .env.example .env        # P0 只需 DATABASE_URL；其余阶段变量可留空
+docker compose up -d        # 起 postgres + mail-router，entrypoint 自动 migrate deploy
+curl localhost:3000/health  # 两容器就绪后返 {"status":"ok"}（200）
 ```
 
-> 项目脚手架尚未生成。完整需求、数据模型、目录结构、分类 Prompt 与验收标准见
+> 若宿主 5432 已被占用，用 `POSTGRES_HOST_PORT` 覆盖 postgres 的宿主端口：
+> `POSTGRES_HOST_PORT=55432 docker compose up -d`（app 容器内部仍连 `postgres:5432`，不受影响）。
+
+### 本地开发（宿主直跑）
+
+```bash
+pnpm install
+cp .env.example .env         # 确认 DATABASE_URL 指向本机可达的 postgres（localhost 形态）
+docker compose up -d postgres # 仅起 postgres（宿主 5432 被占时加 POSTGRES_HOST_PORT 前缀，并同步改 .env 的端口）
+pnpm migrate                  # = prisma migrate dev，建 5 张表
+pnpm dev                      # tsx 起服务；或 pnpm build && pnpm start 跑生产 ESM 路径
+```
+
+> 完整需求、数据模型、目录结构、分类 Prompt 与验收标准见
 > **[PROJECT_INIT.md](./PROJECT_INIT.md)**；开发约定见 **[CLAUDE.md](./CLAUDE.md)**。
 
 ## 开发阶段

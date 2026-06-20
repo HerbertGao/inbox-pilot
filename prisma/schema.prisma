@@ -1,0 +1,92 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model MailAccount {
+  id             String   @id @default(cuid())
+  provider       String
+  email          String
+  authJson       Json
+  lastSyncCursor String?
+  enabled        Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  messages       MailMessage[]
+
+  @@map("mail_accounts")
+}
+
+model MailMessage {
+  id                String   @id @default(cuid())
+  accountId         String
+  providerMessageId String
+  messageId         String?
+  threadId          String?
+  uid               Int?
+  subject           String
+  fromEmail         String
+  fromName          String?
+  receivedAt        DateTime
+  snippet           String?
+  bodyText          String?
+  bodyHash          String?
+  hasAttachments    Boolean  @default(false)
+  isRead            Boolean  @default(false)
+  processedAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  account           MailAccount @relation(fields: [accountId], references: [id])
+  classifications   MailClassification[]
+  actions           MailAction[]
+  digestItems       DigestItem[]
+
+  @@unique([accountId, providerMessageId])
+  @@map("mail_messages")
+}
+
+model MailClassification {
+  id          String   @id @default(cuid())
+  messageId   String
+  priority    String
+  category    String
+  confidence  Float
+  reason      String
+  rawAiJson   Json
+  createdAt   DateTime @default(now())
+
+  message     MailMessage @relation(fields: [messageId], references: [id])
+
+  @@map("mail_classifications")
+}
+
+model MailAction {
+  id         String   @id @default(cuid())
+  messageId  String
+  actionType String
+  status     String   @default("pending")
+  error      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  message    MailMessage @relation(fields: [messageId], references: [id])
+
+  @@map("mail_actions")
+}
+
+model DigestItem {
+  id         String    @id @default(cuid())
+  messageId  String
+  digestType String
+  sentAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  message    MailMessage @relation(fields: [messageId], references: [id])
+
+  @@map("digest_items")
+}
