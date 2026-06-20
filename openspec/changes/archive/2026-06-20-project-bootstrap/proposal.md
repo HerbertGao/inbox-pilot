@@ -13,7 +13,7 @@
 - 落地 Prisma 数据模型与首次 migration（PROJECT_INIT §8 的 5 张表），单例 Prisma 客户端（`src/db/prisma.ts`）。
 - 接入结构化日志 pino。
 - 提供最小 fastify 服务与 `/health` 健康检查（`src/main.ts`）。
-- 提供 `Dockerfile` 与 `docker-compose.yml`（mail-router + postgres，无 Redis）。
+- 提供 `Dockerfile` 与 `docker-compose.yml`（inbox-pilot + postgres，无 Redis）。
 - 提供 `.env.example`。
 
 ## 功能 (Capabilities)

@@ -1,4 +1,4 @@
-# mail-router
+# inbox-pilot
 
 无 GUI 的 AI 邮件路由器。接入 **Gmail + IMAP**，定时轮询未读邮件，用
 **OpenRouter** 做 AI 分类，按优先级执行通知、标已读、打标签/移动文件夹和每日摘要。
@@ -41,7 +41,7 @@ GMAIL / TELEGRAM / BARK / POLL / DIGEST）P0 可留空。宿主侧命令一律�
 
 ```bash
 cp .env.example .env        # P0 只需 DATABASE_URL；其余阶段变量可留空
-docker compose up -d        # 起 postgres + mail-router，entrypoint 自动 migrate deploy
+docker compose up -d        # 起 postgres + inbox-pilot，entrypoint 自动 migrate deploy
 curl localhost:3000/health  # 两容器就绪后返 {"status":"ok"}（200）
 ```
 

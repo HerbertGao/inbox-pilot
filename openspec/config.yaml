@@ -1,7 +1,7 @@
 schema: spec-driven
 
 context: |
-  项目：mail-router（仓库目录 inbox-pilot）——无 GUI 的 AI 邮件路由器后台服务。
+  项目：inbox-pilot——无 GUI 的 AI 邮件路由器后台服务。
   接入 Gmail + IMAP，轮询未读邮件，用 OpenRouter 做 AI 分类，按优先级执行
   通知 / 标已读 / 打标签或移动文件夹 / 每日摘要。完整需求见 PROJECT_INIT.md。
 
@@ -11,7 +11,7 @@ context: |
   - IMAP: imapflow | Gmail: googleapis
   - AI: 只通过 OpenRouter（OpenAI 兼容 SDK），禁止直连 OpenAI/Claude/Gemini
   - Scheduler: node-cron | Config: dotenv + yaml | Validation: zod | Log: pino
-  - HTTP: fastify | 部署: docker-compose（mail-router + postgres，无 Redis）
+  - HTTP: fastify | 部署: docker-compose（inbox-pilot + postgres，无 Redis）
 
   优先级模型：P0 立即通知不标已读 / P1 入摘要不标已读 / P2 标已读入摘要 /
   P3 静默标已读只计数 / P4 风险邮件立即通知不标已读。

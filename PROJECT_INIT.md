@@ -7,7 +7,7 @@
 
 ## 1. 项目目标
 
-构建一个轻量级后台服务 `mail-router`，用于接入 Gmail 与普通 IMAP 邮箱，对新邮件进行 AI 分类，并根据分类结果执行通知、标记已读、打标签/移动文件夹、定时摘要等动作。
+构建一个轻量级后台服务 `inbox-pilot`，用于接入 Gmail 与普通 IMAP 邮箱，对新邮件进行 AI 分类，并根据分类结果执行通知、标记已读、打标签/移动文件夹、定时摘要等动作。
 
 第一版不做完整邮箱客户端，不做 GUI，不做规则学习，不做自动回复。重点是：
 
@@ -90,7 +90,7 @@ HTTP Server: Fastify or Express
 
 ```text
 Docker Compose
-├── mail-router
+├── inbox-pilot
 └── postgres
 ```
 
@@ -112,7 +112,7 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_MODEL=google/gemini-2.5-flash-lite
 OPENROUTER_FALLBACK_MODEL=openai/gpt-4o-mini
 OPENROUTER_SITE_URL=http://localhost:3000
-OPENROUTER_APP_NAME=mail-router
+OPENROUTER_APP_NAME=inbox-pilot
 ```
 
 模型名可以先用便宜、速度快、结构化输出稳定的模型。后续可通过 OpenRouter Models API 查询可用模型和价格。
@@ -131,7 +131,7 @@ export const openrouter = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY,
   defaultHeaders: {
     'HTTP-Referer': process.env.OPENROUTER_SITE_URL ?? 'http://localhost:3000',
-    'X-Title': process.env.OPENROUTER_APP_NAME ?? 'mail-router',
+    'X-Title': process.env.OPENROUTER_APP_NAME ?? 'inbox-pilot',
   },
 })
 ```
@@ -418,7 +418,7 @@ model DigestItem {
 ## 9. 项目目录结构
 
 ```text
-mail-router/
+inbox-pilot/
 ├── src/
 │   ├── accounts/
 │   │   └── accountService.ts
@@ -678,9 +678,9 @@ P3 广告营销：26 封，已静默标记已读
 version: "3.9"
 
 services:
-  mail-router:
+  inbox-pilot:
     build: .
-    container_name: mail-router
+    container_name: inbox-pilot
     env_file:
       - .env
     depends_on:
@@ -689,7 +689,7 @@ services:
 
   postgres:
     image: postgres:16
-    container_name: mail-router-postgres
+    container_name: inbox-pilot-postgres
     environment:
       POSTGRES_DB: mail_router
       POSTGRES_USER: mail_router
@@ -714,7 +714,7 @@ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 OPENROUTER_MODEL=google/gemini-2.5-flash-lite
 OPENROUTER_FALLBACK_MODEL=openai/gpt-4o-mini
 OPENROUTER_SITE_URL=http://localhost:3000
-OPENROUTER_APP_NAME=mail-router
+OPENROUTER_APP_NAME=inbox-pilot
 
 GMAIL_CLIENT_ID=
 GMAIL_CLIENT_SECRET=
@@ -786,8 +786,8 @@ DIGEST_TIMES=12:30,21:30
 ### 17.1 初始化命令
 
 ```bash
-mkdir mail-router
-cd mail-router
+mkdir inbox-pilot
+cd inbox-pilot
 pnpm init
 pnpm add typescript tsx dotenv zod pino yaml node-cron prisma @prisma/client imapflow googleapis openai fastify
 pnpm add -D @types/node
