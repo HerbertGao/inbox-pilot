@@ -569,6 +569,7 @@ if (classification.priority === 'P4') {
 }
 
 if (classification.confidence < 0.65) {
+  // 注：验证码(P0)/P4(风险) 等安全强制不被 confidence<0.65 下调（见 safety-rules 规范的安全细化）——本伪码仅为顺序示意。
   forcePriority('P1')
   forceDoNotMarkRead()
   includeDigest()

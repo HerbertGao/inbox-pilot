@@ -59,6 +59,13 @@ export const configSchema = z.object({
   OPENROUTER_SITE_URL: z.preprocess(emptyToUndefined, z.string().default('http://localhost:3000')),
   OPENROUTER_APP_NAME: z.preprocess(emptyToUndefined, z.string().default('inbox-pilot')),
   OPENROUTER_API_KEY: z.string().optional(),
+  // P2 通知渠道（telegram）：两者都裸 .optional()（无默认），落在 P0「后续阶段
+  // 变量可选」范围内，不破坏「仅 DATABASE_URL 必需」。两者全齐 → notifier 选
+  // telegram；缺则降级记日志（不崩）。凭据只从此处读、禁写死、不入日志
+  // （TELEGRAM_BOT_TOKEN 已在 logger redact 名单，见 src/logger.ts）。
+  // bark 作为后续可选渠道，本期不引入 BARK_*。
+  TELEGRAM_BOT_TOKEN: z.string().optional(),
+  TELEGRAM_CHAT_ID: z.string().optional(),
 });
 
 export type Config = Readonly<z.infer<typeof configSchema>>;
