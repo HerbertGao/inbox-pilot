@@ -60,11 +60,11 @@ P0 必需变量集必须**仅**为：`DATABASE_URL`（无默认值，缺失即 f
 - **那么** 写入日志的内容禁止包含连接串或口令明文，禁止直接记录原始 Prisma 错误对象或连接串
 
 ### 需求:容器化运行
-项目必须提供 Dockerfile 与 docker-compose.yml，一键启动 mail-router 与 postgres 两个服务（不含 Redis，不含已废弃的 `version:` 键）。app 容器必须发布端口供宿主访问；postgres 必须配置 healthcheck（`pg_isready`），app 必须 `depends_on: condition: service_healthy`；容器 entrypoint 必须先执行 `prisma migrate deploy`（fail-fast）再启动服务。
+项目必须提供 Dockerfile 与 docker-compose.yml，一键启动 inbox-pilot 与 postgres 两个服务（不含 Redis，不含已废弃的 `version:` 键）。app 容器必须发布端口供宿主访问；postgres 必须配置 healthcheck（`pg_isready`），app 必须 `depends_on: condition: service_healthy`；容器 entrypoint 必须先执行 `prisma migrate deploy`（fail-fast）再启动服务。
 
 #### 场景:一键启动
 - **当** 在配置好 `.env` 的环境执行 `docker compose up`（迁移可成功的前提下）
-- **那么** mail-router 与 postgres 容器必须于合理时间内进入 running（非 restarting）状态，迁移成功，5 张表存在，且从宿主请求 `/health` 返回 200（迁移持续失败属下一场景的 crash-loop，不计入本场景）
+- **那么** inbox-pilot 与 postgres 容器必须于合理时间内进入 running（非 restarting）状态，迁移成功，5 张表存在，且从宿主请求 `/health` 返回 200（迁移持续失败属下一场景的 crash-loop，不计入本场景）
 
 #### 场景:迁移失败时不以半启动状态对外服务
 - **当** `prisma migrate deploy` 在 entrypoint 中失败

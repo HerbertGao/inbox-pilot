@@ -57,7 +57,7 @@ export const configSchema = z.object({
   OPENROUTER_MODEL: z.preprocess(emptyToUndefined, z.string().default('google/gemini-2.5-flash-lite')),
   OPENROUTER_FALLBACK_MODEL: z.preprocess(emptyToUndefined, z.string().default('openai/gpt-4o-mini')),
   OPENROUTER_SITE_URL: z.preprocess(emptyToUndefined, z.string().default('http://localhost:3000')),
-  OPENROUTER_APP_NAME: z.preprocess(emptyToUndefined, z.string().default('mail-router')),
+  OPENROUTER_APP_NAME: z.preprocess(emptyToUndefined, z.string().default('inbox-pilot')),
   OPENROUTER_API_KEY: z.string().optional(),
 });
 

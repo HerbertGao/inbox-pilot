@@ -2,7 +2,7 @@
 
 仓库目前只有文档（PROJECT_INIT、README、ROADMAP）。P0 要立起一个可运行的服务骨架，
 作为 P1–P6 的共同地基。技术栈已定（见 config.yaml）：Node 22 + TS + Prisma + fastify +
-pino + zod，docker-compose 跑 mail-router + postgres。本期不含任何业务逻辑。
+pino + zod，docker-compose 跑 inbox-pilot + postgres。本期不含任何业务逻辑。
 
 ## 目标 / 非目标
 

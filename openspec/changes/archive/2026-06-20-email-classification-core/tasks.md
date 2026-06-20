@@ -7,7 +7,7 @@
 ## 1. 依赖与脚手架
 
 - [x] 1.1 安装运行依赖 `openai`（仅指向 OpenRouter base URL）；zod 已在 P0 装好。测试用 Node 内置 `node:test` + 已装的 `tsx`，**无新测试依赖**
-- [x] 1.2 扩展 P0 `config` schema 加 6 个 `OPENROUTER_*`：`OPENROUTER_BASE_URL`/`OPENROUTER_MODEL`/`OPENROUTER_FALLBACK_MODEL`/`OPENROUTER_SITE_URL`/`OPENROUTER_APP_NAME` 用 `.default()` 带 §4.1 默认值（`https://openrouter.ai/api/v1`/`google/gemini-2.5-flash-lite`/`openai/gpt-4o-mini`/`http://localhost:3000`/`mail-router`，使模型/baseURL 恒有值）；**仅 `OPENROUTER_API_KEY` 裸 `.optional()`**（无默认，缺失走安全默认）。带默认的 optional 仍是「可选」，落在 P0「后续阶段变量可选」允许范围内，service-bootstrap 规范需求不变、无需增量规范；确认 logger `redact` 覆盖 `OPENROUTER_API_KEY`
+- [x] 1.2 扩展 P0 `config` schema 加 6 个 `OPENROUTER_*`：`OPENROUTER_BASE_URL`/`OPENROUTER_MODEL`/`OPENROUTER_FALLBACK_MODEL`/`OPENROUTER_SITE_URL`/`OPENROUTER_APP_NAME` 用 `.default()` 带 §4.1 默认值（`https://openrouter.ai/api/v1`/`google/gemini-2.5-flash-lite`/`openai/gpt-4o-mini`/`http://localhost:3000`/`inbox-pilot`，使模型/baseURL 恒有值）；**仅 `OPENROUTER_API_KEY` 裸 `.optional()`**（无默认，缺失走安全默认）。带默认的 optional 仍是「可选」，落在 P0「后续阶段变量可选」允许范围内，service-bootstrap 规范需求不变、无需增量规范；确认 logger `redact` 覆盖 `OPENROUTER_API_KEY`
 - [x] 1.3 测试运行器：`package.json` 加 `"test": "tsx --test 'src/**/*.test.ts'"`；`tsconfig.json` `exclude` 追加 `src/**/*.test.ts`（避免测试文件编进 `dist`）。ponytail：stdlib `node:test` + 已装 `tsx`，不引 vitest/jest
 
 ## 2. 邮件模型 email-model
