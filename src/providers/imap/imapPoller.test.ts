@@ -38,6 +38,14 @@ import { SENSITIVE_DOMAINS } from '../../rules/lists.js';
 
 const ACCOUNT_ID = 'imap:u@h';
 
+// 新建并先锚定账号的 repo——镜像生产流程（main.ts：ensureAccountAnchor → 才轮询），
+// 也满足 setCursor 与 Prisma 一致的「未锚定即抛」契约。
+async function makeRepo(): Promise<InMemoryMailRepo> {
+  const r = new InMemoryMailRepo();
+  await r.ensureAccountAnchor({ accountId: ACCOUNT_ID, email: 'u@h' });
+  return r;
+}
+
 /**
  * 可配假连接：
  *  - status：openInbox 返回的 uidValidity/uidNext（每轮可改以模拟 UIDVALIDITY 重置 / 缺 UIDNEXT）。
@@ -178,7 +186,7 @@ test('首轮（无游标）→ SEARCH UNSEEN、未读进流水线、游标写 ui
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
   conn.setMessage(fetched(8));
   conn.setMessage(fetched(10));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps, provider } = makeDeps(conn, repo, classify);
 
@@ -201,7 +209,7 @@ test('首轮（无游标）→ SEARCH UNSEEN、未读进流水线、游标写 ui
 test('含 Message-ID → 跨轮稳定去重：同邮件第二轮经 dedup 跳过、不再 classify', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 10 });
   conn.setMessage(fetched(9, { messageId: '  <stable@id>  ' })); // 含首尾空白，规范化后稳定。
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -224,7 +232,7 @@ test('显示名形态发件人 → fromEmail 裸地址 u@bank.com 并触发敏�
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 7 });
   // 模拟 envelope.from[0] = { name:'客服', address:'u@bank.com' }（imapClient 已拆裸地址）。
   conn.setMessage(fetched(6, { fromName: '客服', fromEmail: `u@${SENSITIVE_DOMAINS[0]}` }));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
   const { deps, provider } = makeDeps(conn, repo, classify);
 
@@ -249,7 +257,7 @@ test('单封 normalize 抛出被跳过、其余照常（游标停在失败封前
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 12 });
   conn.setMessage(fetched(9, { subject: 'POISON_NORMALIZE' }));
   conn.setMessage(fetched(11));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const provider = new FakeProviderActions();
   const notifier = createNotifier({ channel: noopChannel() });
@@ -282,7 +290,7 @@ test('全空白 Message-ID → 回退 UID 合成键 imap-uid:<uidValidity>-<uid>
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 16 });
   conn.setMessage(fetched(13, { messageId: '   ' })); // 全空白 Message-ID → 规范化后回退 UID 合成键（仍合法）。
   conn.setMessage(fetched(15));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -302,7 +310,7 @@ test('全空白 Message-ID → 回退 UID 合成键 imap-uid:<uidValidity>-<uid>
 test('已处理邮件下轮不再被 FETCH：增量 SEARCH `UID 游标+1:*` 不含它', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
   conn.setMessage(fetched(10));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -337,7 +345,7 @@ test('失败邮件下轮重取：游标停在失败封前、其后已处理者 d
     }
     return conn.messages.get(uid) ?? null;
   };
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -368,7 +376,7 @@ test('失败邮件下轮重取：游标停在失败封前、其后已处理者 d
 test('UIDVALIDITY 变化 → 退化 SEARCH UNSEEN、重写当前 uidValidity、下轮回增量分支', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
   conn.setMessage(fetched(10));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -401,7 +409,7 @@ test('UIDVALIDITY 变化 → 退化 SEARCH UNSEEN、重写当前 uidValidity、�
 test('UIDVALIDITY 重置 + UNSEEN 空集 → 游标 当前uidValidity:UIDNEXT-1、下轮进增量分支（不永久 UNSEEN）', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
   conn.setMessage(fetched(10));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
   await pollOnce(ACCOUNT_ID, deps); // 游标 5:10。
@@ -430,7 +438,7 @@ test('mailboxOpen 缺 UIDNEXT + 退化轮有取回 → 游标=取回连续高水
   const conn = new FakeConnection({ uidValidity: 5 }); // 无 uidNext。
   conn.setMessage(fetched(8));
   conn.setMessage(fetched(9));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -443,7 +451,7 @@ test('mailboxOpen 缺 UIDNEXT + 退化轮有取回 → 游标=取回连续高水
 
 test('mailboxOpen 缺 UIDNEXT + 退化轮空集 → 游标 uidValidity:0（不写 NaN）', async () => {
   const conn = new FakeConnection({ uidValidity: 5 }); // 无 uidNext、无消息。
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -462,7 +470,7 @@ test('畸形游标（如 "5:"、":5"、"1.5:2"、"1e3:5"、"abc:def"）→ 拒�
   for (const bad of ['5:', ':5', '1.5:2', '1e3:5', 'abc:def', '']) {
     const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
     conn.setMessage(fetched(10));
-    const repo = new InMemoryMailRepo();
+    const repo = await makeRepo();
     await repo.setCursor(ACCOUNT_ID, bad); // 预置畸形游标。
     const classify = makeClassifySpy(makeClassification());
     const { deps } = makeDeps(conn, repo, classify);
@@ -476,7 +484,7 @@ test('畸形游标（如 "5:"、":5"、"1.5:2"、"1e3:5"、"abc:def"）→ 拒�
 test('合法 floor-④ 游标 "<uv>:0" → 被接受 → 增量轮 SEARCH `UID 1:*`', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
   conn.setMessage(fetched(10));
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   await repo.setCursor(ACCOUNT_ID, '5:0'); // 合法 floor-④ 游标（uid=0）。
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
@@ -495,7 +503,7 @@ test('expunge 空洞（取回区间缺某 UID）→ 高水位按取回序列推�
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 14 });
   conn.setMessage(fetched(11));
   conn.setMessage(fetched(13)); // 12 缺失（expunge）。
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   await repo.setCursor(ACCOUNT_ID, '5:10'); // 预置增量游标。
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
@@ -524,7 +532,7 @@ test('poison 邮件（某 UID 持续失败）→ 游标钉在其前、每轮重�
     }
     return conn.messages.get(uid) ?? null;
   };
-  const repo = new InMemoryMailRepo();
+  const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
@@ -548,7 +556,6 @@ test('poison 邮件（某 UID 持续失败）→ 游标钉在其前、每轮重�
 test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取重跑、无孤儿行', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 16 });
   conn.setMessage(fetched(15));
-  const repo = new InMemoryMailRepo();
   const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
 
   // 第一轮：模拟标已读后、markProcessed 前崩溃——用一个在 markProcessed 抛的 repo 包装。
@@ -562,6 +569,7 @@ test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取�
     }
   }
   const crashRepo = new CrashAfterMarkReadRepo();
+  await crashRepo.ensureAccountAnchor({ accountId: ACCOUNT_ID, email: 'u@h' });
   const provider = new FakeProviderActions();
   const notifier = createNotifier({ channel: noopChannel() });
   const deps1: PollDeps = {

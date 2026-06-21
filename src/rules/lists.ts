@@ -6,6 +6,8 @@
 // 关键词大小写：匹配方应在 applySafetyRules（组 B）里对主题/正文与关键词同做
 // 小写归一后比较；此处常量统一以小写英文给出，中文不区分大小写。
 
+import type { Classification } from '../classifier/schema.js';
+
 /**
  * 验证码关键词。主题命中→强制 P0（仅主题，对齐 §12 subjectContainsVerificationCode）；
  * 正文命中→走「强制不标已读护栏」，不强制 P0。
@@ -67,12 +69,11 @@ export const SECURITY_PAYMENT_KEYWORDS: readonly string[] = [
  *   - finance：银行类；security：安全类；transaction：支付/交易类。
  * 概率性广覆盖（召回广但非确定）——与 SECURITY_PAYMENT_KEYWORDS 的确定性兜底分层互补。
  * 医院/保险无对应类别枚举，由上面的关键词轴确定性守住，**不在此集合**。
+ * 类型绑定到 `Classification['category']`：非法/拼错的类别值编译期即报错（守护此关键名单）。
  */
-export const SENSITIVE_CATEGORIES: ReadonlySet<string> = new Set([
-  'finance',
-  'security',
-  'transaction',
-]);
+export const SENSITIVE_CATEGORIES: ReadonlySet<Classification['category']> = new Set<
+  Classification['category']
+>(['finance', 'security', 'transaction']);
 
 /**
  * 敏感发件域名（银行/医院/保险/支付/合同类）。发件域命中 → 强制

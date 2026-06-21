@@ -84,6 +84,11 @@ export class InMemoryMailRepo implements MailRepo {
   }
 
   async setCursor(accountId: string, cursor: string): Promise<void> {
+    // 与 PrismaMailRepo.setCursor（update→未知账号即抛）保持契约一致：未锚定即抛，
+    // 使「漏调 ensureAccountAnchor」在测试就暴露、而非到生产才报。
+    if (!this.cursorsByAccountId.has(accountId)) {
+      throw new Error(`InMemoryMailRepo.setCursor: 未锚定的 accountId ${accountId}`);
+    }
     this.cursorsByAccountId.set(accountId, cursor);
   }
 
