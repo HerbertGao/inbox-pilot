@@ -14,7 +14,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { applySafetyRules } from './applySafetyRules.js';
-import { SENSITIVE_DOMAINS, SECURITY_PAYMENT_KEYWORDS } from './lists.js';
+import {
+  SENSITIVE_DOMAINS,
+  SECURITY_PAYMENT_KEYWORDS,
+  SENSITIVE_CATEGORIES,
+} from './lists.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 
@@ -238,6 +242,128 @@ test('敏感域名带尖括号/显示名形态 "Name <u@bank.com>" 也命中 →
   );
   assert.equal(d.shouldMarkRead, false);
   assert.ok(d.appliedRules.includes('sensitive-domain→no-mark-read'));
+});
+
+// ——————————————————————————————————————————————————————————
+// 类别轴：finance/security/transaction 覆盖 P2/P3 的标已读（无需域名表）
+// ——————————————————————————————————————————————————————————
+
+test('类别轴 finance（P3 银行营销邮件）→ 不标已读（无需发件域命中白名单）', () => {
+  // 发件域非敏感、主题/正文无任何关键词，仅靠 LLM 透传 category=finance。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'promo@some-bank-marketing.example', subject: '本月理财活动' }),
+    makeClassification({ priority: 'P3', category: 'finance' }),
+  );
+  assert.equal(d.priority, 'P3'); // 优先级不变，仅护栏改 shouldMarkRead
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+test('类别轴 transaction（P2）→ 不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'noreply@shop.example', subject: '您的订单已发货' }),
+    makeClassification({ priority: 'P2', category: 'transaction' }),
+  );
+  assert.equal(d.priority, 'P2');
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+test('类别轴 security（P3）→ 不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'alerts@svc.example', subject: '账户活动通知' }),
+    makeClassification({ priority: 'P3', category: 'security' }),
+  );
+  assert.equal(d.priority, 'P3');
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+test('SENSITIVE_CATEGORIES 每个成员（P2）→ 不标已读（防漏类别静默破坏护栏）', () => {
+  for (const category of SENSITIVE_CATEGORIES) {
+    const d = applySafetyRules(
+      makeEmail({ fromEmail: 'x@non-sensitive.example' }),
+      makeClassification({ priority: 'P2', category: category as Classification['category'] }),
+    );
+    assert.equal(d.shouldMarkRead, false, `category=${category} 应不标已读`);
+    assert.ok(
+      d.appliedRules.includes('sensitive-category→no-mark-read'),
+      `category=${category} 应命中类别轴`,
+    );
+  }
+});
+
+test('非敏感类别（work，无任何关键词/域名命中）的 P2 → 仍标已读（类别轴不误伤）', () => {
+  // 确保类别轴只在敏感类别命中，非敏感类别保持 §5 默认（P2 标已读）。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'colleague@company.example', subject: '周会纪要' }),
+    makeClassification({ priority: 'P2', category: 'work' }),
+  );
+  assert.equal(d.shouldMarkRead, true);
+  assert.ok(!d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+// ——————————————————————————————————————————————————————————
+// 医院/保险关键词轴：非敏感类别 + conf≥0.65 + P2/P3 仍不标已读（确定性兜底硬约束）
+// ——————————————————————————————————————————————————————————
+
+// 代表性医院/保险关键词（spec 场景明列）。逐词断言：漏掉任一词 → 静默破坏硬约束。
+const HOSPITAL_INSURANCE_KEYWORDS = [
+  '医院',
+  '医疗',
+  '挂号',
+  '病历',
+  '诊断',
+  '保险',
+  '保单',
+  '理赔',
+  'hospital',
+  'clinic',
+  'medical',
+  'insurance',
+] as const;
+
+test('医院/保险关键词（主题，类别=personal/work 非敏感、conf≥0.65、P2/P3）→ 不标已读', () => {
+  // 关键先决：类别非敏感（不靠类别轴）、置信高（不降 P1）、P2/P3（默认会标已读）。
+  // 仅靠确定性关键词轴守住硬约束。逐词覆盖，防漏词。
+  for (const kw of HOSPITAL_INSURANCE_KEYWORDS) {
+    const d = applySafetyRules(
+      makeEmail({ subject: `关于您的${kw}事项`, fromEmail: 'info@non-sensitive.example' }),
+      makeClassification({ priority: 'P2', category: 'personal', confidence: 0.9 }),
+    );
+    assert.equal(d.priority, 'P2', `kw=${kw} 优先级应保持 P2（conf≥0.65 不降级）`);
+    assert.equal(d.shouldMarkRead, false, `医院/保险关键词「${kw}」应令 P2 不标已读`);
+    assert.ok(
+      d.appliedRules.includes('payment-security-keyword→no-mark-read'),
+      `医院/保险关键词「${kw}」应命中关键词轴`,
+    );
+  }
+});
+
+test('医院/保险关键词（正文，类别=work 非敏感、P3）→ 不标已读', () => {
+  for (const kw of HOSPITAL_INSURANCE_KEYWORDS) {
+    const d = applySafetyRules(
+      makeEmail({ subject: '普通通知', textBody: `提醒：请处理${kw}相关材料`, fromEmail: 'svc@non-sensitive.example' }),
+      makeClassification({ priority: 'P3', category: 'work', confidence: 0.88 }),
+    );
+    assert.equal(d.priority, 'P3', `kw=${kw} 优先级应保持 P3`);
+    assert.equal(d.shouldMarkRead, false, `医院/保险关键词「${kw}」（正文）应令 P3 不标已读`);
+    assert.ok(
+      d.appliedRules.includes('payment-security-keyword→no-mark-read'),
+      `医院/保险关键词「${kw}」（正文）应命中关键词轴`,
+    );
+  }
+});
+
+test('英文医院/保险关键词大小写归一（Insurance/HOSPITAL 主题）→ 不标已读', () => {
+  for (const kw of ['Insurance Renewal Notice', 'HOSPITAL Appointment', 'Your Medical Bill']) {
+    const d = applySafetyRules(
+      makeEmail({ subject: kw, fromEmail: 'noreply@non-sensitive.example' }),
+      makeClassification({ priority: 'P2', category: 'personal', confidence: 0.9 }),
+    );
+    assert.equal(d.shouldMarkRead, false, `主题「${kw}」应不标已读（小写归一命中）`);
+    assert.ok(d.appliedRules.includes('payment-security-keyword→no-mark-read'));
+  }
 });
 
 // ——————————————————————————————————————————————————————————

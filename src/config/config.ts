@@ -66,6 +66,28 @@ export const configSchema = z.object({
   // bark 作为后续可选渠道，本期不引入 BARK_*。
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
+  // P3 IMAP（§1.2）：全部可选，缺 IMAP_HOST 即不启用 IMAP（accountService 层判定），
+  // 不破坏「仅 DATABASE_URL 必需」。每键经 emptyToUndefined 预处理使 `KEY=`（空串）
+  // 归一为 undefined——否则带默认的键（IMAP_PORT/IMAP_TLS）的 .default() 不生效、
+  // 数值键 z.coerce.number('') 会落成 0。host/user/password 无默认（裸 optional）：
+  // 空串→undefined，供 accountService 做「host 有而凭据缺→fail-fast」跨字段校验
+  // （该校验属 accountService 层，config 仅解析、不做 IMAP 跨字段校验）。
+  // IMAP_PASSWORD 已在 logger redact 名单（见 src/logger.ts）；账号对象口令字段名为 password。
+  IMAP_HOST: z.preprocess(emptyToUndefined, z.string().optional()),
+  IMAP_PORT: z.preprocess(emptyToUndefined, z.coerce.number().int().min(1).max(65535).default(993)),
+  IMAP_USER: z.preprocess(emptyToUndefined, z.string().optional()),
+  IMAP_PASSWORD: z.preprocess(emptyToUndefined, z.string().optional()),
+  // 布尔（默认 true）：仅显式 'false'（大小写不敏感）→ false，其余（含省略/空串/其它值）→ true，
+  // 与「IMAP_TLS 默认 true」对齐；不引入第三方布尔 coercion，沿用就地解析。
+  IMAP_TLS: z.preprocess(
+    emptyToUndefined,
+    z
+      .string()
+      .optional()
+      .transform((v) => v?.toLowerCase() !== 'false'),
+  ),
+  IMAP_ACCOUNT_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  POLL_INTERVAL_SECONDS: z.preprocess(emptyToUndefined, z.coerce.number().default(180)),
 });
 
 export type Config = Readonly<z.infer<typeof configSchema>>;

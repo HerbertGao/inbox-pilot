@@ -12,7 +12,10 @@ import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
 import {
+  buildAnchorUpsertArgs,
   buildRawAiJson,
+  type AnchorAccount,
+  type AnchorUpsertArgs,
   type MailRepo,
   type RawAiJson,
   type StoredEmail,
@@ -53,12 +56,41 @@ export type ActionRow = {
 export class InMemoryMailRepo implements MailRepo {
   private readonly emailsById = new Map<string, EmailRow>();
   private readonly emailIdByDedupKey = new Map<string, string>();
+  /** 锚定行：accountId → 同步游标（lastSyncCursor）。供 4.5 离线测试与游标推进断言。 */
+  private readonly cursorsByAccountId = new Map<string, string | null>();
+  /**
+   * call-shape spy：每次 ensureAccountAnchor 记下构造出的 upsert 参数（供 3.3 断言
+   * where.id === create.id === accountId 且 authJson === {}，无需真库即在 CI 捕获 id≠accountId 回归）。
+   */
+  readonly anchorUpsertCalls: AnchorUpsertArgs[] = [];
   /** 暴露给测试断言；按插入顺序。 */
   readonly classifications: ClassificationRow[] = [];
   /** 暴露给测试断言；按插入顺序。 */
   readonly actions: ActionRow[] = [];
 
   private seq = 0;
+
+  async ensureAccountAnchor(account: AnchorAccount): Promise<void> {
+    // 复用与 prisma 同一纯函数构造参数（call-shape 一致）；幂等：已存行不覆盖游标。
+    const args = buildAnchorUpsertArgs(account);
+    this.anchorUpsertCalls.push(args);
+    if (!this.cursorsByAccountId.has(account.accountId)) {
+      this.cursorsByAccountId.set(account.accountId, null);
+    }
+  }
+
+  async getCursor(accountId: string): Promise<string | null> {
+    return this.cursorsByAccountId.get(accountId) ?? null;
+  }
+
+  async setCursor(accountId: string, cursor: string): Promise<void> {
+    // 与 PrismaMailRepo.setCursor（update→未知账号即抛）保持契约一致：未锚定即抛，
+    // 使「漏调 ensureAccountAnchor」在测试就暴露、而非到生产才报。
+    if (!this.cursorsByAccountId.has(accountId)) {
+      throw new Error(`InMemoryMailRepo.setCursor: 未锚定的 accountId ${accountId}`);
+    }
+    this.cursorsByAccountId.set(accountId, cursor);
+  }
 
   private dedupKey(accountId: string, providerMessageId: string): string {
     // 以 (NUL) 分隔，避免 accountId / providerMessageId 边界歧义（NUL 不会出现在二者内容中）。

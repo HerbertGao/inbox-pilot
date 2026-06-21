@@ -23,6 +23,58 @@ export type StoredEmail = {
 };
 
 /**
+ * DB 锚定行的最小入参（design 决策 1：env 是真相源，DB 仅存一行锚定）。
+ * id = accountId（去重键），provider/email 为只写 denormalization、非真相源。
+ * 口令绝不入此结构——仍只在 env / accountService 的内存对象（authJson 永远是空对象）。
+ */
+export type AnchorAccount = {
+  accountId: string;
+  /** best-effort denormalization（IMAP_USER 可能是登录名而非邮箱）；非真相源。 */
+  email: string;
+};
+
+/**
+ * mail_accounts 锚定 upsert 的调用参数形状（spec「需求:IMAP 账号加载与持久化锚定」）。
+ * 与 prisma upsert 的 where/create/update 对齐。**两处必须钉死**：
+ *   (a) where.id === create.id === accountId（覆盖 @default(cuid())，否则 id≠accountId、
+ *       mail_messages.accountId 外键仍违约）；
+ *   (b) create.authJson 为**非空空对象** {}（列为非空 Json、无默认，置 null 触发 NOT NULL
+ *       违约——口令仍只在 env、绝不入此行）。
+ */
+export type AnchorUpsertArgs = {
+  where: { id: string };
+  create: {
+    id: string;
+    provider: 'imap';
+    email: string;
+    authJson: Record<string, never>;
+    enabled: true;
+  };
+  update: Record<string, never>;
+};
+
+/**
+ * 由账号纯函数构造锚定 upsert 参数（无副作用、无 DB——供 3.3 call-shape spy 在 CI 捕获
+ * id≠accountId 回归）。PrismaMailRepo.ensureAccountAnchor 直接喂给 prisma.mailAccount.upsert。
+ */
+export function buildAnchorUpsertArgs(account: AnchorAccount): AnchorUpsertArgs {
+  return {
+    where: { id: account.accountId },
+    create: {
+      // (a) 显式 id = accountId，覆盖 @default(cuid())。
+      id: account.accountId,
+      provider: 'imap',
+      // best-effort denormalization；非真相源。
+      email: account.email,
+      // (b) 非空空对象 {}（口令绝不入此行）。
+      authJson: {},
+      enabled: true,
+    },
+    update: {},
+  };
+}
+
+/**
  * rawAiJson 的审计块：原始 AI 建议 + 最终裁定的「非专列」字段。
  * 不含 final priority/category/reason/confidence——它们已落 mail_classifications 专列、不重复存储。
  * 完整 FinalDecision = 专列（priority/category/reason + 透传 confidence）+ 此块。
@@ -41,8 +93,26 @@ export type RawAiJson = {
 /**
  * 落库 / provider seam（除真正的标已读/通知 I/O，那走 ProviderActions / Notifier）。
  * 方法语义见各方法注释；prisma 实现见 PrismaMailRepo，测试用 InMemoryMailRepo。
+ *
+ * 注：MailRepo 由此**有意跨两个聚合**——mail_messages 行（邮件落库/去重/分类/动作）
+ * 与 mail_accounts 同步状态（锚定行 + lastSyncCursor 游标）。MVP 单 seam 省事（YAGNI、
+ * 与既有 seam 一致），后续若有多账号/账号 CRUD 需求可拆出 `AccountSyncRepo`。
  */
 export type MailRepo = {
+  /**
+   * 调度器启动前**无条件、幂等**确保 mail_accounts 存在 accountId 对应锚定行
+   * （spec「锚定行先于调度建立」）——否则首次 saveEmail 触发 FK 违约、被 poller
+   * per-email catch 静默吞掉每封。create.id 显式 = accountId（覆盖 @default(cuid())）、
+   * authJson 为非空空对象 {}（置 null 触发 NOT NULL 违约）；update 留空（已存行不改）。
+   */
+  ensureAccountAnchor(account: AnchorAccount): Promise<void>;
+
+  /** 读 mail_accounts.lastSyncCursor（增量游标）；无行 / 未设返回 null。 */
+  getCursor(accountId: string): Promise<string | null>;
+
+  /** 写 mail_accounts.lastSyncCursor（轮末持久化增量游标）。 */
+  setCursor(accountId: string, cursor: string): Promise<void>;
+
   /** 按去重键查已存行（含 processedAt）；未命中返回 null。 */
   findByDedupKey(
     accountId: string,
@@ -101,6 +171,27 @@ export function buildRawAiJson(
  * 挡在流水线外。注：prisma 唯一键/SQL 行为的真测在接真实 DB 时验证（design 风险条已列）。
  */
 export class PrismaMailRepo implements MailRepo {
+  async ensureAccountAnchor(account: AnchorAccount): Promise<void> {
+    // 调度器 arm 前 await 完成；幂等（重复启动复用已存行，update 留空）。
+    // 参数经 buildAnchorUpsertArgs 钉死 where.id===create.id===accountId、authJson==={}。
+    await prisma.mailAccount.upsert(buildAnchorUpsertArgs(account));
+  }
+
+  async getCursor(accountId: string): Promise<string | null> {
+    const row = await prisma.mailAccount.findUnique({
+      where: { id: accountId },
+      select: { lastSyncCursor: true },
+    });
+    return row?.lastSyncCursor ?? null;
+  }
+
+  async setCursor(accountId: string, cursor: string): Promise<void> {
+    await prisma.mailAccount.update({
+      where: { id: accountId },
+      data: { lastSyncCursor: cursor },
+    });
+  }
+
   async findByDedupKey(
     accountId: string,
     providerMessageId: string,

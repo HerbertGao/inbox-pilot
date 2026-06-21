@@ -396,12 +396,16 @@ test('推送失败 → notify(failed) + 单次调用内 ≤3 次尝试、markPro
 // 无渠道配置 → skipped（不抛、流水线完成）
 // ——————————————————————————————————————————————————————————
 
-test('无渠道配置 → notify 动作落 skipped、不抛、流水线完成', async (t) => {
-  // createNotifier({}) 无 channel 注入；测试环境 TELEGRAM_* 未设置 → telegramChannelFromConfig
-  // 返回 undefined → notifier 降级。若环境恰好设了 TELEGRAM_*，跳过该断言（保持确定性）。
+test('无渠道配置 → notify 动作落 skipped、不抛、流水线完成', async () => {
+  // 注入确定性返回 skipped 的假 notifier（不经 createNotifier/telegramChannelFromConfig）——
+  // 故不依赖 .env、绝不触达真实通道；测「notify 为 skipped 时流水线落 skipped 且照常完成」。
   const repo = new InMemoryMailRepo();
   const provider = new FakeProviderActions();
-  const notifier = createNotifier({});
+  const notifier = {
+    async notify() {
+      return { outcome: 'skipped' as const, reason: 'no-channel' };
+    },
+  };
   const classify = makeClassifySpy(makeClassification({ priority: 'P0' }));
   const email = makeEmail();
 
@@ -412,15 +416,9 @@ test('无渠道配置 → notify 动作落 skipped、不抛、流水线完成', 
   const after = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!;
   // 流水线完成（不抛、markProcessed 执行）。
   assert.ok(after.processedAt !== null, '无渠道也应完成流水线');
-
-  if (notify?.status === 'skipped') {
-    assert.equal(notify.status, 'skipped');
-    assert.ok(notify.error !== null, 'skipped 应含原因');
-  } else {
-    t.diagnostic(
-      `notify 状态为 ${notify?.status}（疑似环境已设 TELEGRAM_*），跳过 skipped 断言`,
-    );
-  }
+  // skipped 现在确定（假 notifier），无条件断言。
+  assert.equal(notify?.status, 'skipped');
+  assert.ok(notify?.error !== null, 'skipped 应含原因');
 });
 
 // ——————————————————————————————————————————————————————————
