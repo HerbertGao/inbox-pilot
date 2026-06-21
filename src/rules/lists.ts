@@ -22,8 +22,14 @@ export const VERIFICATION_KEYWORDS: readonly string[] = [
 ];
 
 /**
- * 支付/安全关键词。主题或正文命中 → 强制 shouldMarkRead=false（护栏）。
+ * 支付/安全/医院/保险关键词。主题或正文命中 → 强制 shouldMarkRead=false（护栏）。
  * 参考 §12.2 security_keywords。
+ *
+ * 承载硬约束、非示例列表，增删需对照硬约束（PROJECT_INIT 硬约束「敏感邮件不自动标已读」、
+ * 「银行/医院/保险/支付/合同 永不自动标已读」）。
+ * 医院/保险类关键词是该硬约束的**唯一确定性兜底**——9 类别枚举（schema.ts）无 medical/insurance
+ * 对应项，故引入专用类别枚举属超范围（设计取舍：用确定性关键词轴守硬约束）。命中即必不标已读。
+ * 全部以小写英文给出（匹配方对主题/正文同做小写归一），中文不区分大小写。
  */
 export const SECURITY_PAYMENT_KEYWORDS: readonly string[] = [
   'invoice',
@@ -40,19 +46,47 @@ export const SECURITY_PAYMENT_KEYWORDS: readonly string[] = [
   '安全提醒',
   '重置密码',
   '合同',
+  // 医院/保险类（承载硬约束的确定性兜底，增删需对照硬约束——不得静默删词）。
+  '医院',
+  '医疗',
+  '挂号',
+  '病历',
+  '诊断',
+  '保险',
+  '保单',
+  '理赔',
+  'hospital',
+  'clinic',
+  'medical',
+  'insurance',
 ];
+
+/**
+ * 敏感类别（类别轴）：最终 `category ∈ 此集合` → 强制 shouldMarkRead=false（护栏）。
+ * 消费 LLM 透传的 `category`、引擎不改写。这些值均存在于 9 类别枚举（schema.ts）。
+ *   - finance：银行类；security：安全类；transaction：支付/交易类。
+ * 概率性广覆盖（召回广但非确定）——与 SECURITY_PAYMENT_KEYWORDS 的确定性兜底分层互补。
+ * 医院/保险无对应类别枚举，由上面的关键词轴确定性守住，**不在此集合**。
+ */
+export const SENSITIVE_CATEGORIES: ReadonlySet<string> = new Set([
+  'finance',
+  'security',
+  'transaction',
+]);
 
 /**
  * 敏感发件域名（银行/医院/保险/支付/合同类）。发件域命中 → 强制
  * shouldMarkRead=false（护栏）。参考 §12.2 never_mark_read_domains。
  * 匹配方应对发件域同做小写归一，并按「等于该域或为其子域」判断。
+ *
+ * 域名轴=**可选补充**（硬约束已由关键词轴确定性兜底 + 类别轴概率性广覆盖落地，不要求穷举域名）。
+ * 但**默认非空、非穷举**：保留示例项使域名轴可被实例化、不破坏既有域名轴用例——**禁止清空**
+ * （清空会使域名轴场景 vacuous）。真实/完整名单 P6 YAML 可配。
  */
 export const SENSITIVE_DOMAINS: readonly string[] = [
   'bank.com',
   'hospital.com',
   'insurance.com',
-  // 支付/合同类（硬约束「银行/医院/保险/支付/合同」明列五类，发件域轴需对齐枚举）。
-  // 占位示例，真实/完整名单 P6 YAML 可配（内容轴另由 SECURITY_PAYMENT_KEYWORDS 覆盖）。
   'payment.com',
   'contract.com',
 ];

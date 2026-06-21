@@ -827,7 +827,7 @@ Claude Code 应按以下顺序生成代码：
 - 不要让 LLM 直接决定最终动作，必须经过规则引擎；
 - AI 分类失败时，默认 P1，不标已读；
 - P4 永远不自动标已读；
-- 银行、医院、保险、支付、合同类邮件默认不自动标已读；
+- 银行、医院、保险、支付、合同类邮件默认不自动标已读（实现细化见 safety-rules 规范：关键词轴确定性兜底 支付/合同/安全/医院/保险/账单类 + 类别轴概率性广覆盖 finance/security/transaction；残留缺口——未命中关键词且被判非敏感类别者，如纯银行/医院/保险通知——非零、best-effort（不维护域名白名单的取舍；彻底消除需 medical/insurance 类别枚举，超范围），不再要求维护域名白名单）；
 - 所有 provider 原始邮件必须先转换成 `NormalizedEmail`；
 - 处理过的邮件必须通过 `(accountId, providerMessageId)` 去重。
 

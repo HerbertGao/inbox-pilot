@@ -17,13 +17,13 @@ model MailAccount {
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  messages       MailMessage[]
+  messages MailMessage[]
 
   @@map("mail_accounts")
 }
 
 model MailMessage {
-  id                String   @id @default(cuid())
+  id                String    @id @default(cuid())
   accountId         String
   providerMessageId String
   messageId         String?
@@ -36,31 +36,31 @@ model MailMessage {
   snippet           String?
   bodyText          String?
   bodyHash          String?
-  hasAttachments    Boolean  @default(false)
-  isRead            Boolean  @default(false)
+  hasAttachments    Boolean   @default(false)
+  isRead            Boolean   @default(false)
   processedAt       DateTime?
-  createdAt         DateTime @default(now())
+  createdAt         DateTime  @default(now())
 
-  account           MailAccount @relation(fields: [accountId], references: [id])
-  classifications   MailClassification[]
-  actions           MailAction[]
-  digestItems       DigestItem[]
+  account         MailAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  classifications MailClassification[]
+  actions         MailAction[]
+  digestItems     DigestItem[]
 
   @@unique([accountId, providerMessageId])
   @@map("mail_messages")
 }
 
 model MailClassification {
-  id          String   @id @default(cuid())
-  messageId   String
-  priority    String
-  category    String
-  confidence  Float
-  reason      String
-  rawAiJson   Json
-  createdAt   DateTime @default(now())
+  id         String   @id @default(cuid())
+  messageId  String
+  priority   String
+  category   String
+  confidence Float
+  reason     String
+  rawAiJson  Json
+  createdAt  DateTime @default(now())
 
-  message     MailMessage @relation(fields: [messageId], references: [id])
+  message MailMessage @relation(fields: [messageId], references: [id])
 
   @@map("mail_classifications")
 }
@@ -74,7 +74,7 @@ model MailAction {
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
-  message    MailMessage @relation(fields: [messageId], references: [id])
+  message MailMessage @relation(fields: [messageId], references: [id])
 
   @@map("mail_actions")
 }
@@ -86,7 +86,7 @@ model DigestItem {
   sentAt     DateTime?
   createdAt  DateTime  @default(now())
 
-  message    MailMessage @relation(fields: [messageId], references: [id])
+  message MailMessage @relation(fields: [messageId], references: [id])
 
   @@map("digest_items")
 }

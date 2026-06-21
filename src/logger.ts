@@ -19,6 +19,10 @@ export const logger = pino({
       '*.OPENROUTER_API_KEY',
       'GMAIL_CLIENT_SECRET',
       '*.GMAIL_CLIENT_SECRET',
+      // IMAP_PASSWORD（P3）：口令型密钥，逐键枚举顶层与一层嵌套（pino 不支持 key 后缀通配）。
+      // 账号对象的口令字段统一命名 password，由上面的 'password'/'*.password' 兜底。
+      'IMAP_PASSWORD',
+      '*.IMAP_PASSWORD',
       'TELEGRAM_BOT_TOKEN',
       '*.TELEGRAM_BOT_TOKEN',
       // CHAT_ID 非密钥（泄露无法冒充 bot），但 notifications spec 把 TELEGRAM_* 并列为凭据、

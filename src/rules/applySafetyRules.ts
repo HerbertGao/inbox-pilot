@@ -15,6 +15,7 @@ import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision, Priority } from './finalDecision.js';
 import {
   SECURITY_PAYMENT_KEYWORDS,
+  SENSITIVE_CATEGORIES,
   SENSITIVE_DOMAINS,
   VERIFICATION_KEYWORDS,
 } from './lists.js';
@@ -111,6 +112,13 @@ export function applySafetyRules(
 
   // —— ③ 强制不标已读护栏（覆盖 P2/P3 的标已读；单调趋安全：本块只把 shouldMarkRead 置 false、
   //     绝不翻回 true，故直接赋值即满足单调性）——
+  // 类别轴：最终 category ∈ SENSITIVE_CATEGORIES（finance/security/transaction）→ 强制不标已读。
+  // 消费 LLM 透传的 category（引擎不改写，故等同于最终 decision.category）；概率性广覆盖，
+  // 与确定性关键词轴分层互补。医院/保险无对应类别枚举，由 SECURITY_PAYMENT_KEYWORDS 关键词轴守住。
+  if (SENSITIVE_CATEGORIES.has(classification.category)) {
+    shouldMarkRead = false;
+    appliedRules.push('sensitive-category→no-mark-read');
+  }
   // 敏感域名命中。
   if (matchesSensitiveDomain(email.fromEmail)) {
     shouldMarkRead = false;

@@ -53,13 +53,21 @@
   `imapActions`（标 `\Seen` / 移动文件夹，失败退化仅标 Seen）；`jobs/scheduler.ts`（node-cron 轮询）。
 - **验收**：配真实 IMAP 账号，未读邮件被分类、P2/P3 标已读、P0/P4 推送、actions 有日志；重启不重复。
 
-## P4 · Gmail 端到端
+## P4 · Gmail 端到端 + 统一多账号
 
-- **目标**：Gmail 账号跑通，标签化分流。可与 P3 并行（共用 P2 流水线）。
+- **目标**：Gmail 账号跑通，标签化分流；**并把多账号（多 IMAP + 多 Gmail）统一在本期落地**——
+  P3 决策：多账号延后与 Gmail 合并（见下「多账号」），避免只为 IMAP 建一遍账号加载/凭据层、Gmail 来时重做。
 - **交付**：Gmail OAuth（授权 + token 存 `authJson`）；`gmailClient`；标签管理（创建 `AI/*` 标签）；
   `gmailPoller`（查 unread → message detail → `NormalizedEmail`）；`gmailActions`
   （按 P0–P4 映射 add label / remove UNREAD）；接入 scheduler。
-- **验收**：配 Gmail 账号，未读邮件被打 `AI/*` 标签；P2/P3 去 UNREAD；P0/P4 保留 UNREAD 并推送。
+- **多账号（统一账号注册表）**：N 个账号、每个 `provider=imap|gmail`；凭据统一存 `MailAccount.authJson`
+  （Gmail OAuth token / IMAP 凭据）；per-account 调度 + 故障隔离（一个账号挂不拖累其他）+ 并发上限。
+  **数据层/流水线已就绪**——去重键 `(accountId, providerMessageId)`、`getCursor/setCursor(accountId)`、
+  `ensureAccountAnchor`、整条 `processEmail` 已按 accountId 键化；本期只需改账号加载层
+  （config/accountService/main 三处单账号接线 → 多账号注册表）+ scheduler 起 N 个 per-account 轮询。
+  配置模型（env 列表 vs DB 后端 vs YAML）开工时定。
+- **验收**：配 ≥2 个账号（含至少 1 Gmail + 1 IMAP）；未读被分类分流；P2/P3 去 UNREAD/标 Seen、
+  P0/P4 保留并推送；各账号去重/游标互不干扰；一个账号 IMAP/OAuth 故障不影响其他账号轮询。
 
 ## P5 · 每日定时摘要
 
