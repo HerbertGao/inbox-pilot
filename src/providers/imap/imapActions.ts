@@ -1,7 +1,8 @@
-// IMAP provider 的 ProviderActions 实现（spec「经规则引擎裁定执行真实标已读」、design 决策 7）。
+// IMAP provider 的 ProviderActions 实现（spec「经规则引擎裁定执行真实标已读」、design 决策 3/7）。
 //
-// 职责：实现 ProviderActions.markRead——对 executeActions 裁定要标已读的邮件按其活动 uid
-// `messageFlagsAdd(['\\Seen'])`，幂等。
+// 职责：
+//   - `markRead`：对 executeActions 裁定要标已读的邮件按其活动 uid `messageFlagsAdd(['\\Seen'])`，幂等。
+//   - `reflectPriority`：IMAP 本期 **no-op**（优先级标签是 Gmail 的权威 AI/* 标签能力，IMAP 不打标签）。
 //
 // CRITICAL 架构点 1（连接共享）：markRead 由 executeActions 在 processEmail 内发起，而
 // processEmail 由 poller 在**持有当前已打开连接**时逐封调用——故本 provider 必须操作 poller
@@ -47,6 +48,9 @@ export class ImapMarkReadError extends Error {
  */
 export function createImapProvider(connection: ImapConnection): ProviderActions {
   return {
+    // reflectPriority：IMAP 本期 no-op（不打优先级标签；幂等、与 markRead 失败隔离天然成立）。
+    async reflectPriority(): Promise<void> {},
+
     async markRead(email: NormalizedEmail): Promise<void> {
       // (1) uid 缺失 → fail-loud（禁静默 no-op）。固定 kind 串，零插值。
       if (typeof email.uid !== 'number' || !Number.isFinite(email.uid)) {
@@ -61,17 +65,16 @@ export function createImapProvider(connection: ImapConnection): ProviderActions 
         // 幂等：messageFlagsAdd 重复加 \Seen 不报错。
         await connection.addSeenFlag(email.uid);
       } catch (err) {
-        // (2) 原始错误仅 debug 日志（可能含 host/account 片段）；对外抛**固定 kind 串、零插值**。
-        // logger 已对 password/IMAP_PASSWORD redact，但 message 字符串内嵌的 host 不受 key-redact
-        // 保护，故仅在 debug 级别记原始 message，绝不进入对外抛出的错误。
-        // 注：开 LOG_LEVEL=debug 会显式暴露这条原始 provider 错误 message（可接受；默认级别 info 不打）。
-        logger.debug(
+        // (2) 对外抛**固定 kind 串、零插值**；只记标量 code/name（**禁记原始 IMAP 错误 message**——
+        // 其内嵌的 host/IMAP 命令文本不受 key-redact 保护，契约禁原始 IMAP 错误文本入日志）。
+        logger.warn(
           {
             kind: 'imap-mark-read-failed',
             providerMessageId: email.providerMessageId,
-            rawError: err instanceof Error ? err.message : String(err),
+            code: (err as { code?: unknown })?.code,
+            errorName: err instanceof Error ? err.name : 'unknown',
           },
-          'markRead 底层调用失败（原始错误仅 debug 记录，对外脱敏为固定 kind 串）',
+          'markRead 底层调用失败（对外脱敏为固定 kind 串；仅记 code/name，不记原始 IMAP 错误文本）',
         );
         throw new ImapMarkReadError(IMAP_MARK_READ_FAILED);
       }

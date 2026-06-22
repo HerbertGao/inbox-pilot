@@ -14,7 +14,7 @@ inbox-pilot：无 GUI 的 AI 邮件路由器后台服务。
 - AI 失败或 `confidence < 0.65`：降级 P1、不标已读、入摘要（验证码/P4 等安全强制不被低置信度下调）。
 - 所有 provider 原始邮件先转成 `NormalizedEmail` 再进分类器。
 - 去重键 `(accountId, providerMessageId)`，重启不重复处理。
-- 通知不泄露完整正文；密钥只从环境变量读，不写死。
+- 通知不泄露完整正文；app 凭据（OPENROUTER_API_KEY / GMAIL_CLIENT_* 等）从环境变量读、不写死；账号凭据存 DB `MailAccount.authJson`、整体绝不入日志。
 
 ## 技术栈
 

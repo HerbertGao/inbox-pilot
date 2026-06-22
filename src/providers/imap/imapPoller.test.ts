@@ -38,11 +38,16 @@ import { SENSITIVE_DOMAINS } from '../../rules/lists.js';
 
 const ACCOUNT_ID = 'imap:u@h';
 
-// 新建并先锚定账号的 repo——镜像生产流程（main.ts：ensureAccountAnchor → 才轮询），
-// 也满足 setCursor 与 Prisma 一致的「未锚定即抛」契约。
+// 新建并先写入账号行的 repo——镜像生产流程（注册表行先于调度存在 → 才轮询），
+// 也满足 setCursor 与 Prisma 一致的「账号未写入即抛」契约。
 async function makeRepo(): Promise<InMemoryMailRepo> {
   const r = new InMemoryMailRepo();
-  await r.ensureAccountAnchor({ accountId: ACCOUNT_ID, email: 'u@h' });
+  await r.upsertAccount({
+    id: ACCOUNT_ID,
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+  });
   return r;
 }
 
@@ -569,7 +574,12 @@ test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取�
     }
   }
   const crashRepo = new CrashAfterMarkReadRepo();
-  await crashRepo.ensureAccountAnchor({ accountId: ACCOUNT_ID, email: 'u@h' });
+  await crashRepo.upsertAccount({
+    id: ACCOUNT_ID,
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+  });
   const provider = new FakeProviderActions();
   const notifier = createNotifier({ channel: noopChannel() });
   const deps1: PollDeps = {

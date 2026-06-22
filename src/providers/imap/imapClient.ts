@@ -11,7 +11,7 @@
 // 连接生命周期归 poller：poller 每轮 `connect()` 得到一个 ImapConnection，逐封处理后 `logout()`。
 
 import { ImapFlow, type FetchQueryObject } from 'imapflow';
-import type { ImapAccount } from '../../accounts/accountService.js';
+import type { ImapAccount } from '../provider.js';
 
 /**
  * 打开 INBOX 后读到的邮箱状态。
