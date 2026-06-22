@@ -251,17 +251,10 @@ test('共享锁跨任务互斥：A 运行中、B 触发被跳过；A 完成后 B
   await a;
   await b;
 
-  // 锁已释放 → 再触发可进入 run。
-  const gate2 = deferred();
-  const { runOnce: runOnce2 } = createSharedLockRunner(async () => {
-    runs += 1;
-    await gate2.promise;
-  });
-  const c = runOnce2();
-  await flush();
-  assert.equal(runs, 2, '锁释放后新触发可进入 run');
-  gate2.resolve();
-  await c;
+  // 用**原** runOnce 验证第一个 runner 确实释放了锁（新建 runner 会让断言空过）。
+  // gate 已 resolve，故再次进入 run 会立即跑完。
+  await runOnce();
+  assert.equal(runs, 2, '锁释放后同一 runOnce 可再次进入 run');
 });
 
 test('保护体首行同步抛 → finally 仍释放锁（不泄漏）；下次触发可再运行', async () => {

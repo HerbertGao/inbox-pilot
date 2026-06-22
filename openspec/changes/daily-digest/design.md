@@ -36,7 +36,7 @@ node-cron `noOverlap` 仅**单任务内**不重入（每 `cron.schedule` 一个�
 `buildDigest(repo, now) → { segments: Array<{ text: string; messageRowIds: string[] }> } | null`：查候选 +
 组装文案并按渠道上限**分段**，每段携带**该段所含邮件的 `messageRowIds`**（含 P3 计数段所计 P3 的 row-ids），
 **不发送、不写库**（null = 无可入摘要邮件，见决策 4 的「null 条件」）。`digestScheduler` 一轮编排（**逐段提交**）：
-```
+```text
 const d = await buildDigest(repo, now); if (!d) return;
 for (const seg of d.segments) {
   if ((await notifier.notifyDigest(seg.text)).outcome !== 'sent') return; // 停在第一处失败
@@ -134,8 +134,8 @@ for (const seg of d.segments) {
 ## 迁移计划
 
 无 schema 迁移（复用 `digest_items`、不加唯一约束/索引）。部署：设 `DIGEST_TIMES` + `TZ`（或用默认）→ 重启生效。
-digest task 与轮询 task **concat 进 main 同一个被 `shutdown()` 迭代的 `schedulerTasks` 数组**（main.ts 现状是 `=` 覆盖赋值，
-须改为 concat；否则 digest task 不被 `stop()`、`$disconnect()` 后仍触发）。回滚：置 `DIGEST_TIMES=`（显式空）即停摘要。
+digest task 与轮询 task **合并进 main 同一个被 `shutdown()` 迭代的 `schedulerTasks` 数组**（单一合并赋值
+`[...pollingTasks, ...digestTasks]`，故 SIGTERM/SIGINT 时一并 `stop()`）。回滚：置 `DIGEST_TIMES=`（显式空）即停摘要。
 
 ## 待解决问题
 

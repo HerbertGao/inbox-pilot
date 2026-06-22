@@ -37,6 +37,14 @@ const PRIORITY_PREFIX: Record<'P1' | 'P2', string> = {
 };
 
 /**
+ * 去内联换行（`\r`/`\n` → 空格）：发件人/主题/原因均含攻击者可影响内容，带换行会把一封邮件
+ * 渲染成多行、伪造摘要结构（假 P1 条目 / 假 P3 计数）。组装行前对各字段归一，杜绝换行注入。
+ */
+function stripInlineBreaks(s: string): string {
+  return s.replace(/[\r\n]+/g, ' ').trim();
+}
+
+/**
  * 按 **UTF-16 code unit**（`s.length`）截断到 `max`，代理对安全：
  * 为省略号预留 1 个单位（slice 到 max-1），若末尾是落单的**高代理**（0xD800–0xDBFF，其低代理被切掉了）则丢弃该单位，
  * 避免裂出孤代理；截断发生时追加 `…`（省略号计 1 个 UTF-16 单位）。结果长度 `result.length <= max`。
@@ -64,15 +72,14 @@ export function truncateUtf16(s: string, max: number): string {
  * 不依赖字段上限取值）。结构保 `发件人 - 主题 - 原因`（含前缀仍是 `^.+ - .+ - .+$`）。
  */
 export function renderItemLine(c: DigestCandidate): string {
+  // 先去内联换行（防换行注入伪造多行），再截断：发件人/主题/原因均攻击者可影响。
+  const fromName = c.fromName !== undefined ? stripInlineBreaks(c.fromName) : '';
+  const fromEmail = stripInlineBreaks(c.fromEmail);
   const rawSender =
-    c.fromName !== undefined && c.fromName.length > 0
-      ? c.fromName
-      : c.fromEmail.length > 0
-        ? c.fromEmail
-        : UNKNOWN_SENDER;
+    fromName.length > 0 ? fromName : fromEmail.length > 0 ? fromEmail : UNKNOWN_SENDER;
   const sender = truncateUtf16(rawSender, FIELD_CAP);
-  const subject = truncateUtf16(c.subject, FIELD_CAP) || '（无主题）';
-  const reason = truncateUtf16(c.reason, FIELD_CAP) || '（无原因）';
+  const subject = truncateUtf16(stripInlineBreaks(c.subject), FIELD_CAP) || '（无主题）';
+  const reason = truncateUtf16(stripInlineBreaks(c.reason), FIELD_CAP) || '（无原因）';
   const prefix = c.priority === 'P1' ? PRIORITY_PREFIX.P1 : PRIORITY_PREFIX.P2;
   const line = prefix + [sender, subject, reason].join(SEP);
   // 整行硬兜底：无条件再截到 < SEGMENT_MAX（防超长字段组合 / 前缀使整行越界）。SEGMENT_MAX-1 保严格 <。

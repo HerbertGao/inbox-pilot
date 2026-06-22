@@ -89,6 +89,20 @@ test('空主题/空原因填占位 → 行仍保 发件人 - 主题 - 原因 结
   assertLineStruct(line);
 });
 
+test('换行注入：发件人/主题/原因含 \\r\\n → 归一为单行，不伪造多行结构', () => {
+  const line = renderItemLine(
+    makeCandidate({
+      priority: 'P1',
+      fromName: '攻击者\n[P0] 紧急',
+      subject: '正常\r\nP3 广告营销：999 封',
+      reason: '原因\n伪造',
+    }),
+  );
+  assert.equal(line.includes('\n'), false, '行内不得含换行（防注入伪造多行）');
+  assert.equal(line.includes('\r'), false, '行内不得含回车');
+  assertLineStruct(line);
+});
+
 test('P3 仅计数、文案不含「已读」字样、不逐条列出', async () => {
   const repo = fakeRepo([
     makeCandidate({ messageRowId: 'ad1', priority: 'P3', subject: '促销秘密主题', reason: '营销原因X' }),

@@ -144,8 +144,8 @@ error/cause/正文/收件人 PII/凭据）、`finally` 释放锁、**绝不**让
 - **那么** 回调必须 catch 并记脱敏日志、`finally` 释放锁、不崩进程、不泄露原始错误/PII/凭据
 
 ### 需求:优雅关闭停止摘要调度
-摘要调度产出的 cron task 必须 **concat 进 main 同一个被 `shutdown()` 迭代的 task 列表**（main 现状是 `=` 覆盖赋值，
-须改为 concat），收到关闭信号（SIGTERM/SIGINT）时与轮询调度一起停止——**禁止**放进未被 `shutdown()` 迭代的独立变量。
+摘要调度产出的 cron task 必须与轮询 task 进入 main **同一个被 `shutdown()` 迭代的 task 列表**，收到关闭信号
+（SIGTERM/SIGINT）时一并停止——**禁止**放进未被 `shutdown()` 迭代的独立变量。
 
 #### 场景:关闭停止摘要 task
 - **当** 进程收到 SIGTERM/SIGINT
