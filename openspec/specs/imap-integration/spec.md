@@ -4,25 +4,29 @@
 待定 - 由归档变更 imap-end-to-end 创建。归档后请更新目的。
 ## 需求
 ### 需求:IMAP 账号加载与持久化锚定
-系统必须从配置（环境变量 `IMAP_*`）加载至多一个 IMAP 账号，产出供轮询使用的连接参数与一个**跨重启稳定**的 `accountId`（去重键依赖）。**且在调度器启动前必须确保 `mail_accounts` 存在该 `accountId` 对应行**（`upsert({ where:{id:accountId}, create:{id:accountId, provider:'imap', email:user, authJson:{}, enabled:true}, update:{} })`，**`create` 必须显式 `id = accountId`** 覆盖 `@default(cuid())`、`authJson` 为非空空对象 `{}`）——因为 `mail_messages.accountId` 对 `mail_accounts.id` 有外键约束（`ON DELETE RESTRICT`），缺锚定行或 id≠accountId 或 authJson 为 null 都会使首次 `saveEmail` 触发约束违约、被 poller per-email catch 静默吞掉每封。该 upsert 必须在调度器 arm 前 await 完成、每次启动无条件执行且幂等。env 仍是配置真相源，DB 仅存此锚定行（`provider`/`email` 为只写 denormalization、非真相源；`lastSyncCursor` 等后续游标挂于此行）。改变 `accountId` 来源（user/host 变更或改设 `IMAP_ACCOUNT_ID`）会形成新去重命名空间 + 新锚定行 + 一次性重处理（与 UIDVALIDITY 重置同属 at-least-once）。
+IMAP 账号必须经**统一账号注册表**加载（见 `account-registry`），**不再从 env 单账号读取**。该账号对应的 `MailAccount` 行（`provider='imap'`）即注册表条目、**含真实凭据于 `authJson`**（`{host,port,user,password,tls}`）。
 
-配置完整性:`IMAP_HOST` 缺失时，系统必须**不启用** IMAP 轮询且正常启动（IMAP 为可选 provider）；但 `IMAP_HOST` 已设而 `IMAP_USER`/`IMAP_PASSWORD` 缺失时必须 **fail-fast 配置错误**（在 accountService 抛错终止该账号加载，不静默降级、不反复尝试坏连接，不得产出 `imap:undefined@host` 之类残缺 accountId）；该校验属 accountService 层、不在 config 层。IMAP 口令等密钥**只**从环境变量读取，禁止写死、禁止以明文写入日志。
+`accountId` **必须就是该行的 `MailAccount.id`**（不再「或派生 id」二选一的含糊措辞）；`MailAccount.id` 由写入路径**确定性派生并显式设置**（CLI add 与迁移共用同一规则，见 `account-registry`「accountId 与 MailAccount.id 同一」需求）、**覆盖 `@default(cuid())`**：迁移沿用 P3 实际 accountId（`deriveAccountId(IMAP_ACCOUNT_ID,user,host)`，含旧显式值）;CLI add 用 `--account-id`（若给）否则确定性 `imap:<user>@<host>` 作主键 **upsert**（**不**按 user@host 模糊查既有行——无此可查列）；legacy 自定义 `IMAP_ACCOUNT_ID` 的连续性仅经迁移或显式 `--account-id`。这是去重键 `(accountId, providerMessageId)` 与游标连续、外键成立的前提。`MailAccount.email`（NOT NULL）取 `--email` 或回落 `user@host`（best-effort denormalization，非真相源）。
 
-#### 场景:配置齐全则加载账号并锚定 DB 行
-- **当** `IMAP_HOST` / `IMAP_USER` / `IMAP_PASSWORD` 等必要项齐全
-- **那么** 系统必须产出一个含稳定 `accountId` 的 IMAP 账号配置，并 upsert 对应 `mail_accounts` 行（`id = accountId`、`authJson = {}`），使后续 `saveEmail` 的外键约束成立
+因「注册表行**本身即账号**、`MailAccount.id===accountId`、authJson 含真实凭据」，`mail_messages.accountId` 对 `mail_accounts.id` 的外键约束天然满足，**不再需要** P3 的「空 `authJson` 锚定行」机制：P3 的一次性 `ensureAccountAnchor(authJson:{})` + `buildAnchorUpsertArgs`/`AnchorAccount`/`AnchorUpsertArgs`（及其 call-shape 测试）被「行本身即账号、id 显式 = accountId、authJson 含真实凭据」取代——本变更必须**移除或改为 no-op** 这些锚定 seam 及其测试，并把 P3「锚定行先于调度建立」的不变量**改述为「注册表行必须先于该账号被调度而存在」**（由 CLI add / 迁移建行、注册表加载断言其存在），避免首次 `saveEmail` 触发 FK 违约。
 
-#### 场景:锚定行先于调度建立
-- **当** 服务启动（含崩溃重启）
-- **那么** `mail_accounts` 锚定 upsert 必须在调度器被 arm 之前 await 完成，使首轮轮询的任何 `saveEmail` 都已有父行（无条件执行、幂等）
+IMAP 凭据从 `authJson` 解出、**只在内存、绝不以明文入日志**（不再从 env 读取 IMAP 凭据）。凭据不完整（缺 host/user/password）的 imap 账号行在加载时记错并跳过该账号（见 `account-registry`），不产出残缺连接、不影响其他账号。IMAP 的 `markRead`/`reflectPriority` 动作必须在 `poll()` 本轮打开的同一连接上操作（连接共享，见 `account-registry`「Provider 抽象」）。
 
-#### 场景:缺 host 则禁用 IMAP 而非崩溃
-- **当** `IMAP_HOST` 未设置
-- **那么** 系统必须跳过 IMAP 轮询启动、记录一条信息日志，且服务其余部分（/health 等）正常运行
+#### 场景:IMAP 账号经注册表加载
+- **当** 注册表有一个 enabled 的 `provider='imap'` 账号、其 authJson 含完整连接凭据
+- **那么** 系统必须产出含稳定 `accountId`(= `MailAccount.id`) + 从 authJson 解出的连接参数的 IMAP 账号，供轮询
 
-#### 场景:host 有而凭据缺失则不静默坏连接
-- **当** `IMAP_HOST` 已设但 `IMAP_USER` 或 `IMAP_PASSWORD` 缺失
-- **那么** 系统必须 **fail-fast 配置错误**（accountService 抛错），**禁止**产出残缺 accountId 或每轮反复发起注定失败的连接
+#### 场景:外键由注册表行满足（无需空 authJson 锚定）
+- **当** 该 IMAP 账号首次 `saveEmail`
+- **那么** `mail_messages.accountId` 的外键必须成立(注册表行已存在、`MailAccount.id===accountId`)，无需额外的空 authJson 锚定 upsert
+
+#### 场景:注册表行先于调度存在
+- **当** 一个 IMAP 账号被纳入 per-account 调度
+- **那么** 其 `MailAccount` 行(id = 派生 accountId)必须已存在(由 CLI add / 迁移建立)，否则不调度该账号、记错
+
+#### 场景:凭据不入日志
+- **当** 任何路径记录该 IMAP 账号
+- **那么** authJson 中的 password 等凭据必须被 redact，不出现明文
 
 ### 需求:轮询并收敛为 NormalizedEmail
 IMAP 轮询必须 SELECT INBOX、按增量 UID 游标取新邮件（见「增量 UID 游标避免重复 FETCH」需求；首轮或 UIDVALIDITY 变化时退化为 SEARCH UNSEEN）、FETCH envelope 与文本正文，并把每封原始邮件经 `normalizeEmail` 收敛为 `NormalizedEmail` 后才交给分类流水线。分类器**禁止**接收任何未规范化的原始 IMAP 对象。`envelope.from` 映射必须明确:`fromEmail` 取**裸地址**（`mailbox@host`，不含显示名/尖括号），`fromName` 取显示名——使敏感发件域护栏与通知格式拿到干净地址。`providerMessageId` 必须取**跨重启稳定**的标识(优先 `Message-ID` 头;**规范化=首尾去空白、保留尖括号内内容逐字、不大小写折叠**,使同一邮件跨轮产出一致键);`Message-ID` 缺失时回退为 `imap-uid:<uidValidity>-<uid>`,该回退在**同一 UIDVALIDITY 期内**（含服务重启）稳定，但服务端 UIDVALIDITY 重置时会变（见下「去重键」场景的退化说明）。
