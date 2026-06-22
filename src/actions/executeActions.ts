@@ -25,6 +25,7 @@ import type { MailRepo } from '../repo/mailRepo.js';
 import type { Notifier, NotifyResult } from '../notify/notifier.js';
 import { ActionType } from './actionTypes.js';
 import type { ProviderActions } from './providerActions.js';
+import { ProviderReauthRequired } from '../providers/provider.js';
 
 /**
  * 单次 executeActions 调用内每个动作的尝试上限（含首次）。小常数、禁无限。
@@ -57,13 +58,58 @@ function redactError(err: unknown): string {
 }
 
 /**
+ * 优先级落地动作：**始终**被 executeActions 调用（标签是分类可见性、不被 shouldMarkRead 门控）。
+ * recordAction(pending) → 单次调用内有界重试地调 provider.reflectPriority → done；
+ * 发送态失败耗尽 → updateAction(failed, 脱敏error)、**不抛**（不阻断 markRead/notify/markProcessed）。
+ * reflectPriority 真实实现幂等（重复打同一标签安全），重试安全。
+ *
+ * **致命错误通道（区别于发送态瞬时失败）**：provider 抛 `ProviderReauthRequired`（token 撤销 /
+ * scope 403）时，必须在本作用域内把该 in-flight 行置 `failed`(reauth kind)、**不留 orphan pending**，
+ * 然后 **re-throw** —— 由 executeActions 传播出去，processEmail 因此跳过 markProcessed，
+ * scheduler 的 per-account guard 隔离该账号。绝不当发送态瞬时失败吞掉。
+ */
+async function executeReflectPriority(
+  email: NormalizedEmail,
+  decision: FinalDecision,
+  deps: ExecuteActionsDeps,
+  messageRowId: string,
+): Promise<void> {
+  const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.ReflectPriority);
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    try {
+      await deps.provider.reflectPriority(email, decision);
+      await deps.repo.updateAction(actionRowId, 'done');
+      return;
+    } catch (err) {
+      // 致命错误：落 failed(reauth kind) 后 re-throw（不重试、不吞）；rowId 在作用域内、无 orphan pending。
+      if (err instanceof ProviderReauthRequired) {
+        await deps.repo.updateAction(actionRowId, 'failed', err.kind);
+        throw err;
+      }
+      lastError = err;
+      // 发送态瞬时失败：继续下一次尝试（reflectPriority 幂等，重试安全）；耗尽后落 failed、不抛。
+    }
+  }
+  const summary = redactError(lastError);
+  logger.warn(
+    { kind: 'reflect-priority-failed', attempts: MAX_ATTEMPTS, error: summary },
+    '优先级落地动作重试耗尽，落 failed',
+  );
+  await deps.repo.updateAction(actionRowId, 'failed', summary);
+}
+
+/**
  * 标已读动作：仅当 decision.shouldMarkRead 为 true 时调用。
  * recordAction(pending) → 单次调用内有界重试地调 provider.markRead → done；
- * 耗尽仍抛 → updateAction(failed, 脱敏error)。markRead 真实实现幂等，重试安全。
+ * 发送态失败耗尽 → updateAction(failed, 脱敏error)、**不抛**。markRead 真实实现幂等，重试安全。
  * 发送态不抛 —— markRead 的发送失败只落 mail_actions、不阻断其余动作与 markProcessed。
  * 注：updateAction('done') 仍在重试 try 内（与 executeNotify **有意**不对称——markRead 幂等，
  * done-写入失败时重试重标已读无害；notify 不幂等故其 done-写入移出 try）。repo 写入持久故障会
  * 经耗尽分支的 updateAction(failed) 向上传播 → processEmail at-least-once 重跑兜底。
+ *
+ * **致命错误通道**：同 executeReflectPriority——provider 抛 `ProviderReauthRequired` 时本作用域内
+ * 置 failed(reauth kind)、不留 orphan pending，然后 re-throw（不当发送态瞬时失败吞掉）。
  */
 async function executeMarkRead(
   email: NormalizedEmail,
@@ -78,8 +124,13 @@ async function executeMarkRead(
       await deps.repo.updateAction(actionRowId, 'done');
       return;
     } catch (err) {
+      // 致命错误：落 failed(reauth kind) 后 re-throw（不重试、不吞）；rowId 在作用域内、无 orphan pending。
+      if (err instanceof ProviderReauthRequired) {
+        await deps.repo.updateAction(actionRowId, 'failed', err.kind);
+        throw err;
+      }
       lastError = err;
-      // 继续下一次尝试（标已读幂等，重试安全）；耗尽后落 failed。
+      // 发送态瞬时失败：继续下一次尝试（标已读幂等，重试安全）；耗尽后落 failed、不抛。
     }
   }
   // ponytail: 假 provider 仅抛固定串，redactError 截断即可；接真实 IMAP/Gmail（P3/P4）时
@@ -147,14 +198,24 @@ async function executeNotify(
 /**
  * 按 FinalDecision 分发并执行动作。只认 FinalDecision（不读原始 Classification）。
  *
+ * **动作顺序**（防崩溃窗口，见 gmail-integration「动作顺序」）：
+ *   reflectPriority（**始终**）→ markRead（仅 shouldMarkRead）→ notify（仅 shouldNotifyNow）。
+ *   markProcessed 由 processEmail 在本函数返回后**最后**执行。
+ *
+ * - reflectPriority → 经 ProviderActions 把最终优先级落到 provider 维度（Gmail 打 `AI/P*` 标签）；
+ *   始终调用（标签是分类可见性，不被 shouldMarkRead 门控）、幂等。
  * - shouldMarkRead → 经 ProviderActions 标已读。
  * - shouldNotifyNow → 经 Notifier 推送。
  * - shouldIncludeDigest → 本期不产生动作（仅由 saveClassification 持久化标记，摘要属 P5）。
  *
- * 两个动作相互独立：一个动作的**发送态失败**不影响另一个、只落 mail_actions（failed/skipped），
+ * 各动作相互独立：一个动作的**发送态失败**不影响其余、只落 mail_actions（failed/skipped），
  * markProcessed 由 processEmail 在本函数返回后照常执行、不以动作发送成功为前提。
- * 注：「不抛」仅指动作发送态失败；终态落库（updateAction）的 repo I/O 故障会**向上传播**——
- * 此时 markProcessed 不执行、邮件留待 at-least-once 重跑（即 spec「动作中途崩溃后可重跑」）。
+ * 注：「不抛」仅指动作发送态瞬时失败；两类异常会**向上传播**、跳过 markProcessed：
+ *   ① 终态落库（updateAction）的 repo I/O 故障；
+ *   ② `ProviderReauthRequired`（账号级致命：token 撤销 / scope 403）——动作 helper 已先把其
+ *      in-flight 行置 failed(reauth kind)、不留 orphan pending，再 re-throw（不当发送态吞掉）；
+ *      processEmail 因此跳过 markProcessed → scheduler per-account guard 隔离该账号。
+ * 两种情形邮件均留待 at-least-once 重跑（动作幂等、重跑安全）。
  *
  * @param messageRowId 由 processEmail 在 saveEmail 后传入，动作行挂到这封邮件。
  */
@@ -164,6 +225,8 @@ export async function executeActions(
   messageRowId: string,
   deps: ExecuteActionsDeps,
 ): Promise<void> {
+  // 始终先落优先级（标签不被 shouldMarkRead 门控）；ProviderReauthRequired 会从此处向上抛。
+  await executeReflectPriority(email, decision, deps, messageRowId);
   if (decision.shouldMarkRead) {
     await executeMarkRead(email, deps, messageRowId);
   }

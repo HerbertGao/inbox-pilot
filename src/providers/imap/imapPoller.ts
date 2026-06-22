@@ -39,7 +39,7 @@ import {
   type ImapConnection,
   type MailboxStatus,
 } from './imapClient.js';
-import type { ImapAccount } from '../../accounts/accountService.js';
+import type { ImapAccount } from '../provider.js';
 
 /**
  * 单封处理结果（供 advanceHighWater 计算「连续已处理前缀」）。

@@ -2,6 +2,10 @@
 // recordAction+updateAction / markProcessed）：prisma 实现为真身，测试用内存实现。把 prisma
 // 细节挡在 processEmail 外」、spec「落库处理记录」「动作 I/O 经可注入 seam」）。
 //
+// 账号真相源（design 决策 1/2）：`MailAccount` 是**唯一账号真相源**——行本身即账号、`id`===accountId、
+// `authJson` 含真实凭据（不再有「env 是真相源、DB 仅锚定空 authJson」的旧模型）。账号写入路径
+// （createAccount/upsertAccount）显式设 `id`、列举枚举凭据 authJson；注册表加载读 enabled 行。
+//
 // processEmail / executeActions 只依赖此接口，prisma 细节不外泄；测试注入内存实现离线可测。
 //
 // 落库映射（design「落库映射（raw vs final 可恢复，无需迁移）」硬规格）：
@@ -16,6 +20,9 @@ import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
 
+/** Gmail authJson 的默认 scope（scopes 缺省回落，避免写 scopes:undefined）。与 oauth.ts 同值、不耦合其重量级依赖。 */
+const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
+
 /** 已存邮件行的最小投影（processEmail 去重判定只需 id + processedAt）。 */
 export type StoredEmail = {
   id: string;
@@ -23,56 +30,39 @@ export type StoredEmail = {
 };
 
 /**
- * DB 锚定行的最小入参（design 决策 1：env 是真相源，DB 仅存一行锚定）。
- * id = accountId（去重键），provider/email 为只写 denormalization、非真相源。
- * 口令绝不入此结构——仍只在 env / accountService 的内存对象（authJson 永远是空对象）。
+ * 注册表加载读到的 `MailAccount` 行（design 决策 1/2：`MailAccount` 是唯一账号真相源）。
+ * `authJson` 含真实凭据（imap:`{host,port,user,password,tls}` / gmail:`{refreshToken,scopes}`）——
+ * **绝不整体记录**（logger 整体 redact `authJson`；解析失败也只记 `{id, provider}`，见 accountRegistry）。
+ * `id` === accountId（去重键命名空间 + 游标落点）。
  */
-export type AnchorAccount = {
-  accountId: string;
-  /** best-effort denormalization（IMAP_USER 可能是登录名而非邮箱）；非真相源。 */
+export type StoredAccount = {
+  /** = accountId（写入路径显式设、覆盖 @default(cuid())）。 */
+  id: string;
+  /** provider 字符串（注册表加载校验 ∈ {imap,gmail}，未知者跳过）。 */
+  provider: string;
   email: string;
+  /** 凭据子树（绝不整体入日志）。形状校验由 accountRegistry 落地。 */
+  authJson: unknown;
+  enabled: boolean;
 };
 
 /**
- * mail_accounts 锚定 upsert 的调用参数形状（spec「需求:IMAP 账号加载与持久化锚定」）。
- * 与 prisma upsert 的 where/create/update 对齐。**两处必须钉死**：
- *   (a) where.id === create.id === accountId（覆盖 @default(cuid())，否则 id≠accountId、
- *       mail_messages.accountId 外键仍违约）；
- *   (b) create.authJson 为**非空空对象** {}（列为非空 Json、无默认，置 null 触发 NOT NULL
- *       违约——口令仍只在 env、绝不入此行）。
+ * 账号写入路径入参（CLI add / 一次性迁移 / 测试共用，取代被移除的 ensureAccountAnchor）。
+ * `id` **显式设 = 派生 accountId**（覆盖 @default(cuid())，否则 mail_messages.accountId 外键违约
+ * 或去重键换命名空间致历史重处理，见 spec「accountId 与 MailAccount.id 同一」）；`email` 非空。
+ * 口令/refresh token 在 `authJson` 内（整体 redact，绝不明文入日志）。
  */
-export type AnchorUpsertArgs = {
-  where: { id: string };
-  create: {
-    id: string;
-    provider: 'imap';
-    email: string;
-    authJson: Record<string, never>;
-    enabled: true;
-  };
-  update: Record<string, never>;
+export type AccountWriteInput = {
+  /** = 派生 accountId（gmail `gmail:<email>` / imap `--account-id`‖`imap:<user>@<host>`）。 */
+  id: string;
+  provider: 'imap' | 'gmail';
+  /** NOT NULL；gmail=getProfile 邮箱、imap=`--email`‖`user@host`（best-effort）。 */
+  email: string;
+  /** 真实凭据子树（imap/gmail 各自形状）；绝不明文入日志。 */
+  authJson: unknown;
+  /** 默认 enabled=true（恢复/re-auth 路径显式置 true 以解除 reauth-suspend）。 */
+  enabled?: boolean;
 };
-
-/**
- * 由账号纯函数构造锚定 upsert 参数（无副作用、无 DB——供 3.3 call-shape spy 在 CI 捕获
- * id≠accountId 回归）。PrismaMailRepo.ensureAccountAnchor 直接喂给 prisma.mailAccount.upsert。
- */
-export function buildAnchorUpsertArgs(account: AnchorAccount): AnchorUpsertArgs {
-  return {
-    where: { id: account.accountId },
-    create: {
-      // (a) 显式 id = accountId，覆盖 @default(cuid())。
-      id: account.accountId,
-      provider: 'imap',
-      // best-effort denormalization；非真相源。
-      email: account.email,
-      // (b) 非空空对象 {}（口令绝不入此行）。
-      authJson: {},
-      enabled: true,
-    },
-    update: {},
-  };
-}
 
 /**
  * rawAiJson 的审计块：原始 AI 建议 + 最终裁定的「非专列」字段。
@@ -95,17 +85,59 @@ export type RawAiJson = {
  * 方法语义见各方法注释；prisma 实现见 PrismaMailRepo，测试用 InMemoryMailRepo。
  *
  * 注：MailRepo 由此**有意跨两个聚合**——mail_messages 行（邮件落库/去重/分类/动作）
- * 与 mail_accounts 同步状态（锚定行 + lastSyncCursor 游标）。MVP 单 seam 省事（YAGNI、
- * 与既有 seam 一致），后续若有多账号/账号 CRUD 需求可拆出 `AccountSyncRepo`。
+ * 与 mail_accounts（账号注册表：`MailAccount` 是唯一账号真相源——CRUD + lastSyncCursor 游标）。
+ * MVP 单 seam 省事（YAGNI、与既有 seam 一致），后续若需可拆出 `AccountRepo`。
  */
 export type MailRepo = {
   /**
-   * 调度器启动前**无条件、幂等**确保 mail_accounts 存在 accountId 对应锚定行
-   * （spec「锚定行先于调度建立」）——否则首次 saveEmail 触发 FK 违约、被 poller
-   * per-email catch 静默吞掉每封。create.id 显式 = accountId（覆盖 @default(cuid())）、
-   * authJson 为非空空对象 {}（置 null 触发 NOT NULL 违约）；update 留空（已存行不改）。
+   * 列出所有 enabled=true 的 `MailAccount` 行（注册表加载用，见 accountRegistry）。
+   * `MailAccount` 是唯一账号真相源（不再有空 authJson 锚定行；行本身即账号、含真实凭据）。
+   * 无 enabled 账号 → 返回 []（服务正常启动、仅不轮询）。
    */
-  ensureAccountAnchor(account: AnchorAccount): Promise<void>;
+  listEnabledAccounts(): Promise<StoredAccount[]>;
+
+  /**
+   * 列出**所有** `MailAccount` 行（不按 enabled 过滤）——`account list` 用，使运营者能看到被
+   * reauth-suspend / 手动禁用（enabled=false）的账号并据此重授权/重启。仍**不**含凭据明文（authJson
+   * 整体 redact、CLI 仅打印 id/provider/email/enabled）。
+   */
+  listAccounts(): Promise<StoredAccount[]>;
+
+  /**
+   * 按 id 取单行（CLI 的「正在重新启用」探测用：re-auth 翻转一个 enabled=false 行时提示）。
+   * 无行 → null。仍不含凭据明文（authJson 整体 redact）。
+   */
+  getAccountById(id: string): Promise<StoredAccount | null>;
+
+  /**
+   * 显式写入账号行（CLI add / 一次性迁移 / 测试共用，取代被移除的 ensureAccountAnchor）。
+   * **主键 upsert**（不模糊查既有行）：`id` 显式 = 派生 accountId（覆盖 @default(cuid())）、
+   * `email` 非空、`authJson` 含真实凭据。已存 id → 更新凭据/email/enabled（同邮箱不分裂）。
+   * 这是 spec「注册表行必须先于该账号被调度而存在」的建行路径；首次 saveEmail 的 FK 天然成立。
+   */
+  upsertAccount(input: AccountWriteInput): Promise<void>;
+
+  /**
+   * 创建账号行（CLI `account add --imap` 的 reject-on-exists 路径用——id 已存在则抛）。
+   * 与 upsertAccount 共用同一显式 id / authJson 写入约束；语义差别仅「已存即拒」。
+   */
+  createAccount(input: AccountWriteInput): Promise<void>;
+
+  /**
+   * 置 `MailAccount.enabled`（reauth-suspend 持久化 / CLI disable 用）——复用既有 enabled 列、
+   * 无 schema 迁移。`setAccountEnabled(id, false)` 使下次启动不再加载该账号。
+   */
+  setAccountEnabled(id: string, enabled: boolean): Promise<void>;
+
+  /**
+   * 运行期 refresh 后**只更新 Gmail 账号 authJson 的 token 字段**（refreshToken + scopes），
+   * **绝不触碰 `enabled`**——否则会把 scheduler 刚因 reauth 暂停（enabled=false）的账号重新启用。
+   * `enabled:true` 仅保留给显式 CLI 重授权（cli/account.ts --gmail）。无 schema 迁移（写既有 authJson 列）。
+   */
+  updateGmailTokens(
+    id: string,
+    tokens: { refreshToken: string; scopes?: string[] },
+  ): Promise<void>;
 
   /** 读 mail_accounts.lastSyncCursor（增量游标）；无行 / 未设返回 null。 */
   getCursor(accountId: string): Promise<string | null>;
@@ -171,10 +203,90 @@ export function buildRawAiJson(
  * 挡在流水线外。注：prisma 唯一键/SQL 行为的真测在接真实 DB 时验证（design 风险条已列）。
  */
 export class PrismaMailRepo implements MailRepo {
-  async ensureAccountAnchor(account: AnchorAccount): Promise<void> {
-    // 调度器 arm 前 await 完成；幂等（重复启动复用已存行，update 留空）。
-    // 参数经 buildAnchorUpsertArgs 钉死 where.id===create.id===accountId、authJson==={}。
-    await prisma.mailAccount.upsert(buildAnchorUpsertArgs(account));
+  async listEnabledAccounts(): Promise<StoredAccount[]> {
+    const rows = await prisma.mailAccount.findMany({
+      where: { enabled: true },
+      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      provider: r.provider,
+      email: r.email,
+      authJson: r.authJson,
+      enabled: r.enabled,
+    }));
+  }
+
+  async listAccounts(): Promise<StoredAccount[]> {
+    const rows = await prisma.mailAccount.findMany({
+      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      provider: r.provider,
+      email: r.email,
+      authJson: r.authJson,
+      enabled: r.enabled,
+    }));
+  }
+
+  async getAccountById(id: string): Promise<StoredAccount | null> {
+    const r = await prisma.mailAccount.findUnique({
+      where: { id },
+      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+    });
+    if (r === null) {
+      return null;
+    }
+    return { id: r.id, provider: r.provider, email: r.email, authJson: r.authJson, enabled: r.enabled };
+  }
+
+  async upsertAccount(input: AccountWriteInput): Promise<void> {
+    const authJson = input.authJson as object;
+    const enabled = input.enabled ?? true;
+    await prisma.mailAccount.upsert({
+      where: { id: input.id },
+      // 显式 id = 派生 accountId（覆盖 @default(cuid())，FK 成立 / 去重命名空间稳定的硬要求）。
+      create: {
+        id: input.id,
+        provider: input.provider,
+        email: input.email,
+        authJson,
+        enabled,
+      },
+      // 同邮箱重加 / re-auth：更新凭据/email/enabled（命中同一行、不分裂）。
+      update: { provider: input.provider, email: input.email, authJson, enabled },
+    });
+  }
+
+  async createAccount(input: AccountWriteInput): Promise<void> {
+    // reject-on-exists：id 已存在 → prisma 抛唯一键冲突（CLI --imap 默认拒绝路径）。
+    await prisma.mailAccount.create({
+      data: {
+        id: input.id,
+        provider: input.provider,
+        email: input.email,
+        authJson: input.authJson as object,
+        enabled: input.enabled ?? true,
+      },
+    });
+  }
+
+  async setAccountEnabled(id: string, enabled: boolean): Promise<void> {
+    await prisma.mailAccount.update({ where: { id }, data: { enabled } });
+  }
+
+  async updateGmailTokens(
+    id: string,
+    tokens: { refreshToken: string; scopes?: string[] },
+  ): Promise<void> {
+    // 只更新 authJson 的 token 字段、**不触碰 enabled**（保 reauth-suspend 的 enabled=false 不被复活）。
+    // scopes 未提供时回落 [GMAIL_MODIFY_SCOPE]（绝不写 scopes:undefined）。
+    const authJson = {
+      refreshToken: tokens.refreshToken,
+      scopes: tokens.scopes ?? [GMAIL_MODIFY_SCOPE],
+    };
+    await prisma.mailAccount.update({ where: { id }, data: { authJson } });
   }
 
   async getCursor(accountId: string): Promise<string | null> {

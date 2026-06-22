@@ -17,6 +17,8 @@ import { test } from 'node:test';
 import { processEmail, type ClassifyFn } from './processEmail.js';
 import { InMemoryMailRepo } from '../repo/inMemoryMailRepo.js';
 import { FakeProviderActions, type ProviderActions } from '../actions/providerActions.js';
+import { ProviderReauthRequired } from '../providers/provider.js';
+import type { FinalDecision } from '../rules/finalDecision.js';
 import { createNotifier } from '../notify/notifier.js';
 import type {
   NotificationChannel,
@@ -95,9 +97,13 @@ function makeRecordingChannel(
 }
 
 // 恒抛的假 provider（断言标已读失败 → failed + 有界重试），记尝试次数。
+// reflectPriority no-op（executeActions 始终先调它；本桩只验 markRead 失败语义）。
 function makeThrowingProvider(): ProviderActions & { attempts: number } {
   const provider = {
     attempts: 0,
+    async reflectPriority(): Promise<void> {
+      // no-op：不影响本用例对 markRead 失败的断言。
+    },
     async markRead(_email: NormalizedEmail): Promise<void> {
       provider.attempts += 1;
       throw new Error('fake markRead failure');
@@ -486,4 +492,81 @@ test('updateAction(done) 在 notify 成功后抛 → 不重发通知（sendCount
   // markProcessed 未执行（落库链中断）→ 留待 at-least-once 重跑。
   const after = await repo.findByDedupKey(email.accountId, email.providerMessageId);
   assert.ok(after !== null && after.processedAt === null, '落库中断后不应 markProcessed');
+});
+
+// ——————————————————————————————————————————————————————————
+// ProviderReauthRequired（致命）：reflectPriority 抛 → executeActions 重抛 →
+// processEmail 跳过 markProcessed；in-flight reflect_priority 行为 failed 非 pending
+// ——————————————————————————————————————————————————————————
+
+test('reflectPriority 抛 ProviderReauthRequired → processEmail 向上抛、markProcessed 不调用、reflect_priority 行 failed 非 pending', async () => {
+  const repo = new InMemoryMailRepo();
+  // provider.reflectPriority 抛致命 ProviderReauthRequired；markRead 不应被调到（reflectPriority 先于 markRead 且抛断流程）。
+  const provider: ProviderActions & { markReadCalls: number } = {
+    markReadCalls: 0,
+    async reflectPriority(
+      _email: NormalizedEmail,
+      _decision: FinalDecision,
+    ): Promise<void> {
+      throw new ProviderReauthRequired('acct-1');
+    },
+    async markRead(_email: NormalizedEmail): Promise<void> {
+      provider.markReadCalls += 1;
+    },
+  };
+  const channel = makeRecordingChannel();
+  const notifier = createNotifier({ channel });
+  const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
+  const email = makeEmail();
+
+  await assert.rejects(
+    processEmail(email, { repo, provider, notifier, classify }),
+    (err: unknown) => err instanceof ProviderReauthRequired,
+  );
+
+  const rowId = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!.id;
+  // reflect_priority 行落 failed（非 orphan pending）。
+  const reflect = repo.getActions(rowId).find((a) => a.actionType === 'reflect_priority');
+  assert.ok(reflect, '应有 reflect_priority 动作行');
+  assert.equal(reflect.status, 'failed', 'reflect_priority 行应为 failed、非 pending');
+  assert.notEqual(reflect.status, 'pending');
+  // markRead 未被调（reflectPriority 抛断流程）。
+  assert.equal(provider.markReadCalls, 0, 'reflectPriority 抛后不应再调 markRead');
+  // markProcessed 跳过（致命错误向上传播）。
+  const after = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!;
+  assert.equal(after.processedAt, null, 'ProviderReauthRequired 后必须跳过 markProcessed');
+});
+
+test('markRead 抛 ProviderReauthRequired（P2，reflectPriority 先成功）→ 向上抛、markProcessed 不调用、mark_read 行 failed', async () => {
+  const repo = new InMemoryMailRepo();
+  const provider: ProviderActions & { reflectCalls: number } = {
+    reflectCalls: 0,
+    async reflectPriority(): Promise<void> {
+      provider.reflectCalls += 1; // 成功
+    },
+    async markRead(_email: NormalizedEmail): Promise<void> {
+      throw new ProviderReauthRequired('acct-1');
+    },
+  };
+  const channel = makeRecordingChannel();
+  const notifier = createNotifier({ channel });
+  const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
+  const email = makeEmail();
+
+  await assert.rejects(
+    processEmail(email, { repo, provider, notifier, classify }),
+    (err: unknown) => err instanceof ProviderReauthRequired,
+  );
+
+  const rowId = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!.id;
+  // reflectPriority 先成功落 done。
+  assert.equal(provider.reflectCalls, 1);
+  const reflect = repo.getActions(rowId).find((a) => a.actionType === 'reflect_priority');
+  assert.equal(reflect?.status, 'done');
+  // mark_read 行落 failed（非 orphan pending）。
+  const markRead = repo.getActions(rowId).find((a) => a.actionType === 'mark_read');
+  assert.equal(markRead?.status, 'failed', 'mark_read 行应为 failed、非 pending');
+  // markProcessed 跳过。
+  const after = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!;
+  assert.equal(after.processedAt, null, 'ProviderReauthRequired 后必须跳过 markProcessed');
 });

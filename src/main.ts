@@ -5,10 +5,14 @@ import { logger } from './logger.js';
 import { prisma } from './db/prisma.js';
 import Fastify from 'fastify';
 import type { ScheduledTask } from 'node-cron';
-import { loadImapAccount, ImapConfigError } from './accounts/accountService.js';
+import { loadEnabledAccounts } from './accounts/accountRegistry.js';
 import { PrismaMailRepo } from './repo/mailRepo.js';
+import { startAccountSchedulers, type ScheduledAccount } from './jobs/scheduler.js';
+import type { Account } from './providers/provider.js';
 import { pollAccount } from './providers/imap/imapPoller.js';
-import { startScheduler } from './jobs/scheduler.js';
+import { createGmailClient } from './providers/gmail/gmailClient.js';
+import { createGmailProvider } from './providers/gmail/gmailActions.js';
+import { createGmailPoller } from './providers/gmail/gmailPoller.js';
 
 // /health 的 DB 探测超时（毫秒）。Promise.race 只取消等待，不真正中断底层
 // 查询/连接池取用——可接受（liveness only，禁止挂起）。
@@ -44,18 +48,18 @@ app.get('/health', async (_request, reply) => {
   }
 });
 
-// IMAP 轮询调度任务（仅在账号存在时被赋值）。优雅关闭时先停止调度，避免在 fastify/prisma
+// per-account 轮询调度任务（每个 enabled 账号一个）。优雅关闭时先停止全部调度，避免在 fastify/prisma
 // 关闭后仍有 cron 触发新一轮轮询。
-let schedulerTask: ScheduledTask | undefined;
+let schedulerTasks: ScheduledTask[] = [];
 
-// 优雅关闭：best-effort 停止调度 + 关闭 fastify 与 prisma，再退出。包 try/catch，失败也退出。
+// 优雅关闭：best-effort 停止全部调度 + 关闭 fastify 与 prisma，再退出。包 try/catch，失败也退出。
 // entrypoint 用 exec 使 SIGTERM/SIGINT 直达 node。P0 无在途业务，不强求 drain。
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   app.log.info({ msg: 'shutting down', signal });
-  // 先停调度：不再触发新一轮轮询（在途的一轮由其自身 finally 释放锁，不阻塞关闭）。
-  if (schedulerTask !== undefined) {
+  // 先停全部调度：不再触发新一轮轮询（在途的一轮由其自身 finally 释放锁与信号量名额，不阻塞关闭）。
+  for (const task of schedulerTasks) {
     try {
-      schedulerTask.stop();
+      task.stop();
     } catch (error) {
       const message = error instanceof Error ? error.message : 'unknown error';
       app.log.warn({ msg: 'scheduler stop failed', error: message });
@@ -92,41 +96,91 @@ try {
   process.exit(1);
 }
 
-// —— IMAP 接入（6.3，spec「需求:IMAP 账号加载与持久化锚定」）——
-// listen 成功后（/health 已可用）再启用 IMAP 轮询：
-//   - 账号存在 → ensureAccountAnchor（在 arm 调度前 await 完成，使首轮 saveEmail 已有父行，
-//     spec「锚定行先于调度建立」）→ 启动调度器，每 tick 调用 pollAccount（注入真实 IMAP I/O）。
-//   - 缺 IMAP_HOST → loadImapAccount 返回 null → 只记一条信息日志、不启用（服务其余正常运行）。
-//   - IMAP_HOST 已设而凭据缺 → loadImapAccount 抛 ImapConfigError → fail-fast（非零退出），
-//     与 config fail-fast 一致，不静默禁用。
-try {
-  const account = loadImapAccount(config);
-  if (account === null) {
-    // 缺 host：IMAP 为可选 provider，禁用而非崩溃（/health 等其余部分正常运行）。
-    app.log.info({ msg: 'IMAP disabled (no IMAP_HOST)' });
-  } else {
-    const repo = new PrismaMailRepo();
-    // 锚定 upsert 必须在 arm 调度前 await 完成（首轮任何 saveEmail 都已有父行）。
-    await repo.ensureAccountAnchor({ accountId: account.accountId, email: account.user });
-    // arm 调度：每 tick 经不重入锁调用 pollAccount（内部每轮新建真实 imapflow 连接、用完即关）。
-    schedulerTask = startScheduler(
-      () => pollAccount(account, repo),
-      config.POLL_INTERVAL_SECONDS,
-    );
-    app.log.info({
-      msg: 'IMAP polling enabled',
+// —— 账号注册表加载 + per-account 调度（spec account-registry「需求:从注册表加载多账号」
+//    「需求:per-account 调度与故障隔离」、design 决策 7、tasks 5.3）——
+//
+// listen 成功后（/health 已可用）从 DB 注册表加载 enabled 账号 → 为每账号按 provider 构造 poller →
+// 启动 per-account 调度（共享信号量 + 单轮超时 + reauth-suspend）。无账号 → 只记日志、不轮询。
+//
+// gmail 账号若 GMAIL_CLIENT_* 不全（onboarding 未配齐）→ 无法构造 client：记日志跳过该账号（沿用
+// imap「配置不全则禁用一个账号」模式），其余账号照常调度、服务正常运行。
+
+/**
+ * 把一个加载后的 Account 转为「执行一轮该账号轮询」的 poll 闭包；无法构造（gmail 缺 app 凭据）→ null。
+ * 凭据纪律：闭包内不整体记录 account/凭据对象；构造失败只记 `{accountId, provider, reason}`。
+ */
+function buildAccountPoll(account: Account, repo: PrismaMailRepo): (() => Promise<void>) | null {
+  if (account.provider === 'imap') {
+    // IMAP：每轮新建连接 → pollOnce → logout（连接生命周期归 pollAccount）。
+    return () => pollAccount(account, repo);
+  }
+  // gmail：需 app 凭据（GMAIL_CLIENT_ID/SECRET，从 env）。缺则无法构造 client → 跳过该账号。
+  const clientId = config.GMAIL_CLIENT_ID;
+  const clientSecret = config.GMAIL_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    app.log.warn({
+      msg: 'gmail account skipped: missing app credentials',
       accountId: account.accountId,
-      pollIntervalSeconds: config.POLL_INTERVAL_SECONDS,
+      provider: account.provider,
+      reason: 'gmail-app-credentials-missing',
     });
+    return null;
   }
+  // 每轮构造一个按 refresh token 自动 refresh 的 GmailApi（access token 运行期换、不长存）；
+  // refresh 后仅轮换的 refreshToken 经 setAccountEnabled 同表的写入路径回写（best-effort 持久化）。
+  //
+  // **轮换后的 refreshToken 必须在进程内传播到下一轮**：每轮都用 `currentRefreshToken` 构造 client，
+  // 并在回写时**先**更新 `currentRefreshToken`、**再**写 DB。否则每轮都用启动时捕获的旧 token；Google
+  // 轮换后下一轮仍用陈旧值 → `invalid_grant` → 误把健康账号 suspend 到重启（闭包不共享回写值的缺陷）。
+  let currentRefreshToken = account.refreshToken;
+  return () => {
+    const gmail = createGmailClient(account.accountId, {
+      clientId,
+      clientSecret,
+      refreshToken: currentRefreshToken,
+      persistRefreshToken: async (accountId, refreshToken) => {
+        // 仅回写轮换后的 refreshToken（绝不写 access_token/expiry 入 authJson）。
+        // **先**更新进程内 currentRefreshToken（下一轮 client 即用轮换后的值，不再用陈旧捕获值），
+        // **再** await 写 DB（持久化 best-effort）。
+        currentRefreshToken = refreshToken;
+        // **只更新 authJson token 字段、绝不触碰 enabled**——否则会把 scheduler 刚因 reauth 暂停
+        // （enabled=false）的账号重新启用（enabled:true 仅保留给显式 CLI 重授权）。
+        // scopes 缺省回落（updateGmailTokens 内回落 [gmail.modify]，绝不写 scopes:undefined）。
+        await repo.updateGmailTokens(accountId, { refreshToken, scopes: account.scopes });
+      },
+    });
+    const provider = createGmailProvider(account.accountId, gmail);
+    const poller = createGmailPoller(account.accountId, { gmail, repo, provider });
+    return poller.poll();
+  };
+}
+
+try {
+  const repo = new PrismaMailRepo();
+  const accounts = await loadEnabledAccounts(repo);
+
+  const scheduled: ScheduledAccount[] = [];
+  for (const account of accounts) {
+    const poll = buildAccountPoll(account, repo);
+    if (poll !== null) {
+      scheduled.push({ accountId: account.accountId, poll });
+    }
+  }
+
+  app.log.info({
+    msg: 'account registry loaded',
+    accountCount: accounts.length,
+    scheduledCount: scheduled.length,
+    pollIntervalSeconds: config.POLL_INTERVAL_SECONDS,
+  });
+
+  // 无可调度账号 → startAccountSchedulers 返回 []（不调度）；服务正常运行（/health 可用）。
+  schedulerTasks = startAccountSchedulers(scheduled, repo, {
+    intervalSeconds: config.POLL_INTERVAL_SECONDS,
+  });
 } catch (error) {
-  if (error instanceof ImapConfigError) {
-    // host 有而凭据缺：配置错误，fail-fast（非零退出），不静默禁用。
-    app.log.error({ msg: 'IMAP misconfigured, refusing to start', error: error.message });
-    process.exit(1);
-  }
-  // 其它启用期错误（如锚定 upsert 的 DB 错误）：无法保证「锚定行先于调度」，同样 fail-fast。
+  // 注册表加载本身失败（DB 错误）：fail-fast，不静默以空账号继续。只记脱敏字段。
   const message = error instanceof Error ? error.message : 'unknown error';
-  app.log.error({ msg: 'failed to enable IMAP polling', error: message });
+  app.log.error({ msg: 'failed to load account registry', error: message });
   process.exit(1);
 }

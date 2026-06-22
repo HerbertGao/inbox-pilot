@@ -12,12 +12,11 @@ import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
 import {
-  buildAnchorUpsertArgs,
   buildRawAiJson,
-  type AnchorAccount,
-  type AnchorUpsertArgs,
+  type AccountWriteInput,
   type MailRepo,
   type RawAiJson,
+  type StoredAccount,
   type StoredEmail,
 } from './mailRepo.js';
 
@@ -53,16 +52,22 @@ export type ActionRow = {
   createdAt: Date;
 };
 
+/** 内存账号行（注册表加载 / 写入路径；authJson 含真实凭据，绝不整体记录）。 */
+type AccountRow = {
+  id: string;
+  provider: string;
+  email: string;
+  authJson: unknown;
+  enabled: boolean;
+};
+
 export class InMemoryMailRepo implements MailRepo {
   private readonly emailsById = new Map<string, EmailRow>();
   private readonly emailIdByDedupKey = new Map<string, string>();
-  /** 锚定行：accountId → 同步游标（lastSyncCursor）。供 4.5 离线测试与游标推进断言。 */
+  /** 账号行：id → 行（`MailAccount` 是唯一账号真相源）。游标存其 lastSyncCursor 字段。 */
+  private readonly accountsById = new Map<string, AccountRow>();
+  /** id → 同步游标（lastSyncCursor）。仅对已写入账号有效（未写入即抛，见 setCursor）。 */
   private readonly cursorsByAccountId = new Map<string, string | null>();
-  /**
-   * call-shape spy：每次 ensureAccountAnchor 记下构造出的 upsert 参数（供 3.3 断言
-   * where.id === create.id === accountId 且 authJson === {}，无需真库即在 CI 捕获 id≠accountId 回归）。
-   */
-  readonly anchorUpsertCalls: AnchorUpsertArgs[] = [];
   /** 暴露给测试断言；按插入顺序。 */
   readonly classifications: ClassificationRow[] = [];
   /** 暴露给测试断言；按插入顺序。 */
@@ -70,13 +75,74 @@ export class InMemoryMailRepo implements MailRepo {
 
   private seq = 0;
 
-  async ensureAccountAnchor(account: AnchorAccount): Promise<void> {
-    // 复用与 prisma 同一纯函数构造参数（call-shape 一致）；幂等：已存行不覆盖游标。
-    const args = buildAnchorUpsertArgs(account);
-    this.anchorUpsertCalls.push(args);
-    if (!this.cursorsByAccountId.has(account.accountId)) {
-      this.cursorsByAccountId.set(account.accountId, null);
+  async listEnabledAccounts(): Promise<StoredAccount[]> {
+    const rows: StoredAccount[] = [];
+    for (const row of this.accountsById.values()) {
+      if (row.enabled) {
+        rows.push({ ...row });
+      }
     }
+    return rows;
+  }
+
+  async listAccounts(): Promise<StoredAccount[]> {
+    // 所有行（不按 enabled 过滤）——account list 用，使被禁用/reauth-suspend 的行可见。
+    const rows: StoredAccount[] = [];
+    for (const row of this.accountsById.values()) {
+      rows.push({ ...row });
+    }
+    return rows;
+  }
+
+  async getAccountById(id: string): Promise<StoredAccount | null> {
+    const row = this.accountsById.get(id);
+    return row === undefined ? null : { ...row };
+  }
+
+  async updateGmailTokens(
+    id: string,
+    tokens: { refreshToken: string; scopes?: string[] },
+  ): Promise<void> {
+    // 只更新 authJson 的 token 字段、**不触碰 enabled**（保 reauth-suspend 不被复活）。
+    const row = this.accountsById.get(id);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.updateGmailTokens: 未知 accountId ${id}`);
+    }
+    row.authJson = {
+      refreshToken: tokens.refreshToken,
+      scopes: tokens.scopes ?? ['https://www.googleapis.com/auth/gmail.modify'],
+    };
+  }
+
+  async upsertAccount(input: AccountWriteInput): Promise<void> {
+    // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
+    this.accountsById.set(input.id, {
+      id: input.id,
+      provider: input.provider,
+      email: input.email,
+      authJson: input.authJson,
+      enabled: input.enabled ?? true,
+    });
+    // 写入路径即「播种」游标命名空间（取代旧 ensureAccountAnchor）；幂等：已存不重置游标。
+    if (!this.cursorsByAccountId.has(input.id)) {
+      this.cursorsByAccountId.set(input.id, null);
+    }
+  }
+
+  async createAccount(input: AccountWriteInput): Promise<void> {
+    // reject-on-exists（与 prisma create 的唯一键冲突语义一致）。
+    if (this.accountsById.has(input.id)) {
+      throw new Error(`InMemoryMailRepo.createAccount: 账号已存在 ${input.id}`);
+    }
+    await this.upsertAccount(input);
+  }
+
+  async setAccountEnabled(id: string, enabled: boolean): Promise<void> {
+    const row = this.accountsById.get(id);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.setAccountEnabled: 未知 accountId ${id}`);
+    }
+    row.enabled = enabled;
   }
 
   async getCursor(accountId: string): Promise<string | null> {
@@ -84,10 +150,10 @@ export class InMemoryMailRepo implements MailRepo {
   }
 
   async setCursor(accountId: string, cursor: string): Promise<void> {
-    // 与 PrismaMailRepo.setCursor（update→未知账号即抛）保持契约一致：未锚定即抛，
-    // 使「漏调 ensureAccountAnchor」在测试就暴露、而非到生产才报。
+    // 与 PrismaMailRepo.setCursor（update→未知账号即抛）保持契约一致：账号未写入即抛，
+    // 使「漏调 createAccount/upsertAccount」在测试就暴露、而非到生产才报。
     if (!this.cursorsByAccountId.has(accountId)) {
-      throw new Error(`InMemoryMailRepo.setCursor: 未锚定的 accountId ${accountId}`);
+      throw new Error(`InMemoryMailRepo.setCursor: 未写入的 accountId ${accountId}`);
     }
     this.cursorsByAccountId.set(accountId, cursor);
   }
