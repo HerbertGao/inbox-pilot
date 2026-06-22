@@ -51,10 +51,12 @@ export type CliDeps = {
   gmailApp: () => { available: boolean; clientId?: string; clientSecret?: string };
 };
 
-/** 解析后的 flag 集合（值型 flag + 布尔 flag）。 */
+/** 解析后的 flag 集合（值型 flag + 布尔 flag + 裸位置参数）。 */
 type ParsedFlags = {
   values: Map<string, string>;
   bools: Set<string>;
+  /** 非 `--` 开头的裸 token（位置参数）；本 CLI 不接受，调用方据此拒绝（防误把机密当位置参数落 argv/history）。 */
+  positionals: string[];
 };
 
 /**
@@ -66,9 +68,12 @@ type ParsedFlags = {
 function parseFlags(args: string[]): ParsedFlags {
   const values = new Map<string, string>();
   const bools = new Set<string>();
+  const positionals: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const tok = args[i]!;
     if (!tok.startsWith('--')) {
+      // 裸 token：收集供调用方拒绝（不静默忽略——防误把机密当位置参数传入而落 argv/shell 历史）。
+      positionals.push(tok);
       continue;
     }
     const body = tok.slice(2);
@@ -89,7 +94,7 @@ function parseFlags(args: string[]): ParsedFlags {
       i += 1;
     }
   }
-  return { values, bools };
+  return { values, bools, positionals };
 }
 
 /** 口令/机密的 flag 名单——出现在 argv 即拒绝（口令只经 prompt/stdin）。 */
@@ -128,29 +133,42 @@ const USAGE = [
  */
 export async function runAccountCli(argv: string[], deps: CliDeps): Promise<number> {
   const [command, ...rest] = argv;
-  switch (command) {
-    case 'add':
-      return cmdAdd(rest, deps);
-    case 'list':
-      return cmdList(deps);
-    case 'disable':
-      return cmdDisable(rest, deps);
-    case undefined:
-    case 'help':
-    case '--help':
-    case '-h':
-      deps.println(USAGE);
-      return command === undefined ? EXIT_USAGE : EXIT_OK;
-    default:
-      deps.errln(`未知命令: ${command}`);
-      deps.errln(USAGE);
-      return EXIT_USAGE;
+  try {
+    switch (command) {
+      case 'add':
+        return await cmdAdd(rest, deps);
+      case 'list':
+        return await cmdList(deps);
+      case 'disable':
+        return await cmdDisable(rest, deps);
+      case undefined:
+      case 'help':
+      case '--help':
+      case '-h':
+        deps.println(USAGE);
+        return command === undefined ? EXIT_USAGE : EXIT_OK;
+      default:
+        deps.errln(`未知命令: ${command}`);
+        deps.errln(USAGE);
+        return EXIT_USAGE;
+    }
+  } catch {
+    // 顶层脱敏边界：写路径 / repo 可能抛（DB/网络/运行期）——**绝不**把原始 error 打到 stderr
+    // （Prisma 错误可内嵌 DATABASE_URL/凭据子串）。只输出固定文案 + EXIT_FAILURE（详情走结构化日志）。
+    deps.errln('命令执行失败（已脱敏；详见服务日志）。');
+    return EXIT_FAILURE;
   }
 }
 
 /** `account add --imap | --gmail`。 */
 async function cmdAdd(args: string[], deps: CliDeps): Promise<number> {
   const flags = parseFlags(args);
+
+  // 拒绝裸位置参数（只接受显式 flag）：防误把机密当位置参数传入而落 argv/shell 历史/ps。
+  if (flags.positionals.length > 0) {
+    deps.errln('add 不接受位置参数（只用显式 --flag）；口令/机密只经交互提示输入，绝不经命令行。');
+    return EXIT_USAGE;
+  }
 
   // 硬约束：口令/机密绝不经 argv（落 shell 历史 / ps）。任何机密 flag 出现即拒。
   const forbidden = findForbiddenSecretFlag(flags);
@@ -222,10 +240,21 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     // 默认 reject-on-exists（createAccount 命中已存 id 即抛）——不静默覆盖。
     await deps.repo.createAccount({ id, provider: 'imap', email, authJson, enabled: true });
   } catch {
-    // id 已存在：拒绝并提示（凭据纪律：不记原始 error/凭据；只提示 id）。
-    deps.errln(
-      `拒绝: 账号已存在 (${id})。如需更新凭据请加 --update 显式确认（不会静默覆盖）。`,
-    );
+    // 区分「id 已存在」与「存储/网络/运行期写失败」——一律报「已存在」会给错指引。
+    // getAccountById 自身也可能抛（DB 不可达）→ 再包一层、抛则按通用写失败处理（凭据纪律：不记原始 error）。
+    let exists = false;
+    try {
+      exists = (await deps.repo.getAccountById(id)) !== null;
+    } catch {
+      exists = false;
+    }
+    if (exists) {
+      deps.errln(
+        `拒绝: 账号已存在 (${id})。如需更新凭据请加 --update 显式确认（不会静默覆盖）。`,
+      );
+    } else {
+      deps.errln(`新增失败: 无法写入账号 ${id}（存储/网络错误）。请重试或检查连接。`);
+    }
     return EXIT_FAILURE;
   }
   deps.println(`已新增 IMAP 账号: ${id}（email=${email}）。重启后生效。`);

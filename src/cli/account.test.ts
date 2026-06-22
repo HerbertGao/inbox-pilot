@@ -231,6 +231,18 @@ test('account add --imap：--secret/--token/--refresh-token 经 argv 同样拒�
   assert.equal((await repo.listEnabledAccounts()).length, 0);
 });
 
+test('account add：含裸位置参数 → 参数错误（防机密误作位置参数落 argv/history）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '--email', 'me@example.com', '--host', 'h', 'STRAY_SECRET'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '裸位置参数 → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '未建任何行');
+  assert.ok(!err.join('\n').includes('STRAY_SECRET'), '不回显位置参数值');
+});
+
 // ——————————————————————————————————————————————————————————
 // 同 id 拒绝（默认 reject-on-exists）/ --update 显式确认
 // ——————————————————————————————————————————————————————————
@@ -254,6 +266,24 @@ test('account add --imap：同派生 id 已存在 → 默认拒绝、不静默�
   // 凭据未被覆盖（仍是 OLD_PW）。
   const auth = (await repo.listEnabledAccounts())[0]!.authJson as Record<string, unknown>;
   assert.equal(auth.password, 'OLD_PW', '不静默覆盖凭据');
+});
+
+test('account add --imap：createAccount 因存储/网络失败（非重复）→ 报「新增失败」非「已存在」、不泄露', async () => {
+  const repo = new InMemoryMailRepo();
+  // 写入抛错但该 id 并不存在（getAccountById 返回 null）：模拟 DB/网络写失败，非重复。
+  repo.createAccount = async () => {
+    throw new Error('postgresql://u:SECRET_PW@h/db connection refused');
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '--email', 'me@example.com', '--host', 'h'],
+    deps,
+  );
+  assert.equal(code, EXIT_FAILURE);
+  const text = err.join('\n');
+  assert.ok(text.includes('新增失败'), '非重复写失败 → 报「新增失败」');
+  assert.ok(!text.includes('已存在'), '不误报「已存在」');
+  assert.ok(!text.includes('SECRET_PW'), '不泄露原始 error（含连接串口令）');
 });
 
 test('account add --imap --update：同 id 显式确认 → 更新凭据（不分裂、命中同一行）', async () => {
@@ -447,4 +477,22 @@ test('未知命令 → 参数错误 + 用法', async () => {
   const repo = new InMemoryMailRepo();
   const { deps } = makeDeps(repo);
   assert.equal(await runAccountCli(['bogus'], deps), EXIT_USAGE);
+});
+
+// ——————————————————————————————————————————————————————————
+// 顶层脱敏错误边界：未捕获的 repo 异常 → EXIT_FAILURE + 固定文案、不泄露原始 error
+// ——————————————————————————————————————————————————————————
+
+test('runAccountCli：命令抛出（如 list 的 repo 故障）→ EXIT_FAILURE + 脱敏文案、不泄露连接串/凭据', async () => {
+  const repo = new InMemoryMailRepo();
+  // list 路径无内层 try/catch；repo 故障须由顶层边界脱敏接住（含连接串口令子串）。
+  repo.listAccounts = async () => {
+    throw new Error('postgresql://u:SECRET_PW@h/db connection lost');
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['list'], deps);
+  assert.equal(code, EXIT_FAILURE, '未捕获异常 → 业务失败退出（不崩、不静默成功）');
+  const text = err.join('\n');
+  assert.ok(text.includes('命令执行失败'), '顶层脱敏文案');
+  assert.ok(!text.includes('SECRET_PW'), '不把原始 error（含连接串口令子串）打到 stderr');
 });

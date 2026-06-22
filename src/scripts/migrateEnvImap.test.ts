@@ -131,6 +131,22 @@ test('迁移重跑：游标在两次迁移间保持（upsert 不重置已播种�
   assert.equal(await repo.getCursor(accountId), 'cursor-after-poll', '重跑迁移不重置游标');
 });
 
+test('迁移重跑：保留已存行的 enabled（不静默重新启用被 reauth-suspend/手动 disable 的账号）', async () => {
+  const repo = new InMemoryMailRepo();
+  const env = baseEnv();
+  const r1 = await migrateEnvImap(repo, env);
+  assert.equal(r1.migrated, true);
+  const accountId = r1.migrated ? r1.accountId : '';
+  // 该账号此后被 reauth-suspend / 手动 disable。
+  await repo.setAccountEnabled(accountId, false);
+
+  // 重跑迁移（重启再迁移）：绝不把已禁用账号静默重新启用。
+  await migrateEnvImap(repo, env);
+  const row = await repo.getAccountById(accountId);
+  assert.equal(row?.enabled, false, '重跑迁移保留 enabled=false（不静默重新启用）');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '该账号仍不在 enabled 集');
+});
+
 // ——————————————————————————————————————————————————————————
 // 同邮箱后续 CLI add --account-id 对齐同一 id（不分裂）
 // ——————————————————————————————————————————————————————————

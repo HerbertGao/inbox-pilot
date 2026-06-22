@@ -73,13 +73,18 @@ export async function migrateEnvImap(
   // email：NOT NULL，best-effort。user 已是完整邮箱（含 @）则原样用，避免 me@x.com@host 的重复。
   const email = user.includes('@') ? user : `${user}@${host}`;
 
+  // enabled：保留已存行的状态——重跑迁移**绝不**把已被 reauth-suspend / 手动 disable 的账号静默
+  // 重新启用（与 updateGmailTokens / CLI「enabled:true 仅显式重授权」纪律一致）；新行默认 true。
+  const existing = await repo.getAccountById(accountId);
+  const enabled = existing?.enabled ?? true;
+
   // 凭据写 authJson（整体 redact）；upsert 幂等（主键命中同一行、不分裂）。
   await repo.upsertAccount({
     id: accountId,
     provider: 'imap',
     email,
     authJson: { host, port: env.port, user, password, tls: env.tls },
-    enabled: true,
+    enabled,
   });
 
   // 脱敏日志：只记 {accountId, email}，绝不记 authJson / 口令。

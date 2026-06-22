@@ -77,9 +77,12 @@ export const REDACT_PATHS: string[] = [
       '*.codeVerifier',
       'code_verifier',
       '*.code_verifier',
-      // authorization（小写）：防 headers 对象直接入日志泄露 bearer（主防仍是「不记原始 error」）。
+      // authorization：防 headers 对象直接入日志泄露 bearer（主防仍是「不记原始 error」）。
+      // fast-redact **大小写敏感**——HTTP 标准头是大写 'Authorization'，故大小写两种都显式枚举。
       'authorization',
       '*.authorization',
+      'Authorization',
+      '*.Authorization',
       // ── 数组路径：覆盖凭据落在数组元素里的形态（pino 用 `[*]` 表数组任意下标）──
       '*[*].password',
       '*[*].authJson',
