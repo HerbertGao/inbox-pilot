@@ -15,6 +15,7 @@
 //     finalDecision 块**不含** final priority/category/reason/confidence——它们在专列、不重复。
 
 import { prisma } from '../db/prisma.js';
+import { logger } from '../logger.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
@@ -22,6 +23,31 @@ import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
 
 /** Gmail authJson 的默认 scope（scopes 缺省回落，避免写 scopes:undefined）。与 oauth.ts 同值、不耦合其重量级依赖。 */
 const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
+
+/** 每日摘要的 digestType 值（去重命名空间 + digest_items.digestType 落点；daily-digest 决策 1）。 */
+export const DIGEST_TYPE_DAILY = 'daily';
+
+/**
+ * 摘要候选邮件的最小投影（daily-digest 决策 4）。**故意无 `bodyText`/`htmlBody`**——正文绝不进摘要
+ * 投影对象（显式 select 白名单保证；DigestCandidate 类型层再钉一遍）。
+ * `messageRowId` = `MailMessage.id`（行主键），**非** RFC 头 `MailMessage.messageId`——后者非 FK 目标，
+ * 误用会破坏 digest_items 外键与去重（spec「标识用行主键而非 RFC 头」）。
+ * `priority`/`category`/`reason` 取该邮件**最新分类行**（规则裁定后的最终值），`priority ∈ {P1,P2,P3}`
+ * （P0/P4 已在候选过滤阶段丢弃）。
+ */
+export type DigestCandidate = {
+  /** = `MailMessage.id`（行主键 / 去重键 / digest_items FK 目标）。 */
+  messageRowId: string;
+  /** 最新分类的最终优先级（候选过滤后 ∈ {P1,P2,P3}）。 */
+  priority: FinalDecision['priority'];
+  /** 最新分类的类别。 */
+  category: FinalDecision['category'];
+  subject: string;
+  fromEmail: string;
+  fromName?: string;
+  /** 最新分类的裁定原因（人类可读，渲染进摘要行）。 */
+  reason: string;
+};
 
 /** 已存邮件行的最小投影（processEmail 去重判定只需 id + processedAt）。 */
 export type StoredEmail = {
@@ -179,7 +205,56 @@ export type MailRepo = {
 
   /** 置 mail_messages.processedAt（流水线最后一步，标记处理完）。 */
   markProcessed(messageRowId: string): Promise<void>;
+
+  /**
+   * 列出摘要候选邮件（daily-digest 决策 4）：`processedAt != null` 且**无**对应 `digestType` 的
+   * `digest_items` 行（去重唯一真相源是「≥1 行即排除」的读侧存在性谓词，**无年龄窗**——停机期间积压
+   * 的旧邮件仍入摘要、不被永久排除）。取每邮件最新分类后**只保留 `priority ∈ {P1,P2,P3}`**（P0/P4
+   * 丢弃，其出口是即时推送）；缺分类行的已处理邮件被**排除**（记 debug 日志，非 error/非每轮刷屏）。
+   * **确定性排序**：优先级档（P1<P2<P3）、同档 `receivedAt` 升序、再 `id` 升序——使分段边界跨重复 build
+   * 稳定。投影为 `DigestCandidate`（显式 select 白名单，**无 bodyText**）。
+   */
+  listDigestCandidates(digestType: string): Promise<DigestCandidate[]>;
+
+  /**
+   * 落 `digest_items` 标记一批邮件已进摘要（daily-digest 决策 1/3）：批量插入
+   * `(messageId=messageRowId, digestType, sentAt)`。`digest_items` **无唯一约束**，重复
+   * `(messageRowId, digestType)` 行**容忍**（读侧只看存在性）；**不用 `skipDuplicates`**（无唯一索引时
+   * 它是 no-op、徒增误解）。若后续加唯一约束（非目标）须同步改 skipDuplicates/upsert。
+   */
+  markDigested(
+    messageRowIds: string[],
+    digestType: string,
+    sentAt: Date,
+  ): Promise<void>;
 };
+
+/** 优先级档排序权重（P1<P2<P3；候选已过滤掉 P0/P4，故只需这三档）。 */
+const DIGEST_PRIORITY_RANK: Record<string, number> = { P1: 0, P2: 1, P3: 2 };
+
+/**
+ * 摘要候选的确定性排序（daily-digest 决策 4，prisma 与内存实现共用——使两实现排序一致、测试忠实）：
+ * 优先级档（P1<P2<P3）、同档 `receivedAt` 升序、再 `id`（行主键）升序。**入参须各 candidate 附 `receivedAt`
+ * 与 `id`** 用于 tie-break。注：fixture 应用各异 `receivedAt` 以避「同刻并列时 in-memory(seq) vs
+ * prisma(cuid id) 排序差异」（见 task 2.5）。
+ */
+export function sortDigestCandidates<
+  T extends { priority: string; receivedAt: Date; id: string },
+>(rows: T[]): T[] {
+  return [...rows].sort((a, b) => {
+    const pa = DIGEST_PRIORITY_RANK[a.priority] ?? Number.MAX_SAFE_INTEGER;
+    const pb = DIGEST_PRIORITY_RANK[b.priority] ?? Number.MAX_SAFE_INTEGER;
+    if (pa !== pb) {
+      return pa - pb;
+    }
+    const ra = a.receivedAt.getTime();
+    const rb = b.receivedAt.getTime();
+    if (ra !== rb) {
+      return ra - rb;
+    }
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+}
 
 /** 由 saveClassification 的落库映射构造 rawAiJson 审计块（prisma 与内存实现共用）。 */
 export function buildRawAiJson(
@@ -393,6 +468,84 @@ export class PrismaMailRepo implements MailRepo {
     await prisma.mailMessage.update({
       where: { id: messageRowId },
       data: { processedAt: new Date() },
+    });
+  }
+
+  async listDigestCandidates(digestType: string): Promise<DigestCandidate[]> {
+    // 谓词：已处理（processedAt != null）且无对应 digestType 的 digest_items 行（读侧存在性去重、无年龄窗）。
+    // 显式 select 白名单（**非 include**，否则把整行 MailMessage 含 bodyText 拉进结果）。
+    // 确定性排序：优先级档无法在 SQL 直接表达（priority 在分类行），故 SQL 仅按 [receivedAt asc, id asc]
+    // 排稳定基序，优先级档在 JS 取最新分类后做稳定二次排序（决策 4：P1<P2<P3、同档 receivedAt/id 升序）。
+    const rows = await prisma.mailMessage.findMany({
+      where: {
+        processedAt: { not: null },
+        digestItems: { none: { digestType } },
+      },
+      select: {
+        id: true,
+        subject: true,
+        fromEmail: true,
+        fromName: true,
+        receivedAt: true,
+        classifications: {
+          select: { priority: true, category: true, reason: true },
+          orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+          take: 1,
+        },
+      },
+      orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+    });
+
+    // JS 取最新分类、过滤、附 receivedAt/id 供确定性排序（优先级档不能在 SQL 表达，故在此排）。
+    const enriched: Array<DigestCandidate & { receivedAt: Date; id: string }> = [];
+    for (const row of rows) {
+      const latest = row.classifications[0];
+      if (latest === undefined) {
+        // 缺分类行的已处理邮件：排除，记 debug（非 error、非每轮 error 刷屏）。
+        logger.debug(
+          { kind: 'digest-candidate-missing-classification', messageRowId: row.id },
+          'digest candidate skipped: no classification row',
+        );
+        continue;
+      }
+      // 只保留 P1/P2/P3（P0/P4 丢弃，其出口是即时推送）。
+      if (
+        latest.priority !== 'P1' &&
+        latest.priority !== 'P2' &&
+        latest.priority !== 'P3'
+      ) {
+        continue;
+      }
+      enriched.push({
+        messageRowId: row.id,
+        priority: latest.priority as DigestCandidate['priority'],
+        category: latest.category as DigestCandidate['category'],
+        subject: row.subject,
+        fromEmail: row.fromEmail,
+        ...(row.fromName !== null ? { fromName: row.fromName } : {}),
+        reason: latest.reason,
+        receivedAt: row.receivedAt,
+        id: row.id,
+      });
+    }
+    // 确定性排序后剥掉排序辅助字段（receivedAt/id），返回纯 DigestCandidate（messageRowId 仍是 id）。
+    return sortDigestCandidates(enriched).map(
+      ({ receivedAt: _receivedAt, id: _id, ...candidate }) => candidate,
+    );
+  }
+
+  async markDigested(
+    messageRowIds: string[],
+    digestType: string,
+    sentAt: Date,
+  ): Promise<void> {
+    if (messageRowIds.length === 0) {
+      return;
+    }
+    // createMany 批量插；**不用 skipDuplicates**（digest_items 无唯一约束、它是 no-op、徒增误解）。
+    // 重复 (messageId, digestType) 行容忍——读侧只看存在性（决策 1/3）。
+    await prisma.digestItem.createMany({
+      data: messageRowIds.map((messageId) => ({ messageId, digestType, sentAt })),
     });
   }
 }

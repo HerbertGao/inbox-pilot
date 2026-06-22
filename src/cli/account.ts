@@ -213,10 +213,10 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     }
     port = parsed;
   }
-  // tls 默认 true；仅显式 'false'（大小写不敏感）→ false（与 config IMAP_TLS 解析一致）。
+  // tls 默认 true；仅显式 'false'（大小写不敏感）→ false。
   const tls = flags.values.get('tls')?.toLowerCase() !== 'false';
 
-  // id：--account-id（对齐 legacy）优先，否则确定性 `imap:<user>@<host>`。
+  // id：--account-id（对齐既有/自定义 id）优先，否则确定性 `imap:<user>@<host>`。
   const id = deriveAccountId(flags.values.get('account-id'), user, host);
 
   // **口令只经交互 prompt（echo off）**——绝不从 argv、绝不回显。

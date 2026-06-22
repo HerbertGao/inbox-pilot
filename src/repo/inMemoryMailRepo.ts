@@ -11,9 +11,12 @@ import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
+import { logger } from '../logger.js';
 import {
   buildRawAiJson,
+  sortDigestCandidates,
   type AccountWriteInput,
+  type DigestCandidate,
   type MailRepo,
   type RawAiJson,
   type StoredAccount,
@@ -52,6 +55,13 @@ export type ActionRow = {
   createdAt: Date;
 };
 
+/** 内存 digest_items 行（摘要去重存在性 + markDigested 落点；对应 prisma DigestItem）。 */
+type DigestItemRow = {
+  messageRowId: string;
+  digestType: string;
+  sentAt: Date;
+};
+
 /** 内存账号行（注册表加载 / 写入路径；authJson 含真实凭据，绝不整体记录）。 */
 type AccountRow = {
   id: string;
@@ -72,6 +82,8 @@ export class InMemoryMailRepo implements MailRepo {
   readonly classifications: ClassificationRow[] = [];
   /** 暴露给测试断言；按插入顺序。 */
   readonly actions: ActionRow[] = [];
+  /** digest_items 行（摘要去重存在性）；暴露给测试断言，按插入顺序。重复 (rowId,type) 行容忍。 */
+  readonly digestItems: DigestItemRow[] = [];
 
   private seq = 0;
 
@@ -292,5 +304,66 @@ export class InMemoryMailRepo implements MailRepo {
   /** 取某邮件的所有动作行（组 F 断言用），按插入顺序。 */
   getActions(messageRowId: string): ActionRow[] {
     return this.actions.filter((a) => a.messageRowId === messageRowId);
+  }
+
+  async listDigestCandidates(digestType: string): Promise<DigestCandidate[]> {
+    // 谓词 + 排序与 PrismaMailRepo 同（测试忠实）：processedAt != null 且无对应 digestType 的 digest_items
+    // 行（读侧存在性去重、无年龄窗）；JS 取最新分类（getLatestClassification：createdAt desc, seq desc）；
+    // 缺分类行排除 + debug；只保留 P1/P2/P3。
+    const enriched: Array<DigestCandidate & { receivedAt: Date; id: string }> = [];
+    for (const row of this.emailsById.values()) {
+      if (row.processedAt === null) {
+        continue;
+      }
+      if (
+        this.digestItems.some(
+          (d) => d.messageRowId === row.id && d.digestType === digestType,
+        )
+      ) {
+        continue;
+      }
+      const latest = this.getLatestClassification(row.id);
+      if (latest === null) {
+        logger.debug(
+          { kind: 'digest-candidate-missing-classification', messageRowId: row.id },
+          'digest candidate skipped: no classification row',
+        );
+        continue;
+      }
+      if (
+        latest.priority !== 'P1' &&
+        latest.priority !== 'P2' &&
+        latest.priority !== 'P3'
+      ) {
+        continue;
+      }
+      const email = row.email;
+      enriched.push({
+        messageRowId: row.id,
+        priority: latest.priority,
+        category: latest.category,
+        subject: email.subject,
+        fromEmail: email.fromEmail,
+        ...(email.fromName !== undefined ? { fromName: email.fromName } : {}),
+        reason: latest.reason,
+        // prisma 用 MailMessage.receivedAt = new Date(email.date)；内存镜像同一映射。
+        receivedAt: new Date(email.date),
+        id: row.id,
+      });
+    }
+    return sortDigestCandidates(enriched).map(
+      ({ receivedAt: _receivedAt, id: _id, ...candidate }) => candidate,
+    );
+  }
+
+  async markDigested(
+    messageRowIds: string[],
+    digestType: string,
+    sentAt: Date,
+  ): Promise<void> {
+    // 与 prisma createMany 语义一致：直插、重复 (rowId, digestType) 行容忍（无唯一约束、不抛）。
+    for (const messageRowId of messageRowIds) {
+      this.digestItems.push({ messageRowId, digestType, sentAt });
+    }
   }
 }

@@ -49,75 +49,35 @@ test('configSchema：OpenRouter 兼容代理 / 自建网关 URL → 接受（不
   assert.equal(result.OPENROUTER_BASE_URL, 'https://my-proxy.example.com/v1');
 });
 
-// ── P3 IMAP（§1.5）：config 层仅解析 optional，不做 IMAP 跨字段校验 ──
-// 「host 有而凭据缺→报错」属 accountService 层（断言见 §3.3），不在此处。
+// ── POLL_INTERVAL_SECONDS：空串/省略 → 默认 180，显式值 → coerce ──
+// （IMAP_* env 键已退役——账号凭据走 DB authJson，不再经 config 解析。）
 
-test('configSchema：IMAP 项齐全 → 解析出连接参数（端口/TLS 正确）', () => {
-  const result = configSchema.parse({
-    DATABASE_URL: DB,
-    IMAP_HOST: 'imap.example.com',
-    IMAP_PORT: '143',
-    IMAP_USER: 'me@example.com',
-    IMAP_PASSWORD: 'secret',
-    IMAP_TLS: 'false',
-    IMAP_ACCOUNT_ID: 'imap:custom',
-    POLL_INTERVAL_SECONDS: '60',
-  });
-  assert.equal(result.IMAP_HOST, 'imap.example.com');
-  assert.equal(result.IMAP_PORT, 143);
-  assert.equal(result.IMAP_USER, 'me@example.com');
-  assert.equal(result.IMAP_PASSWORD, 'secret');
-  assert.equal(result.IMAP_TLS, false);
-  assert.equal(result.IMAP_ACCOUNT_ID, 'imap:custom');
-  assert.equal(result.POLL_INTERVAL_SECONDS, 60);
+test('configSchema：POLL_INTERVAL_SECONDS 空串/省略 → 180，显式值 → coerce 为数字', () => {
+  assert.equal(configSchema.parse({ DATABASE_URL: DB }).POLL_INTERVAL_SECONDS, 180);
+  assert.equal(configSchema.parse({ DATABASE_URL: DB, POLL_INTERVAL_SECONDS: '' }).POLL_INTERVAL_SECONDS, 180);
+  assert.equal(configSchema.parse({ DATABASE_URL: DB, POLL_INTERVAL_SECONDS: '60' }).POLL_INTERVAL_SECONDS, 60);
 });
 
-test('configSchema：IMAP 各键空串 → undefined（host/user/password/account_id），端口/TLS/轮询回落默认', () => {
-  const result = configSchema.parse({
-    DATABASE_URL: DB,
-    IMAP_HOST: '',
-    IMAP_PORT: '',
-    IMAP_USER: '',
-    IMAP_PASSWORD: '',
-    IMAP_TLS: '',
-    IMAP_ACCOUNT_ID: '',
-    POLL_INTERVAL_SECONDS: '',
-  });
-  assert.equal(result.IMAP_HOST, undefined);
-  assert.equal(result.IMAP_USER, undefined);
-  assert.equal(result.IMAP_PASSWORD, undefined);
-  assert.equal(result.IMAP_ACCOUNT_ID, undefined);
-  // 带默认的键：空串经 emptyToUndefined 归一后回落默认（非落成 0/''）。
-  assert.equal(result.IMAP_PORT, 993);
-  assert.equal(result.IMAP_TLS, true);
-  assert.equal(result.POLL_INTERVAL_SECONDS, 180);
+// ── DIGEST_TIMES：裸 z.string().optional()，区分缺省(undefined) vs 显式空('') vs 显式值 ──
+// 关键：env 缺省 → undefined（digestScheduler 层兜底默认）；显式 '' → 原样 ''（**不**被归一为
+// undefined、**不**落成默认）——保住"显式空 → 不调度"语义；显式值 → 透传。
+// （若 DIGEST_TIMES 被错误地包 emptyToUndefined，'' 会变 undefined，本测试即失败。）
+
+test('configSchema：DIGEST_TIMES env 缺省 → undefined', () => {
+  assert.equal(configSchema.parse({ DATABASE_URL: DB }).DIGEST_TIMES, undefined);
 });
 
-test('configSchema：IMAP 全省略 → IMAP 视为禁用（host undefined）且解析成功（可选 provider）', () => {
-  const result = configSchema.safeParse({ DATABASE_URL: DB });
-  assert.equal(result.success, true);
-  assert.equal(result.data?.IMAP_HOST, undefined);
-  // 带默认键即便省略仍恒有值。
-  assert.equal(result.data?.IMAP_PORT, 993);
-  assert.equal(result.data?.IMAP_TLS, true);
-  assert.equal(result.data?.POLL_INTERVAL_SECONDS, 180);
+test('configSchema：DIGEST_TIMES 显式空串 → 原样空串（不归一为 undefined、不落默认）', () => {
+  const result = configSchema.parse({ DATABASE_URL: DB, DIGEST_TIMES: '' });
+  assert.equal(result.DIGEST_TIMES, '');
+  assert.notEqual(result.DIGEST_TIMES, undefined);
 });
 
-test('configSchema：缺 IMAP_HOST 但有凭据 → 仍解析成功（跨字段校验属 accountService 层，不在 config）', () => {
-  const result = configSchema.safeParse({
-    DATABASE_URL: DB,
-    IMAP_USER: 'me@example.com',
-    IMAP_PASSWORD: 'secret',
-  });
-  assert.equal(result.success, true);
-  assert.equal(result.data?.IMAP_HOST, undefined);
-});
-
-test('configSchema：IMAP_TLS 省略或非 false 值 → 默认 true（仅显式 false 关 TLS）', () => {
-  assert.equal(configSchema.parse({ DATABASE_URL: DB }).IMAP_TLS, true);
-  assert.equal(configSchema.parse({ DATABASE_URL: DB, IMAP_TLS: 'TRUE' }).IMAP_TLS, true);
-  assert.equal(configSchema.parse({ DATABASE_URL: DB, IMAP_TLS: 'whatever' }).IMAP_TLS, true);
-  assert.equal(configSchema.parse({ DATABASE_URL: DB, IMAP_TLS: 'False' }).IMAP_TLS, false);
+test('configSchema：DIGEST_TIMES 显式值 → 透传', () => {
+  assert.equal(
+    configSchema.parse({ DATABASE_URL: DB, DIGEST_TIMES: '12:30,21:30' }).DIGEST_TIMES,
+    '12:30,21:30',
+  );
 });
 
 // ── P4 Gmail app 凭据（§1.5）：可选解析 + redirect_uri 校验 + onboarding 可用性 ──

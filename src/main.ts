@@ -8,6 +8,8 @@ import type { ScheduledTask } from 'node-cron';
 import { loadEnabledAccounts } from './accounts/accountRegistry.js';
 import { PrismaMailRepo } from './repo/mailRepo.js';
 import { startAccountSchedulers, type ScheduledAccount } from './jobs/scheduler.js';
+import { startDigestSchedulers } from './digest/digestScheduler.js';
+import { defaultNotifier } from './notify/notifier.js';
 import type { Account } from './providers/provider.js';
 import { pollAccount } from './providers/imap/imapPoller.js';
 import { createGmailClient } from './providers/gmail/gmailClient.js';
@@ -175,9 +177,25 @@ try {
   });
 
   // 无可调度账号 → startAccountSchedulers 返回 []（不调度）；服务正常运行（/health 可用）。
-  schedulerTasks = startAccountSchedulers(scheduled, repo, {
+  const pollingTasks = startAccountSchedulers(scheduled, repo, {
     intervalSeconds: config.POLL_INTERVAL_SECONDS,
   });
+
+  // —— 每日摘要调度（daily-digest 决策 6/7、迁移计划）——
+  //
+  // 复用同一 PrismaMailRepo（candidate 查询 + markDigested 落库）与默认 notifier（telegram，无渠道→skipped 降级）。
+  // timezone 取容器 TZ（docker-compose 随 .env 透传），以 .env.example 默认 Asia/Shanghai 兜底——定点触发依赖时区。
+  // 构造期错误隔离归 startDigestSchedulers 内的 per-task try/catch（非法 timezone/表达式跳过该任务、不冒泡到此处 setup）。
+  const digestTasks = startDigestSchedulers({
+    timesString: config.DIGEST_TIMES,
+    timezone: process.env.TZ ?? 'Asia/Shanghai',
+    repo,
+    notifier: defaultNotifier,
+  });
+
+  // **单一合并赋值**：轮询 task 与 digest task 合进同一个被 shutdown() 迭代的 schedulerTasks——
+  // 否则 digest task 不被 stop()，$disconnect() 后仍触发（决策 / spec「优雅关闭停止摘要调度」）。
+  schedulerTasks = [...pollingTasks, ...digestTasks];
 } catch (error) {
   // 注册表加载本身失败（DB 错误）：fail-fast，不静默以空账号继续。只记脱敏字段。
   const message = error instanceof Error ? error.message : 'unknown error';

@@ -92,6 +92,10 @@ function makeRecordingChannel(
       payloads.push(payload);
       return result;
     },
+    async sendText(): Promise<ChannelSendResult> {
+      // 本组不测摘要出口；满足 NotificationChannel 接口即可。
+      return result;
+    },
   };
   return channel;
 }
@@ -409,6 +413,9 @@ test('无渠道配置 → notify 动作落 skipped、不抛、流水线完成', 
   const provider = new FakeProviderActions();
   const notifier = {
     async notify() {
+      return { outcome: 'skipped' as const, reason: 'no-channel' };
+    },
+    async notifyDigest() {
       return { outcome: 'skipped' as const, reason: 'no-channel' };
     },
   };

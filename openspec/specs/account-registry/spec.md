@@ -23,12 +23,12 @@
 - **那么** 该账号仍被轮询到下次重启;CLI/文档必须明确告知此 staleness 窗口,并提示「禁用一个凭据已泄露/撤销的账号后应立即重启以停止轮询」
 
 ### 需求:accountId 与 MailAccount.id 同一且确定性生成
-`accountId`（去重键 `(accountId, providerMessageId)` 命名空间 + 游标落点）必须**就是** `MailAccount.id`。`prisma/schema.prisma` 的 `MailAccount.id` 虽 `@default(cuid())`,但**所有写入路径(CLI `account add`、迁移)必须显式设置 `id` = 解析出的 accountId、覆盖 cuid 默认**——否则 `MailAccount.id`(cuid) ≠ `NormalizedEmail.accountId`,`mail_messages.accountId` 对 `mail_accounts.id` 的外键(`onDelete: Restrict`)将在每次 `saveEmail` 违约,或去重键落入新命名空间导致历史邮件全部重复处理(违反「重启不重复处理」)。此即 P3 `buildAnchorUpsertArgs` 显式 `create.id===accountId` 的延续,**不得**让 cuid 默认生效。
+`accountId`（去重键 `(accountId, providerMessageId)` 命名空间 + 游标落点）必须**就是** `MailAccount.id`。`prisma/schema.prisma` 的 `MailAccount.id` 虽 `@default(cuid())`,但**所有写入路径(CLI `account add`)必须显式设置 `id` = 解析出的 accountId、覆盖 cuid 默认**——否则 `MailAccount.id`(cuid) ≠ `NormalizedEmail.accountId`,`mail_messages.accountId` 对 `mail_accounts.id` 的外键(`onDelete: Restrict`)将在每次 `saveEmail` 违约,或去重键落入新命名空间导致历史邮件全部重复处理(违反「重启不重复处理」)。此即 P3 `buildAnchorUpsertArgs` 显式 `create.id===accountId` 的延续,**不得**让 cuid 默认生效。
 
-**确定性 id（CLI add 与迁移共用同一派生规则，防命名空间分裂）**:
+**确定性 id（CLI add 的派生规则，防命名空间分裂）**:
 - gmail → `gmail:<getProfile().emailAddress 规范化(仅小写)>`(仅取 `users.getProfile`,见 `gmail-integration`)。
 - imap → **确定性派生 `imap:<user>@<host>`**;CLI add 以此 id **upsert**(主键即去重,同邮箱重加自然命中同一行、不分裂),**不**依赖按 `user@host` 模糊查既有行(无此可查列——`MailAccount` 仅有 `email`/`provider`/`authJson`,P3 锚定行还把 `email` 写成 `account.user` 而非 `user@host`,模糊查会漏)。
-- **legacy `IMAP_ACCOUNT_ID`（P3 设过任意旧显式值）的连续性由一次性迁移独占负责**:迁移把 `MailAccount.id` 设为 P3 实际 accountId(`deriveAccountId(IMAP_ACCOUNT_ID,user,host)`),该账号迁移后即存在、为权威。**CLI 不得**用派生式重加一个 legacy-自定义-id 账号致分裂:`account add --imap` 提供可选 **`--account-id`** 显式指定 id(用于对齐 legacy 值),或文档明确「用过 `IMAP_ACCOUNT_ID` 的账号仅经迁移接入、勿 CLI 重加」。
+- **自定义/既有 id 对齐**:`account add --imap` 提供可选 **`--account-id`** 显式指定 id、覆盖确定性派生——用于把账号对齐到一个既有命名空间(如从旧部署带来的 accountId)。不传则用 `imap:<user>@<host>`;两种都经主键 upsert,同 id 重加命中同一行、不分裂。(P3 env-IMAP 单账号 + 一次性迁移脚本已退役,legacy `IMAP_ACCOUNT_ID` 连续性如今由 `--account-id` 承接。)
 
 **`MailAccount.email` 取值(NOT NULL,必须有定值)**:gmail = `getProfile().emailAddress`;imap = `--email` 显式提供、缺省回落 `user@host`(best-effort、非真相源,与 P3 `AnchorAccount.email` 一致)。两路径都必须写非空稳定值。
 
@@ -37,12 +37,12 @@
 - **那么** 该行 `MailAccount.id` = 解析 accountId(覆盖 cuid 默认)、`email` 非空,使该账号首次 `saveEmail` 的 `mail_messages.accountId` 外键命中已存在的 `mail_accounts.id`
 
 #### 场景:同邮箱不分裂命名空间
-- **当** 同一 IMAP 邮箱(无 legacy `IMAP_ACCOUNT_ID`)经迁移与经 CLI add 两路径接入
-- **那么** 两者都用确定性 `imap:<user>@<host>`、CLI add 以该 id upsert 命中同一行,落同一去重/游标命名空间(不分裂、不重复处理)
+- **当** 同一 IMAP 邮箱(无显式 `--account-id`)经 `account add` 重复接入
+- **那么** 每次都用确定性 `imap:<user>@<host>`、以该 id 主键 upsert 命中同一行,落同一去重/游标命名空间(不分裂、不重复处理)
 
-#### 场景:legacy 自定义 id 迁移独占、CLI 不分裂
-- **当** P3 设过任意 `IMAP_ACCOUNT_ID` 自定义值的账号
-- **那么** 其 id 连续性由一次性迁移独占(`MailAccount.id`=该旧值);CLI 不得用派生式重加致分裂——需 `--account-id` 对齐或仅经迁移接入
+#### 场景:自定义 id 经 --account-id 对齐、不分裂
+- **当** 操作者要把账号对齐到一个既有/自定义 accountId
+- **那么** 用 `account add --imap --account-id <值>` 写入该 id(覆盖确定性派生);不传则用 `imap:<user>@<host>`——两种都经主键 upsert,不分裂
 
 ### 需求:统一 authJson 凭据模型与凭据不入日志
 账号凭据必须统一存于 `MailAccount.authJson`（imap:`{host,port,user,password,tls}`;gmail:`{refreshToken,scopes}`），不再从 env 读账号凭据（Gmail app 凭据 `GMAIL_CLIENT_*` 仍从 env、属 app 凭据非账号凭据）。

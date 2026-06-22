@@ -27,5 +27,7 @@ services:
     environment:
       # 容器内 DNS：覆盖 .env 的 localhost 形态为 @postgres:5432。
       DATABASE_URL: postgresql://mail_router:mail_router_password@postgres:5432/mail_router
+      # 容器时区：每日摘要定点（DIGEST_TIMES）依赖时区，随 .env 透传（缺省由进程内兜底 Asia/Shanghai）。
+      TZ: ${TZ:-Asia/Shanghai}
     ports:
       - "3000:3000"

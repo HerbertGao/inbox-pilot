@@ -36,8 +36,6 @@ export const REDACT_PATHS: string[] = [
       '*.OPENROUTER_API_KEY',
       'GMAIL_CLIENT_SECRET',
       '*.GMAIL_CLIENT_SECRET',
-      'IMAP_PASSWORD',
-      '*.IMAP_PASSWORD',
       'TELEGRAM_BOT_TOKEN',
       '*.TELEGRAM_BOT_TOKEN',
       // CHAT_ID 非密钥（泄露无法冒充 bot），但 notifications spec 把 TELEGRAM_* 并列为凭据、
