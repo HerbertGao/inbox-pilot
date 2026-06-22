@@ -10,7 +10,6 @@
   "scripts": {
     "dev": "tsx src/main.ts",
     "account": "tsx src/cli/account.ts",
-    "migrate:env-imap": "tsx src/scripts/migrateEnvImap.ts",
     "build": "tsc",
     "test": "tsx --test 'src/**/*.test.ts'",
     "start": "node dist/main.js",

@@ -38,6 +38,11 @@ export type NotificationPayload = {
 export type NotificationChannel = {
   readonly name: string;
   send(payload: NotificationPayload): Promise<ChannelSendResult>;
+  /**
+   * 发**预组装文本**（摘要出口）：文案已在上游按渠道上限分段，渠道只 POST、不再渲染。
+   * 与 send 共用超时 + 脱敏 + 无 parse_mode；同样不抛、返回 sent/failed。
+   */
+  sendText(text: string): Promise<ChannelSendResult>;
 };
 
 /**
@@ -54,6 +59,11 @@ export type NotifyResult =
 /** Notifier seam：processEmail/executeActions 注入；默认接真身（telegram from config），测试注入假渠道。 */
 export type Notifier = {
   notify(decision: FinalDecision, email: NormalizedEmail): Promise<NotifyResult>;
+  /**
+   * 摘要出口：发一段**预组装文本**（digestScheduler 逐段调用）。
+   * 与 notify 同样的选渠道 + 无渠道→skipped 降级；调 channel.sendText 而非按封投影 payload。
+   */
+  notifyDigest(text: string): Promise<NotifyResult>;
 };
 
 /**
@@ -125,6 +135,28 @@ export function createNotifier(args?: {
           error: safeError,
         },
         '通知推送失败',
+      );
+      return { outcome: 'failed', channel: channel.name, error: safeError };
+    },
+
+    async notifyDigest(text: string): Promise<NotifyResult> {
+      if (channel === undefined) {
+        // 无渠道降级：与 notify 一致——结构化日志只含脱敏 kind，禁含凭据/正文。
+        logger.info({ kind: 'notify-digest-skipped-no-channel' }, '无通知渠道凭据，降级跳过摘要推送');
+        return { outcome: 'skipped', reason: 'no-channel' };
+      }
+
+      // 文本已由 buildDigest 预组装并分段；这里直接透传给渠道，不再投影 payload。
+      const result = await channel.sendText(text);
+
+      if (result.outcome === 'sent') {
+        return { outcome: 'sent', channel: channel.name };
+      }
+      // 推送失败：不抛、记结构化日志（只含脱敏 error 摘要 + kind/channel），禁含凭据/正文。
+      const safeError = sanitizeChannelError(result.error);
+      logger.warn(
+        { kind: 'notify-digest-failed', channel: channel.name, error: safeError },
+        '摘要推送失败',
       );
       return { outcome: 'failed', channel: channel.name, error: safeError };
     },

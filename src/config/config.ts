@@ -99,25 +99,15 @@ export const configSchema = z.object({
   // bark 作为后续可选渠道，本期不引入 BARK_*。
   TELEGRAM_BOT_TOKEN: z.string().optional(),
   TELEGRAM_CHAT_ID: z.string().optional(),
-  // P3 IMAP（§1.2，P4 起弃用）：**不再作账号凭据来源**——账号凭据统一存 DB
-  // MailAccount.authJson（决策见 design.md）。这些键仅再保留一轮：供 P4 的一次性迁移脚本
-  // （group G）读取 env 单账号写入注册表；迁移后从 config 删除。仍全部可选、空串归一。
-  // host/user/password 无默认（裸 optional）；IMAP_PASSWORD 已在 logger redact 名单。
-  IMAP_HOST: z.preprocess(emptyToUndefined, z.string().optional()),
-  IMAP_PORT: z.preprocess(emptyToUndefined, z.coerce.number().int().min(1).max(65535).default(993)),
-  IMAP_USER: z.preprocess(emptyToUndefined, z.string().optional()),
-  IMAP_PASSWORD: z.preprocess(emptyToUndefined, z.string().optional()),
-  // 布尔（默认 true）：仅显式 'false'（大小写不敏感）→ false，其余（含省略/空串/其它值）→ true，
-  // 与「IMAP_TLS 默认 true」对齐；不引入第三方布尔 coercion，沿用就地解析。
-  IMAP_TLS: z.preprocess(
-    emptyToUndefined,
-    z
-      .string()
-      .optional()
-      .transform((v) => v?.toLowerCase() !== 'false'),
-  ),
-  IMAP_ACCOUNT_ID: z.preprocess(emptyToUndefined, z.string().optional()),
+  // IMAP 账号凭据不走 env——统一存 DB MailAccount.authJson，经 `account add --imap` 写入
+  // （P3 的 IMAP_* env 键 + 一次性迁移脚本已退役）。轮询间隔仍是进程级 env 配置。
   POLL_INTERVAL_SECONDS: z.preprocess(emptyToUndefined, z.coerce.number().default(180)),
+  // DIGEST_TIMES（每日摘要触发时刻列表，如 `12:30,21:30`）：**有意**不走 emptyToUndefined、
+  // 不用 zod .default()——这是本文件 optional 键惯例的**例外**，切勿"修"回去。
+  // 必须区分 undefined（env 缺省 → 由 digestScheduler 层兜底成默认 `12:30,21:30`）
+  // 与 ''（显式空串 → 空列表 → 不调度任何摘要）。若包 emptyToUndefined，''→undefined→默认
+  // 排程复活，"显式空 → 不调度"语义被毁；故此处用裸 z.string().optional() 原样透传。
+  DIGEST_TIMES: z.string().optional(),
 });
 
 export type Config = Readonly<z.infer<typeof configSchema>>;

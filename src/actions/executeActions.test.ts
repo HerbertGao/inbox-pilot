@@ -78,6 +78,9 @@ function makeSentNotifier(): Notifier & { calls: number } {
       n.calls += 1;
       return { outcome: 'sent', channel: 'fake' };
     },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'sent', channel: 'fake' };
+    },
   };
   return n;
 }

@@ -68,31 +68,43 @@ export function createTelegramChannel(args: {
   readonly chatId: string;
 }): NotificationChannel {
   const { botToken, chatId } = args;
+
+  /**
+   * POST 一段**已渲染好**的文本到 sendMessage 并归一为 ChannelSendResult。
+   * per-email `send`（先 renderTelegramText 再调本 helper）与摘要 `sendText`（直接传预组装文本）共用：
+   * 同一超时、同一脱敏、同样**不设 parse_mode**（subject/reason/fromName/摘要文案均攻击者可影响、按字面发）。
+   */
+  async function postMessage(text: string): Promise<ChannelSendResult> {
+    try {
+      // 纯文本推送：不设 parse_mode → 文本（攻击者可影响）按字面发送、不被 telegram 解释为
+      // Markdown/HTML。security: 未对其做转义前，禁止添加 parse_mode，否则引入标记/链接注入。
+      const response = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text }),
+        // 硬超时：超时 → AbortSignal 抛 TimeoutError → 下方 catch 经 errorKind 记
+        // telegram-fetch-error-TimeoutError（不含 token/正文），纳入 executeActions 有界重试。
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        // 只记 HTTP 状态码（不含 token/chat_id/正文/响应体）作为脱敏 error 摘要。
+        return { outcome: 'failed', error: `telegram-http-${response.status}` };
+      }
+      return { outcome: 'sent' };
+    } catch (err) {
+      // 网络/abort 等异常：只取错误类名作脱敏摘要，禁含 URL（内含 token）/正文。
+      return { outcome: 'failed', error: errorKind(err) };
+    }
+  }
+
   return {
     name: 'telegram',
     async send(payload: NotificationPayload): Promise<ChannelSendResult> {
-      const text = renderTelegramText(payload);
-      try {
-        // 纯文本推送：不设 parse_mode → subject/reason/fromName（均攻击者可影响）按字面发送、
-        // 不被 telegram 解释为 Markdown/HTML。security: 未对这些字段做转义前，禁止添加
-        // parse_mode，否则引入标记/链接注入。
-        const response = await fetch(`${TELEGRAM_API_BASE}/bot${botToken}/sendMessage`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ chat_id: chatId, text }),
-          // 硬超时：超时 → AbortSignal 抛 TimeoutError → 下方 catch 经 errorKind 记
-          // telegram-fetch-error-TimeoutError（不含 token/正文），纳入 executeActions 有界重试。
-          signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
-        });
-        if (!response.ok) {
-          // 只记 HTTP 状态码（不含 token/chat_id/正文/响应体）作为脱敏 error 摘要。
-          return { outcome: 'failed', error: `telegram-http-${response.status}` };
-        }
-        return { outcome: 'sent' };
-      } catch (err) {
-        // 网络/abort 等异常：只取错误类名作脱敏摘要，禁含 URL（内含 token）/正文。
-        return { outcome: 'failed', error: errorKind(err) };
-      }
+      return postMessage(renderTelegramText(payload));
+    },
+    // 摘要出口：文案已由 buildDigest 预组装并按渠道上限分段，sendText 只负责 POST。
+    async sendText(text: string): Promise<ChannelSendResult> {
+      return postMessage(text);
     },
   };
 }

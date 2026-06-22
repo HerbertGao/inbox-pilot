@@ -16,7 +16,7 @@ test('deriveAccountId：无显式 id → 确定性 `imap:<user>@<host>`', () => 
   );
 });
 
-test('deriveAccountId：显式 id（--account-id / legacy IMAP_ACCOUNT_ID）→ 用作 id（覆盖派生）', () => {
+test('deriveAccountId：显式 id（--account-id 对齐既有/自定义 id）→ 用作 id（覆盖派生）', () => {
   assert.equal(
     deriveAccountId('imap:custom-id', 'me@example.com', 'imap.example.com'),
     'imap:custom-id',

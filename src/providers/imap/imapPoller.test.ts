@@ -153,6 +153,9 @@ function noopChannel(): NotificationChannel {
     async send(): Promise<ChannelSendResult> {
       return { outcome: 'sent' };
     },
+    async sendText(): Promise<ChannelSendResult> {
+      return { outcome: 'sent' };
+    },
   };
 }
 
