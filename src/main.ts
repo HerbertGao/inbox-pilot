@@ -15,6 +15,9 @@ import { pollAccount } from './providers/imap/imapPoller.js';
 import { createGmailClient } from './providers/gmail/gmailClient.js';
 import { createGmailProvider } from './providers/gmail/gmailActions.js';
 import { createGmailPoller } from './providers/gmail/gmailPoller.js';
+// import 触发 rulesConfig 模块加载 = rules.yaml 初次同步加载生效（import 副作用）；
+// startRulesConfigReload 在 listen 成功后启动 mtime 轮询热重载（改即生效）。
+import { startRulesConfigReload } from './rules/rulesConfig.js';
 
 // /health 的 DB 探测超时（毫秒）。Promise.race 只取消等待，不真正中断底层
 // 查询/连接池取用——可接受（liveness only，禁止挂起）。
@@ -54,6 +57,11 @@ app.get('/health', async (_request, reply) => {
 // 关闭后仍有 cron 触发新一轮轮询。
 let schedulerTasks: ScheduledTask[] = [];
 
+// rules-config 热重载句柄（mtime 轮询）。与 schedulerTasks 一并由 shutdown() 单一管理停止——
+// 否则 $disconnect 后热重载轮询仍可能触发。RulesReloadHandle 与 ScheduledTask 类型不同，
+// 但都有 .stop()，故此处只取最小 `{ stop: () => void }` 形状。
+let rulesReloadHandle: { stop: () => void } | undefined;
+
 // 优雅关闭：best-effort 停止全部调度 + 关闭 fastify 与 prisma，再退出。包 try/catch，失败也退出。
 // entrypoint 用 exec 使 SIGTERM/SIGINT 直达 node。P0 无在途业务，不强求 drain。
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
@@ -66,6 +74,13 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
       const message = error instanceof Error ? error.message : 'unknown error';
       app.log.warn({ msg: 'scheduler stop failed', error: message });
     }
+  }
+  // 一并停止 rules-config 热重载轮询（单一管理）：确保 $disconnect 后轮询不再触发。
+  try {
+    rulesReloadHandle?.stop();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    app.log.warn({ msg: 'rules reload stop failed', error: message });
   }
   try {
     await app.close();
@@ -192,6 +207,12 @@ try {
     repo,
     notifier: defaultNotifier,
   });
+
+  // —— rules-config 热重载（yaml-rules-hardening 决策 2/3、tasks 5.1）——
+  //
+  // rulesConfig 模块加载（上面的 import 副作用）已同步跑过一次初次加载，故 getActiveRules() 此刻已生效；
+  // 此处启动 mtime 轮询热重载句柄（改 rules.yaml 即生效），交由 shutdown() 与 schedulerTasks 一并停止。
+  rulesReloadHandle = startRulesConfigReload();
 
   // **单一合并赋值**：轮询 task 与 digest task 合进同一个被 shutdown() 迭代的 schedulerTasks——
   // 否则 digest task 不被 stop()，$disconnect() 后仍触发（决策 / spec「优雅关闭停止摘要调度」）。

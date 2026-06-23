@@ -12,9 +12,16 @@
 //   - 不接真实 provider/网络；不发送邮件。
 
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 
 import { processEmail, type ClassifyFn } from './processEmail.js';
+import { resetRulesConfigForTest } from '../rules/rulesConfig.js';
+
+// 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
+// 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
+beforeEach(() => {
+  resetRulesConfigForTest();
+});
 import { InMemoryMailRepo } from '../repo/inMemoryMailRepo.js';
 import { FakeProviderActions, type ProviderActions } from '../actions/providerActions.js';
 import { ProviderReauthRequired } from '../providers/provider.js';
@@ -27,7 +34,6 @@ import type {
 import type { ChannelSendResult } from '../notify/telegram.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
-import { SENSITIVE_DOMAINS } from '../rules/lists.js';
 
 // 独特 sentinel：放进 fixture 的 textBody/htmlBody，断言它绝不出现在渠道 payload 里。
 const BODY_SENTINEL = 'SENTINEL_SECRET_BODY_3f9a7c';
@@ -38,7 +44,9 @@ function makeEmail(overrides: Partial<NormalizedEmail> = {}): NormalizedEmail {
     provider: 'gmail',
     providerMessageId: 'msg-1',
     subject: '普通主题 ordinary subject',
-    fromEmail: 'sender@example.com',
+    // 中性发件域（RFC-6761 保留测试域，不在 rules.yaml 任何 vip/important/域名轴列表）——
+    // 避免命中示例 important_domains:[example.com] 被 floor 轴静默抬升 P1。
+    fromEmail: 'sender@example.test',
     fromName: '发件人',
     to: ['me@example.com'],
     date: '2026-06-20T00:00:00.000Z',
@@ -210,16 +218,21 @@ test('P2 普通 → markRead 调用 + mail_actions mark_read(done)、无 notify'
 });
 
 // ——————————————————————————————————————————————————————————
-// 敏感域名 P2 → 不 markRead（FinalDecision 护栏）
+// 敏感内容 P2 → 不 markRead（FinalDecision 关键词轴护栏）
+//
+// 域名内置默认已清空（决策 1：不维护域名白名单）——硬约束「敏感邮件不自动标已读」
+// 决定性落在内容轴。此用例改用内置 SECURITY_PAYMENT_KEYWORDS 关键词（「医院」）触发
+// 关键词轴，断言意图不变（shouldMarkRead=false）。发件域用中性 example.test。
 // ——————————————————————————————————————————————————————————
 
-test('敏感域名 P2（user@bank.com）→ 不 markRead', async () => {
+test('敏感关键词 P2（主题含「医院」）→ 不 markRead', async () => {
   const repo = new InMemoryMailRepo();
   const provider = new FakeProviderActions();
   const channel = makeRecordingChannel();
   const notifier = createNotifier({ channel });
   const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
-  const email = makeEmail({ fromEmail: `user@${SENSITIVE_DOMAINS[0]}` });
+  // 关键词轴触发器：主题含内置 SECURITY_PAYMENT_KEYWORDS 词「医院」。
+  const email = makeEmail({ subject: '医院预约确认', fromEmail: 'patient@example.test' });
 
   await processEmail(email, { repo, provider, notifier, classify });
 

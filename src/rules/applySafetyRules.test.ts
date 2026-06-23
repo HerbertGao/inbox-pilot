@@ -15,23 +15,42 @@ import { test } from 'node:test';
 
 import { applySafetyRules } from './applySafetyRules.js';
 import {
-  SENSITIVE_DOMAINS,
   SECURITY_PAYMENT_KEYWORDS,
   SENSITIVE_CATEGORIES,
 } from './lists.js';
+import type { ActiveRules } from './rulesConfig.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 
+// 内置默认快照（security = 整个内置常量；其余轴空）——对齐 getActiveRules() 同步初始化默认。
+// 域名/marketing/vip/important 轴用例经 makeRules({...}) 注入 operator 配置的快照测；
+// 不显式注入时 applySafetyRules 缺省取 getActiveRules()（默认 security=整集、其余空）。
+function makeRules(overrides: Partial<ActiveRules> = {}): ActiveRules {
+  return {
+    securityKeywords: SECURITY_PAYMENT_KEYWORDS,
+    neverMarkReadDomains: [],
+    vipSenders: [],
+    importantDomains: [],
+    marketingKeywords: [],
+    ...overrides,
+  };
+}
+
+// operator 配置的敏感域名表（迁移本文件原依赖内置示例域名的域名轴用例用）。
+const OPERATOR_NMR_DOMAINS = ['bank.com', 'hospital.com', 'insurance.com', 'payment.com', 'contract.com'] as const;
+
 // 一封合法 NormalizedEmail（给默认值，按需覆盖 subject/fromEmail/textBody）。
-// 默认 fromEmail 用非敏感域、subject/textBody 不含任何护栏关键词。
+// 默认 fromEmail 用中性域、subject/textBody 不含任何护栏关键词。
+// 注意：默认域须避开仓库示例 rules/rules.yaml 的 vip_senders/important_domains（如 example.com）——
+// 否则不注入 rules 的缺省用例会被 floor 轴抬升、行为不再对齐 §5 默认。用 example.test（中性、未被任何轴配置）。
 function makeEmail(overrides: Partial<NormalizedEmail> = {}): NormalizedEmail {
   return {
     accountId: 'acct-1',
     provider: 'gmail',
     providerMessageId: 'msg-1',
     subject: '普通主题 ordinary subject',
-    fromEmail: 'sender@example.com',
-    to: ['me@example.com'],
+    fromEmail: 'sender@example.test',
+    to: ['me@example.test'],
     date: '2026-06-20T00:00:00.000Z',
     hasAttachments: false,
     headers: {},
@@ -146,11 +165,13 @@ test('§5 派生表 P0（建议 P0、高置信）→ notify + 不 read + 不 dig
 // 强制不标已读护栏：敏感域名 + 支付/安全关键词覆盖 P2/P3
 // ——————————————————————————————————————————————————————————
 
-test('敏感域名（bank.com）覆盖 P2 的标已读 → shouldMarkRead=false', () => {
-  const sensitive = SENSITIVE_DOMAINS[0]; // bank.com
+// 域名轴（迁移后经注入 rules 参的 operator never_mark_read_domains 快照测——保域名轴仍被测、不 vacuous）。
+test('域名轴（operator 配 bank.com）覆盖 P2 的标已读 → shouldMarkRead=false', () => {
+  const sensitive = OPERATOR_NMR_DOMAINS[0]; // bank.com
   const d = applySafetyRules(
     makeEmail({ fromEmail: `user@${sensitive}` }),
     makeClassification({ priority: 'P2' }),
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
   );
   assert.equal(d.priority, 'P2'); // 优先级不变，仅护栏改 shouldMarkRead
   assert.equal(d.shouldMarkRead, false);
@@ -158,38 +179,55 @@ test('敏感域名（bank.com）覆盖 P2 的标已读 → shouldMarkRead=false'
   assert.ok(d.riskFlags.includes('sensitive-domain'));
 });
 
-test('敏感域名子域（mail.bank.com）也命中 → shouldMarkRead=false', () => {
-  const sensitive = SENSITIVE_DOMAINS[0];
+test('域名轴子域（mail.bank.com）也命中 → shouldMarkRead=false', () => {
+  const sensitive = OPERATOR_NMR_DOMAINS[0];
   const d = applySafetyRules(
     makeEmail({ fromEmail: `noreply@mail.${sensitive}` }),
     makeClassification({ priority: 'P2' }),
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
   );
   assert.equal(d.shouldMarkRead, false);
   assert.ok(d.appliedRules.includes('sensitive-domain→no-mark-read'));
 });
 
-test('敏感域名覆盖 P3 的标已读 → shouldMarkRead=false', () => {
+test('域名轴覆盖 P3 的标已读 → shouldMarkRead=false', () => {
   const d = applySafetyRules(
-    makeEmail({ fromEmail: `x@${SENSITIVE_DOMAINS[1]}` }),
+    makeEmail({ fromEmail: `x@${OPERATOR_NMR_DOMAINS[1]}` }),
     makeClassification({ priority: 'P3' }),
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
   );
   assert.equal(d.priority, 'P3');
   assert.equal(d.shouldMarkRead, false);
 });
 
-test('支付/合同敏感域名（无关键词命中）也覆盖 P2/P3 标已读', () => {
-  // 发件域命中支付/合同类敏感域、但主题/正文无任何关键词 → 仍必须不标已读（硬约束枚举对齐）。
+test('域名轴（支付/合同域、无关键词命中）也覆盖 P2/P3 标已读', () => {
+  // 发件域命中 operator 配的支付/合同类域、但主题/正文无任何关键词 → 仍必须不标已读。
+  const rules = makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] });
   const p2 = applySafetyRules(
     makeEmail({ fromEmail: 'noreply@payment.com', subject: '账户更新' }),
     makeClassification({ priority: 'P2' }),
+    rules,
   );
   const p3 = applySafetyRules(
     makeEmail({ fromEmail: 'docs@contract.com', subject: 'document ready' }),
     makeClassification({ priority: 'P3' }),
+    rules,
   );
   assert.equal(p2.shouldMarkRead, false);
   assert.ok(p2.appliedRules.includes('sensitive-domain→no-mark-read'));
   assert.equal(p3.shouldMarkRead, false);
+});
+
+test('域名轴内置默认空：未配 never_mark_read_domains → 域名轴对敏感域 no-op（不命中）', () => {
+  // 注入 makeRules 默认（neverMarkReadDomains=[]）；纯靠域名、无内容轴命中 → 域名轴不触发。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'user@bank.com', subject: '账户更新' }),
+    makeClassification({ priority: 'P2', category: 'work' }),
+    makeRules(), // neverMarkReadDomains=[]（内置默认空）
+  );
+  // 域名轴空 + 无内容轴命中 → 域名轴不触发（诚实边界：仅域名可识别、内容轴漏判者落入残留缺口）。
+  assert.ok(!d.appliedRules.includes('sensitive-domain→no-mark-read'));
+  assert.equal(d.shouldMarkRead, true); // 残留缺口：标已读（内容轴是决定性保证、域名轴非决定性）
 });
 
 test('支付/安全关键词（主题）覆盖 P2 标已读 → shouldMarkRead=false', () => {
@@ -235,10 +273,11 @@ test('正文英文 otp（主题不含）→ P3 仍不标已读', () => {
   assert.ok(d.appliedRules.includes('verification-keyword→no-mark-read'));
 });
 
-test('敏感域名带尖括号/显示名形态 "Name <u@bank.com>" 也命中 → 不标已读', () => {
+test('域名轴带尖括号/显示名形态 "Name <u@bank.com>" 也命中 → 不标已读', () => {
   const d = applySafetyRules(
     makeEmail({ fromEmail: '客服 <noreply@bank.com>' }),
     makeClassification({ priority: 'P2' }),
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
   );
   assert.equal(d.shouldMarkRead, false);
   assert.ok(d.appliedRules.includes('sensitive-domain→no-mark-read'));
@@ -370,10 +409,11 @@ test('英文医院/保险关键词大小写归一（Insurance/HOSPITAL 主题）
 // 单调趋安全：force-no-read 一旦置 false 不翻回 true
 // ——————————————————————————————————————————————————————————
 
-test('单调趋安全：敏感域名 + 支付关键词同时命中 P2 → 仍 false（不翻回）', () => {
+test('单调趋安全：域名轴 + 支付关键词同时命中 P2 → 仍 false（不翻回）', () => {
   const d = applySafetyRules(
-    makeEmail({ fromEmail: `u@${SENSITIVE_DOMAINS[0]}`, subject: 'payment due' }),
+    makeEmail({ fromEmail: `u@${OPERATOR_NMR_DOMAINS[0]}`, subject: 'payment due' }),
     makeClassification({ priority: 'P2', should_mark_read: true }),
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
   );
   // 两条护栏都命中，shouldMarkRead 始终 false（任一规则置 false 后不被后续翻回）。
   assert.equal(d.shouldMarkRead, false);
@@ -453,7 +493,11 @@ test('忽略 classification.should_* 建议，全部重新派生（P2 建议全�
 
 test('纯函数：不改写入参的 risk_flags（riskFlags 为副本）', () => {
   const cls = makeClassification({ priority: 'P2', risk_flags: ['existing-flag'] });
-  const d = applySafetyRules(makeEmail({ fromEmail: `u@${SENSITIVE_DOMAINS[0]}` }), cls);
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: `u@${OPERATOR_NMR_DOMAINS[0]}` }),
+    cls,
+    makeRules({ neverMarkReadDomains: [...OPERATOR_NMR_DOMAINS] }),
+  );
   // 引擎追加 sensitive-domain 到 riskFlags，但不污染原始 classification.risk_flags。
   assert.deepEqual(cls.risk_flags, ['existing-flag']);
   assert.ok(d.riskFlags.includes('existing-flag'));
@@ -463,4 +507,234 @@ test('纯函数：不改写入参的 risk_flags（riskFlags 为副本）', () =>
 test('reason 透传 LLM 的人类可读原因', () => {
   const d = applySafetyRules(makeEmail(), makeClassification({ reason: '工作通知' }));
   assert.equal(d.reason, '工作通知');
+});
+
+// ——————————————————————————————————————————————————————————
+// 新增轴精确有序管线（design 决策 6、safety-rules spec 场景）
+// 经注入 rules 参驱动；security 默认仍为内置整集（makeRules 缺省）。
+// ——————————————————————————————————————————————————————————
+
+// —— YAML 覆盖生效（经注入 rules 参）——
+
+test('security_keywords 整集 ∪ YAML：operator 增配词命中 → 不标已读', () => {
+  // 注入「内置整集 ∪ 自定义词」，断言自定义词也守护栏（模拟 rulesConfig 整集并集）。
+  const d = applySafetyRules(
+    makeEmail({ subject: '关于您的 mycustomsecword 事项', fromEmail: 'x@neutral.example' }),
+    makeClassification({ priority: 'P2', category: 'personal', confidence: 0.9 }),
+    makeRules({ securityKeywords: [...SECURITY_PAYMENT_KEYWORDS, 'mycustomsecword'] }),
+  );
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('payment-security-keyword→no-mark-read'));
+});
+
+test('never_mark_read_domains（operator YAML）命中发件域 → 不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'noreply@myco-internal.example', subject: '账户更新' }),
+    makeClassification({ priority: 'P2', category: 'work' }),
+    makeRules({ neverMarkReadDomains: ['myco-internal.example'] }),
+  );
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('sensitive-domain→no-mark-read'));
+});
+
+// —— 三轴空默认 → 既有用例不变（marketing/vip/important 默认空 → 全 no-op）——
+
+test('三轴空默认（makeRules 缺省）：P2 非敏感 → 仍标已读、无新增轴命中', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '周会纪要 sale discount 50% off', fromEmail: 'vip@boss.example' }),
+    makeClassification({ priority: 'P2', category: 'work' }),
+    makeRules(), // marketing/vip/important 全空 → 三轴 no-op
+  );
+  // marketing 空 → 不下调；vip/important 空 → 不抬升；行为与现状一致（P2 标已读）。
+  assert.equal(d.priority, 'P2');
+  assert.equal(d.shouldMarkRead, true);
+  assert.ok(!d.appliedRules.includes('marketing→P3'));
+  assert.ok(!d.appliedRules.includes('vip-important→P1'));
+});
+
+// —— floor 轴：P0/P4 + vip/important → 不下调 ——
+
+test('P0（验证码主题）+ vip/important → floor no-op（仍 P0、shouldNotifyNow 不丢）', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '您的验证码是 123456', fromEmail: 'ceo@vip.example' }),
+    makeClassification({ priority: 'P2', confidence: 0.9 }),
+    makeRules({ vipSenders: ['ceo@vip.example'], importantDomains: ['vip.example'] }),
+  );
+  assert.equal(d.priority, 'P0'); // 禁止 max('P0','P1') 把 P0 下调为 P1
+  assert.equal(d.shouldNotifyNow, true);
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(!d.appliedRules.includes('vip-important→P1'));
+});
+
+test('P4 + vip/important → floor no-op（仍 P4、shouldNotifyNow 不丢）', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'risk@vip.example' }),
+    makeClassification({ priority: 'P4', confidence: 0.9 }),
+    makeRules({ vipSenders: ['risk@vip.example'], importantDomains: ['vip.example'] }),
+  );
+  assert.equal(d.priority, 'P4');
+  assert.equal(d.shouldNotifyNow, true);
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(!d.appliedRules.includes('vip-important→P1'));
+});
+
+test('floor 轴对 P1（高置信非降级）no-op：vip/important 不动 P1', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'vip@boss.example' }),
+    makeClassification({ priority: 'P1', confidence: 0.9 }),
+    makeRules({ vipSenders: ['vip@boss.example'], importantDomains: ['boss.example'] }),
+  );
+  assert.equal(d.priority, 'P1');
+  assert.ok(!d.appliedRules.includes('vip-important→P1'));
+});
+
+test('floor 轴：P2 命中 important_domains → 抬升 P1（子域归一匹配）', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'team@mail.boss.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ importantDomains: ['boss.example'] }),
+  );
+  assert.equal(d.priority, 'P1');
+  assert.ok(d.appliedRules.includes('vip-important→P1'));
+  // P1 → 不标已读、入摘要、不通知。
+  assert.equal(d.shouldMarkRead, false);
+  assert.equal(d.shouldIncludeDigest, true);
+  assert.equal(d.shouldNotifyNow, false);
+});
+
+test('floor 轴：P3 命中 vip_senders（精确归一匹配）→ 抬升 P1', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: '老板 <Boss@VIP.Example>' }), // 显示名 + 大小写 → 归一为 boss@vip.example
+    makeClassification({ priority: 'P3', category: 'work', confidence: 0.9 }),
+    makeRules({ vipSenders: ['boss@vip.example'] }),
+  );
+  assert.equal(d.priority, 'P1');
+  assert.ok(d.appliedRules.includes('vip-important→P1'));
+});
+
+test('vip_senders 精确匹配：仅域同（地址不同）不命中 vip 轴', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'someone-else@vip.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ vipSenders: ['boss@vip.example'] }), // 只配精确地址、不配域
+  );
+  assert.equal(d.priority, 'P2'); // 地址不同 → vip 轴不命中、important 也未配 → 不抬升
+  assert.ok(!d.appliedRules.includes('vip-important→P1'));
+});
+
+// —— marketing 轴：只动 P2、绝不碰 P0/P1/P4/敏感 ——
+
+test('marketing 轴：P2 非敏感命中 marketing → 下调 P3', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '限时大促 sale 50% off', fromEmail: 'promo@shop.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ marketingKeywords: ['sale', '大促'] }),
+  );
+  assert.equal(d.priority, 'P3');
+  assert.ok(d.appliedRules.includes('marketing→P3'));
+  // P3 非敏感 → 标已读。
+  assert.equal(d.shouldMarkRead, true);
+  assert.equal(d.shouldIncludeDigest, false);
+});
+
+test('高置信 P1 + marketing → 不下调 P3、不翻 shouldMarkRead', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '限时 sale 大促', fromEmail: 'promo@shop.example' }),
+    makeClassification({ priority: 'P1', category: 'work', confidence: 0.95 }),
+    makeRules({ marketingKeywords: ['sale', '大促'] }),
+  );
+  assert.equal(d.priority, 'P1'); // marketing 只动 P2
+  assert.ok(!d.appliedRules.includes('marketing→P3'));
+  assert.equal(d.shouldMarkRead, false); // P1 不标已读、不被 marketing 翻 true
+});
+
+test('P0（验证码）+ marketing 词 → 不下调 P3、不翻 shouldMarkRead', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '您的验证码 sale 123456', fromEmail: 'promo@shop.example' }),
+    makeClassification({ priority: 'P2', confidence: 0.9 }),
+    makeRules({ marketingKeywords: ['sale'] }),
+  );
+  assert.equal(d.priority, 'P0'); // 主题验证码 → P0；marketing 不碰 P0
+  assert.ok(!d.appliedRules.includes('marketing→P3'));
+  assert.equal(d.shouldMarkRead, false);
+  assert.equal(d.shouldNotifyNow, true);
+});
+
+test('敏感 P2 + marketing → marketing no-op、护栏粘住（shouldMarkRead 仍 false）', () => {
+  // P2 + category=finance（敏感轴）+ 主题含 marketing 词 → sensitiveGuardFired 为真 → marketing no-op。
+  const d = applySafetyRules(
+    makeEmail({ subject: '理财 sale 大促', fromEmail: 'promo@bankmkt.example' }),
+    makeClassification({ priority: 'P2', category: 'finance', confidence: 0.9 }),
+    makeRules({ marketingKeywords: ['sale', '大促'] }),
+  );
+  assert.equal(d.priority, 'P2'); // marketing 因 sensitiveGuardFired 不下调
+  assert.ok(!d.appliedRules.includes('marketing→P3'));
+  assert.equal(d.shouldMarkRead, false); // 护栏粘住（类别轴）
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+// —— vip + 广告 → P1（vip 胜：marketing 先 P2→P3、floor 再 P3→P1）——
+
+test('vip + 广告 → 终末 P1（marketing 先 P2→P3、floor 再 P3→P1）、shouldMarkRead=false', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '限时 sale 大促', fromEmail: 'boss@vip.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ marketingKeywords: ['sale', '大促'], vipSenders: ['boss@vip.example'] }),
+  );
+  assert.equal(d.priority, 'P1'); // vip 胜
+  assert.ok(d.appliedRules.includes('marketing→P3'));
+  assert.ok(d.appliedRules.includes('vip-important→P1'));
+  assert.equal(d.shouldMarkRead, false); // P1 → 不标已读（floor 抬升使 markRead 自然 false）
+  assert.equal(d.shouldIncludeDigest, true);
+});
+
+// —— 提升轴 + 敏感轴 → markRead 粘 false（不被 priority 改动重派为 true）——
+
+test('提升轴（important）+ 敏感关键词轴 → 抬升 P1，shouldMarkRead 仍 false（护栏粘住）', () => {
+  // P2 命中 important_domains 被抬升、同时主题含 security 关键词（敏感轴）。
+  const d = applySafetyRules(
+    makeEmail({ subject: 'invoice 账单', fromEmail: 'billing@boss.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ importantDomains: ['boss.example'] }),
+  );
+  assert.equal(d.priority, 'P1');
+  assert.ok(d.appliedRules.includes('vip-important→P1'));
+  assert.ok(d.appliedRules.includes('payment-security-keyword→no-mark-read'));
+  assert.equal(d.shouldMarkRead, false); // 敏感守卫 false 粘住、不被抬升重派 true
+});
+
+// —— 正文含验证码（主题无）的 P2/非敏感类别 → shouldMarkRead=false（经 applySafetyRules）——
+
+test('正文含验证码（主题无、非敏感类别、无 security 词）→ sensitiveGuardFired 真、不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '普通通知', textBody: '您的 OTP 是 998877', fromEmail: 'svc@neutral.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules(), // 默认（域名/marketing/vip/important 空）；验证码轴内置
+  );
+  assert.equal(d.priority, 'P2'); // 正文验证码不强制 P0
+  assert.equal(d.shouldMarkRead, false); // 验证码关键词轴（正文）→ 护栏
+  assert.ok(d.appliedRules.includes('verification-keyword→no-mark-read'));
+});
+
+// —— 域名轴空 → 敏感邮件仍由内容轴守住 ——
+
+test('域名轴空（默认）：敏感邮件仍由关键词轴守住 → 不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ subject: '账单 invoice 提醒', fromEmail: 'noreply@some-bank.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ neverMarkReadDomains: [] }), // 域名轴空
+  );
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('payment-security-keyword→no-mark-read'));
+  assert.ok(!d.appliedRules.includes('sensitive-domain→no-mark-read')); // 域名轴未命中
+});
+
+test('域名轴空（默认）：敏感邮件仍由类别轴守住 → 不标已读', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'promo@some-bank.example', subject: '本月理财活动' }),
+    makeClassification({ priority: 'P2', category: 'finance', confidence: 0.9 }),
+    makeRules({ neverMarkReadDomains: [] }),
+  );
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
 });

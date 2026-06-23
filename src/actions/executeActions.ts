@@ -36,11 +36,64 @@ const MAX_ATTEMPTS = 3;
 /** 脱敏 error 摘要上限：截断为短摘要，禁含 token / chat_id / 正文。 */
 const ERROR_SUMMARY_MAX = 200;
 
+/**
+ * 退避参数（组 C 决策 5「有紧上限的指数退避」）：
+ *   - 起始 ~100ms（首次重试前）、指数翻倍、**每次重试上限封顶 ≤500ms**；
+ *   - **单封邮件动作总退避封顶 ≤~750ms**——与分类器退避（≤250ms，见 classifyEmail.ts
+ *     `TRANSPORT_RETRY_BACKOFF_MS`）求和 = 单封总退避 ≤~1s（design 决策 5 量化）。
+ *
+ * 总退避封顶按整轮校核：常规批量（N 封顺序、整轮 ≤ `DEFAULT_POLL_TIMEOUT_MS`=5min）下单封 ≤~1s 远 << 超时；
+ * 即便病态全失败超时由 scheduler `raceWithTimeout` 优雅放弃（只停等待 + 释放名额、processedAt 幂等、放弃不自动标已读）。
+ * 退避**延迟本封完成**但不跳过该封其余动作（budget 耗尽则后续退避降为 0、动作仍照常发起）、不阻其他账号（各账号独立）。
+ */
+const BACKOFF_BASE_MS = 100;
+const BACKOFF_PER_RETRY_CAP_MS = 500;
+const BACKOFF_TOTAL_CAP_MS = 750;
+
+/**
+ * 可注入睡眠 seam：默认真实 setTimeout，测试注入假时钟以零真实等待断言退避被调用、求和有上限。
+ */
+export type SleepFn = (ms: number) => Promise<void>;
+
+const realSleep: SleepFn = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+/**
+ * 单封邮件的累计退避预算（**贯穿一次 executeActions 调用的三个动作**）：
+ *   - `nextDelay(attempt)`：第 `attempt` 次尝试后、下一次重试前的退避 = `min(指数, per-retry-cap, 剩余预算)`；
+ *     指数 = `BACKOFF_BASE_MS * 2^(attempt-1)`（attempt 从 1 起，第 1 次失败后退避 = base）。
+ *   - 预算耗尽 → 返回 0（**不跳过动作**：退避降为 0、其余动作仍照常发起，仅不再延迟）。
+ *   - 仅在**真正即将 sleep 时**累计消耗（skipped 等不进退避路径者天然不消耗预算）。
+ */
+class BackoffBudget {
+  private spentMs = 0;
+  constructor(private readonly sleep: SleepFn) {}
+
+  /** 已第 `attempt` 次失败、即将进入下一次重试：退避并消耗预算（受 per-retry + 剩余总预算封顶）。 */
+  async backoff(attempt: number): Promise<void> {
+    const remaining = BACKOFF_TOTAL_CAP_MS - this.spentMs;
+    if (remaining <= 0) {
+      return; // 预算耗尽：退避降 0、不跳过动作（调用方继续重试，仅不再延迟）。
+    }
+    const exponential = BACKOFF_BASE_MS * 2 ** (attempt - 1);
+    const delay = Math.min(exponential, BACKOFF_PER_RETRY_CAP_MS, remaining);
+    if (delay <= 0) {
+      return;
+    }
+    this.spentMs += delay;
+    await this.sleep(delay);
+  }
+}
+
 /** executeActions 的可注入依赖。三者皆由 processEmail 注入（默认接真身、测试注入假体）。 */
 export type ExecuteActionsDeps = {
   readonly repo: MailRepo;
   readonly provider: ProviderActions;
   readonly notifier: Notifier;
+  /** 退避睡眠 seam（默认真实 setTimeout，测试注入假时钟断言退避而不真实等待）。 */
+  readonly sleep?: SleepFn;
 };
 
 /**
@@ -73,6 +126,7 @@ async function executeReflectPriority(
   decision: FinalDecision,
   deps: ExecuteActionsDeps,
   messageRowId: string,
+  budget: BackoffBudget,
 ): Promise<void> {
   const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.ReflectPriority);
   let lastError: unknown;
@@ -88,7 +142,10 @@ async function executeReflectPriority(
         throw err;
       }
       lastError = err;
-      // 发送态瞬时失败：继续下一次尝试（reflectPriority 幂等，重试安全）；耗尽后落 failed、不抛。
+      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（reflectPriority 幂等，重试安全）；耗尽后落 failed、不抛。
+      if (attempt < MAX_ATTEMPTS) {
+        await budget.backoff(attempt);
+      }
     }
   }
   const summary = redactError(lastError);
@@ -115,6 +172,7 @@ async function executeMarkRead(
   email: NormalizedEmail,
   deps: ExecuteActionsDeps,
   messageRowId: string,
+  budget: BackoffBudget,
 ): Promise<void> {
   const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.MarkRead);
   let lastError: unknown;
@@ -130,7 +188,10 @@ async function executeMarkRead(
         throw err;
       }
       lastError = err;
-      // 发送态瞬时失败：继续下一次尝试（标已读幂等，重试安全）；耗尽后落 failed、不抛。
+      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（标已读幂等，重试安全）；耗尽后落 failed、不抛。
+      if (attempt < MAX_ATTEMPTS) {
+        await budget.backoff(attempt);
+      }
     }
   }
   // ponytail: 假 provider 仅抛固定串，redactError 截断即可；接真实 IMAP/Gmail（P3/P4）时
@@ -160,6 +221,7 @@ async function executeNotify(
   email: NormalizedEmail,
   deps: ExecuteActionsDeps,
   messageRowId: string,
+  budget: BackoffBudget,
 ): Promise<void> {
   const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.Notify);
   let lastError = 'unknown error';
@@ -174,6 +236,10 @@ async function executeNotify(
       result = await deps.notifier.notify(decision, email);
     } catch (err) {
       lastError = redactError(err);
+      // 抛出当作一次失败尝试：退避（除最后一次尝试外）后继续。
+      if (attempt < MAX_ATTEMPTS) {
+        await budget.backoff(attempt);
+      }
       continue;
     }
     if (result.outcome === 'sent') {
@@ -181,12 +247,15 @@ async function executeNotify(
       return;
     }
     if (result.outcome === 'skipped') {
-      // 无渠道降级：直接落 skipped、不重试、不计入重试预算（首轮即终结）。
+      // 无渠道降级：直接落 skipped、不重试、**不进退避路径**（不消耗退避预算，首轮即终结）。
       await deps.repo.updateAction(actionRowId, 'skipped', result.reason);
       return;
     }
-    // failed：记录脱敏 error 摘要，继续下一次尝试。
+    // failed：记录脱敏 error 摘要，退避（除最后一次尝试外）后继续下一次尝试。
     lastError = redactError(result.error);
+    if (attempt < MAX_ATTEMPTS) {
+      await budget.backoff(attempt);
+    }
   }
   logger.warn(
     { kind: 'notify-action-failed', attempts: MAX_ATTEMPTS, error: lastError },
@@ -225,13 +294,16 @@ export async function executeActions(
   messageRowId: string,
   deps: ExecuteActionsDeps,
 ): Promise<void> {
+  // 单封邮件的累计退避预算：**贯穿本次调用的三个动作**（≤~750ms，与分类器退避求和 ≤~1s）。
+  // 退避延迟本封但不跳过该封其余动作（预算耗尽则后续退避降为 0、动作仍照常发起）。
+  const budget = new BackoffBudget(deps.sleep ?? realSleep);
   // 始终先落优先级（标签不被 shouldMarkRead 门控）；ProviderReauthRequired 会从此处向上抛。
-  await executeReflectPriority(email, decision, deps, messageRowId);
+  await executeReflectPriority(email, decision, deps, messageRowId, budget);
   if (decision.shouldMarkRead) {
-    await executeMarkRead(email, deps, messageRowId);
+    await executeMarkRead(email, deps, messageRowId, budget);
   }
   if (decision.shouldNotifyNow) {
-    await executeNotify(decision, email, deps, messageRowId);
+    await executeNotify(decision, email, deps, messageRowId, budget);
   }
   // shouldIncludeDigest：本期不产生动作（摘要 P5）。
 }

@@ -12,10 +12,11 @@
 //   - refresh 失败日志无 token/secret 子串；回调日志无 code/state 子串、无完整回调 URL。
 
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import http from 'node:http';
 
 import { gmailPoll, htmlToText, toRawEmail, type GmailPollDeps } from './gmailPoller.js';
+import { resetRulesConfigForTest } from '../../rules/rulesConfig.js';
 import {
   createGmailProvider,
   PRIORITY_LABELS,
@@ -42,6 +43,12 @@ import { ProviderReauthRequired } from '../provider.js';
 import { REDACT_PATHS, logger as prodLogger } from '../../logger.js';
 import { pino } from 'pino';
 import type { Classification } from '../../classifier/schema.js';
+
+// 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
+// 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
+beforeEach(() => {
+  resetRulesConfigForTest();
+});
 
 const ACCOUNT_ID = 'gmail:user@example.com';
 
@@ -1247,7 +1254,9 @@ function makeEmail(id: string): import('../../normalizer/normalizeEmail.js').Nor
     provider: 'gmail',
     providerMessageId: id,
     subject: '主题',
-    fromEmail: 'sender@example.com',
+    // 中性发件域（RFC-6761 保留测试域，不在 rules.yaml vip/important/域名轴）——
+    // 避免命中示例 important_domains:[example.com] 被 floor 轴抬升 P1。
+    fromEmail: 'sender@example.test',
     to: ['me@example.com'],
     date: '2026-06-20T00:00:00.000Z',
     hasAttachments: false,

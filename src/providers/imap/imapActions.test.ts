@@ -11,8 +11,9 @@
 // 全离线：注入假 ImapConnection + InMemoryMailRepo + 假 classify；不连网络、不发邮件。
 
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 
+import { resetRulesConfigForTest } from '../../rules/rulesConfig.js';
 import {
   createImapProvider,
   ImapMarkReadError,
@@ -32,7 +33,12 @@ import type { NotificationChannel } from '../../notify/notifier.js';
 import type { ChannelSendResult } from '../../notify/telegram.js';
 import type { Classification } from '../../classifier/schema.js';
 import type { NormalizedEmail } from '../../normalizer/normalizeEmail.js';
-import { SENSITIVE_DOMAINS } from '../../rules/lists.js';
+
+// 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
+// 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
+beforeEach(() => {
+  resetRulesConfigForTest();
+});
 
 // 假连接：addSeenFlag 行为可配（成功记录 uid / 抛含敏感串的错误）。其余方法非本测关注、置惰性默认。
 function makeFakeConnection(
@@ -64,7 +70,9 @@ function makeEmail(overrides: Partial<NormalizedEmail> = {}): NormalizedEmail {
     provider: 'imap',
     providerMessageId: 'mid-1',
     subject: '普通主题',
-    fromEmail: 'sender@example.com',
+    // 中性发件域（RFC-6761 保留测试域，不在 rules.yaml vip/important/域名轴）——
+    // 避免命中示例 important_domains:[example.com] 被 floor 轴抬升 P1。
+    fromEmail: 'sender@example.test',
     to: ['me@example.com'],
     date: '2026-06-20T00:00:00.000Z',
     uid: 42,
@@ -204,9 +212,11 @@ test('经 executeActions：P0/P1/P4/敏感 → 不标 \\Seen（保持未读）',
     { name: 'P1', cls: makeClassification({ priority: 'P1' }), email: makeEmail({ uid: 2 }) },
     { name: 'P4', cls: makeClassification({ priority: 'P4' }), email: makeEmail({ uid: 3 }) },
     {
-      name: '敏感域名',
+      // 域名内置默认已清空（决策 1）——决定性护栏在内容轴。改用内置 SECURITY_PAYMENT_KEYWORDS
+      // 关键词（主题含「医院」）触发关键词轴，断言意图不变（P2 敏感 → 不标 \Seen）。
+      name: '敏感关键词',
       cls: makeClassification({ priority: 'P2' }),
-      email: makeEmail({ uid: 4, fromEmail: `u@${SENSITIVE_DOMAINS[0]}` }),
+      email: makeEmail({ uid: 4, subject: '医院预约确认', fromEmail: 'u@example.test' }),
     },
   ]) {
     const connection = makeFakeConnection(async () => {});
