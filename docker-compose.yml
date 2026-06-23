@@ -30,4 +30,5 @@ services:
       # 容器时区：每日摘要定点（DIGEST_TIMES）依赖时区，随 .env 透传（缺省由进程内兜底 Asia/Shanghai）。
       TZ: ${TZ:-Asia/Shanghai}
     ports:
-      - "3000:3000"
+      # 默认 3000:3000；宿主端口可被 APP_HOST_PORT 覆盖以绕开本机端口冲突（与 POSTGRES_HOST_PORT 同模式，多主机部署用）。
+      - "${APP_HOST_PORT:-3000}:3000"
