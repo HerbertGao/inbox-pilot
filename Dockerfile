@@ -12,6 +12,7 @@ RUN pnpm install --ignore-scripts
 FROM node:24-bookworm-slim AS build
 WORKDIR /app
 RUN corepack enable
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=install /app/node_modules ./node_modules
 COPY package.json pnpm-lock.yaml ./
 COPY prisma ./prisma
@@ -23,10 +24,12 @@ RUN pnpm exec tsc
 # ── run：复用 build 的 node_modules（含 prisma CLI）+ dist + prisma（schema + migrations），不做 --prod 重装 ──
 FROM node:24-bookworm-slim AS run
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/prisma ./prisma
 COPY package.json ./
+COPY rules ./rules
 EXPOSE 3000
 # 单条 shell 形式：set -e 使迁移失败即非零退出（crash-loop），exec 使信号直达 node。不加 until pg_isready。
 ENTRYPOINT ["sh", "-c", "set -e; node_modules/.bin/prisma migrate deploy; exec node dist/main.js"]
