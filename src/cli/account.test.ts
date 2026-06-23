@@ -310,12 +310,30 @@ test('account add --imap --update：同 id 显式确认 → 更新凭据（不�
 // provider 校验
 // ——————————————————————————————————————————————————————————
 
-test('account add：缺 provider → 参数错误', async () => {
+test('account add：无 provider 标志 → 打开交互菜单（注入 promptChoice 选 imap）→ 建行（反转旧 USAGE 契约）', async () => {
+  const repo = new InMemoryMailRepo();
+  const choicePrompts: string[] = [];
+  const { deps } = makeDeps(repo, {
+    promptChoice: async (label, choices) => {
+      choicePrompts.push(`${label}:${choices.join(',')}`);
+      return 'imap';
+    },
+  });
+  const code = await runAccountCli(['add', '--email', 'me@example.com', '--host', 'h'], deps);
+  assert.equal(code, EXIT_OK, '无 provider → 菜单选 imap → 建行（不再 EXIT_USAGE）');
+  assert.equal(choicePrompts.length, 1, '触发了一次 provider 选择菜单');
+  const rows = await repo.listEnabledAccounts();
+  assert.equal(rows.length, 1, '据菜单所选 provider 建 imap 行');
+  assert.equal(rows[0]!.provider, 'imap');
+  assert.equal(rows[0]!.id, 'imap:me@example.com@h');
+});
+
+test('裸 account（无子命令） / runAccountCli([]) → USAGE 退出 2（菜单仅在 add 无 provider 时触发）', async () => {
   const repo = new InMemoryMailRepo();
   const { deps } = makeDeps(repo);
-  const code = await runAccountCli(['add', '--email', 'me@example.com', '--host', 'h'], deps);
-  assert.equal(code, EXIT_USAGE);
-  assert.equal((await repo.listEnabledAccounts()).length, 0);
+  // 无子命令（command === undefined）：仍打印 USAGE、退出 2，绝不触发交互菜单。
+  assert.equal(await runAccountCli([], deps), EXIT_USAGE);
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '裸命令不建任何行');
 });
 
 test('account add：同时 --imap --gmail → 参数错误', async () => {
@@ -469,6 +487,39 @@ test('account disable：缺 id → 参数错误', async () => {
   assert.equal(await runAccountCli(['disable'], deps), EXIT_USAGE);
 });
 
+test('F-C：disable a b（多余位置参数）→ EXIT_USAGE、不静默只禁用 a 丢弃 b', async () => {
+  const repo = new InMemoryMailRepo();
+  await repo.upsertAccount({
+    id: 'a',
+    provider: 'gmail',
+    email: 'a@gmail.com',
+    authJson: { refreshToken: GMAIL_RT, scopes: [] },
+  });
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['disable', 'a', 'b'], deps);
+  assert.equal(code, EXIT_USAGE, '多余位置参数 → 参数错误');
+  assert.ok(err.join('\n').includes('一个 id'), '提示需且仅需一个 id');
+  // a 未被静默禁用（恰好一个 id 校验在写之前拒绝）。
+  const row = await repo.getAccountById('a');
+  assert.equal(row?.enabled, true, '校验失败时不静默禁用 a');
+});
+
+test('disable --json x（任意 flag）→ EXIT_USAGE、精确报「不接受任何 flag」（防 <id> 被 --json 吞掉误报缺 id）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['disable', '--json', 'x'], deps);
+  assert.equal(code, EXIT_USAGE, 'disable 带 flag → 参数错误');
+  assert.ok(err.join('\n').includes('不接受任何 flag'), '精确报「不接受任何 flag」');
+});
+
+test('disable --foo（未知 flag）→ EXIT_USAGE、精确报「不接受任何 flag」', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['disable', '--foo'], deps);
+  assert.equal(code, EXIT_USAGE, 'disable 带未知 flag → 参数错误');
+  assert.ok(err.join('\n').includes('不接受任何 flag'), '精确报「不接受任何 flag」');
+});
+
 // ——————————————————————————————————————————————————————————
 // 未知命令 / help
 // ——————————————————————————————————————————————————————————
@@ -495,4 +546,339 @@ test('runAccountCli：命令抛出（如 list 的 repo 故障）→ EXIT_FAILURE
   const text = err.join('\n');
   assert.ok(text.includes('命令执行失败'), '顶层脱敏文案');
   assert.ok(!text.includes('SECRET_PW'), '不把原始 error（含连接串口令子串）打到 stderr');
+});
+
+// ——————————————————————————————————————————————————————————
+// §2 account-id 校验（最终值锚定）：非法显式 id / 派生路径注入被拒，错误信息不回显原始控制字符
+// ——————————————————————————————————————————————————————————
+
+test('§2.3 --account-id 含控制字符（\\n）→ 拒绝（EXIT_USAGE）、错误信息不含原始控制字符、不建行', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--account-id', 'evil\nINJECTED'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '含换行的 --account-id → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '非法 id 不建任何行');
+  const text = err.join('\n');
+  // 错误信息绝不含原始控制字符（须经转义渲染）：捕获行内不出现裸 \n 注入的「INJECTED」独立行。
+  assert.ok(!text.includes('evil\nINJECTED'), '错误信息不原样回显含裸控制字符的违规值');
+  // JSON.stringify 转义后 \n 变为字面量 \\n，故转义形态可出现。
+  assert.ok(text.includes('evil\\nINJECTED'), '违规值经 JSON 转义渲染（\\n 字面量）');
+});
+
+test('§2.4 --account-id "" 空串 → 拒绝（EXIT_USAGE）（?? 视 "" 为已定义、不走派生，空显式 id 须被拒）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--account-id', ''],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '空串 --account-id → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '空 id 不建任何行');
+});
+
+test('§2.5 --host 含控制字符（\\n）无显式 --account-id → 派生 id 终值校验被拒（EXIT_USAGE）、create 未调用', async () => {
+  const repo = new InMemoryMailRepo();
+  let createCalled = false;
+  repo.createAccount = async () => {
+    createCalled = true;
+    throw new Error('should-not-be-called');
+  };
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(['add', '--imap', '-e', 'me@ex.com', '-H', 'h\nINJECTED'], deps);
+  assert.equal(code, EXIT_USAGE, '含控制字符的 --host 经派生终值校验被拒');
+  assert.equal(createCalled, false, '在任何写之前被拒（create 未调用）');
+});
+
+test('§2.6 --email=a=b -H h → 派生 imap:a=b@h 被接受（= 在字符集内）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(['add', '--imap', '--email=a=b', '-H', 'h'], deps);
+  assert.equal(code, EXIT_OK, '含 = 的合法派生 id 被接受');
+  const rows = await repo.listEnabledAccounts();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.id, 'imap:a=b@h');
+});
+
+// ——————————————————————————————————————————————————————————
+// §4 --json 输出：账号新增结果走字段白名单、绝无凭据字段
+// ——————————————————————————————————————————————————————————
+
+test('§4.3 account add --imap --json → stdout 输出可解析、仅白名单字段、绝无 authJson/password/token/refresh', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, out } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--json'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  // stdout 应只含一行可解析 JSON 对象（数据走 stdout、人类行走 stderr）。
+  const stdout = out.join('\n');
+  const parsed = JSON.parse(stdout) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(parsed).sort(), ['email', 'enabled', 'id', 'provider']);
+  assert.equal(parsed.id, 'imap:me@ex.com@h');
+  assert.equal(parsed.provider, 'imap');
+  assert.equal(parsed.email, 'me@ex.com');
+  assert.equal(parsed.enabled, true);
+  // 绝无任何凭据字段 / 凭据值子串。
+  for (const forbidden of ['authJson', 'password', 'token', 'refresh']) {
+    assert.ok(!stdout.toLowerCase().includes(forbidden), `--json 输出不含 ${forbidden}`);
+  }
+  assert.ok(!stdout.includes(IMAP_PW), '--json 输出不含口令值');
+});
+
+// ——————————————————————————————————————————————————————————
+// §5.2 --tls / --no-tls 冲突解析（查 values + bools 两桶、消除静默忽略）
+// ——————————————————————————————————————————————————————————
+
+test('§5.2 --tls true + --no-tls（值分歧）→ EXIT_USAGE', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--tls', 'true', '--no-tls'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '--tls true 与 --no-tls 真实值分歧 → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0);
+});
+
+test('§5.2 --tls false + --no-tls（一致对）→ 接受、tls=false', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--tls', 'false', '--no-tls'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK, '一致对被接受');
+  const auth = (await repo.listEnabledAccounts())[0]!.authJson as Record<string, unknown>;
+  assert.equal(auth.tls, false);
+});
+
+test('§5.2 值缺位的 --tls --no-tls → 不被静默忽略、由 --no-tls 置 tls=false', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  // 值缺位的 --tls（下一 token --no-tls 以 - 开头）落入 bools；须两桶都查、不静默保留 TLS。
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--tls', '--no-tls'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  const auth = (await repo.listEnabledAccounts())[0]!.authJson as Record<string, unknown>;
+  assert.equal(auth.tls, false, '值缺位 --tls --no-tls → --no-tls 优先 tls=false（不静默忽略）');
+});
+
+test('§5.2 --no-tls 单独 → tls=false', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--no-tls'], deps);
+  assert.equal(code, EXIT_OK);
+  const auth = (await repo.listEnabledAccounts())[0]!.authJson as Record<string, unknown>;
+  assert.equal(auth.tls, false);
+});
+
+// ——————————————————————————————————————————————————————————
+// §6.7 --password-stdin：无 TTY 完成接入、含合法首尾空格的口令逐字保留（仅减一个尾换行）
+// ——————————————————————————————————————————————————————————
+
+test('§6.7 --password-stdin（注入 stdin read 返回 "  p@ss \\n"）→ 口令逐字保留 "  p@ss "（仅减一尾换行）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps } = makeDeps(repo, {
+    stdin: { isTTY: false, read: async () => '  p@ss \n' },
+    // promptHidden 不应被调用（走 stdin 来源）；若被调用返回哨兵值便于断言失败。
+    promptHidden: async () => 'SHOULD_NOT_BE_USED',
+  });
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--password-stdin'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  const rows = await repo.listEnabledAccounts();
+  assert.equal(rows.length, 1);
+  const auth = rows[0]!.authJson as Record<string, unknown>;
+  // 首尾空格逐字保留，仅剥一个尾随换行。
+  assert.equal(auth.password, '  p@ss ', '口令逐字保留首尾空格、仅减一尾换行');
+});
+
+// ——————————————————————————————————————————————————————————
+// F1：机密 flag 在路由前对**所有**子命令统一拒绝（不止 add）；F7：归一词根匹配（分隔符/大小写变体）
+// ——————————————————————————————————————————————————————————
+
+test('F1：list --password SECRET → 路由前拒绝（参数错误、不回显机密值）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['list', '--password', 'SECRET'], deps);
+  assert.equal(code, EXIT_USAGE, 'list 子命令也拒绝机密 flag');
+  assert.ok(!err.join('\n').includes('SECRET'), '不回显机密值');
+});
+
+test('F1：disable <id> --password SECRET → 路由前拒绝（不禁用、不回显机密值）', async () => {
+  const repo = new InMemoryMailRepo();
+  await repo.upsertAccount({
+    id: 'gmail:user@gmail.com',
+    provider: 'gmail',
+    email: 'user@gmail.com',
+    authJson: { refreshToken: GMAIL_RT, scopes: [] },
+  });
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['disable', 'gmail:user@gmail.com', '--password', 'SECRET'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, 'disable 子命令也拒绝机密 flag');
+  assert.ok(!err.join('\n').includes('SECRET'), '不回显机密值');
+  // 行仍为 enabled=true（未被禁用，因路由前已拒）。
+  const row = await repo.getAccountById('gmail:user@gmail.com');
+  assert.equal(row?.enabled, true, '路由前拒绝 → 未执行禁用');
+});
+
+test('F7：归一词根匹配 → --refreshToken / --access-token / --client-secret 经 argv 均拒绝', async () => {
+  const repo = new InMemoryMailRepo();
+  for (const flag of ['--refreshToken', '--access-token', '--client-secret', '--PASSWORD', '--pw']) {
+    const { deps } = makeDeps(repo);
+    const code = await runAccountCli(
+      ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', flag, 'X'],
+      deps,
+    );
+    assert.equal(code, EXIT_USAGE, `${flag} 经 argv → 拒绝`);
+  }
+  assert.equal((await repo.listEnabledAccounts()).length, 0);
+});
+
+test('F-A：复合机密 flag 名（分段命中机密词根）经 argv 均拒绝（封堵 exact-Set.has 复合名漏洞）', async () => {
+  const repo = new InMemoryMailRepo();
+  // 复合/分隔符/大小写变体：任一分段命中机密词根 → 拒绝（exact normalize+Set.has 会漏掉这些）。
+  const forbidden = [
+    '--password',
+    '--imap-password',
+    '--imapPassword',
+    '--db-password',
+    '--access-token',
+    '--refreshToken',
+    '--client-secret',
+    '--PW',
+    '--user_secret',
+    // F-3：无边界粘连机密名（单段，分段检测漏掉、子串带兜住）。
+    '--mypassword',
+    '--apikey',
+    '--api-key',
+    '--oauthtoken',
+    '--passphrase',
+    '--credential',
+  ];
+  for (const flag of forbidden) {
+    const { deps, err } = makeDeps(repo);
+    const code = await runAccountCli(
+      ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', flag, 'LEAKED'],
+      deps,
+    );
+    assert.equal(code, EXIT_USAGE, `${flag}（含机密分段）经 argv → 拒绝`);
+    assert.ok(!err.join('\n').includes('LEAKED'), `${flag}：不回显机密值`);
+  }
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '任一机密 flag 都不建行');
+});
+
+test('F-A：非机密 flag（含 password-stdin/password-file 白名单 + 普通 flag）不被分段检测误拒', async () => {
+  const repo = new InMemoryMailRepo();
+  // --password-stdin / --password-file 走口令来源放行；其余非机密 flag 不含机密分段、均放行。
+  // 用 --json + 各 flag 单跑 add，断言不因机密检测被 EXIT_USAGE 误拒（缺值类 flag 走各自校验路径）。
+
+  // 白名单：--password-stdin（裸布尔、走 stdin 来源）→ 建行成功。
+  {
+    const { deps } = makeDeps(repo, {
+      stdin: { isTTY: false, read: async () => 'pw\n' },
+      promptHidden: async () => 'SHOULD_NOT_BE_USED',
+    });
+    const code = await runAccountCli(
+      ['add', '--imap', '-e', 'a@ex.com', '-H', 'h1', '--password-stdin'],
+      deps,
+    );
+    assert.equal(code, EXIT_OK, '--password-stdin 白名单放行');
+  }
+
+  // 普通非机密 flag 串（--account-id/--no-tls/--port/--json/--update 等）：不被机密检测拦截。
+  {
+    const { deps } = makeDeps(repo);
+    const code = await runAccountCli(
+      ['add', '--imap', '-e', 'b@ex.com', '-H', 'h2', '-p', '143', '--no-tls', '--account-id', 'imap:custom-b', '--json'],
+      deps,
+    );
+    assert.equal(code, EXIT_OK, '普通非机密 flag 串不被机密检测误拒');
+    const row = await repo.getAccountById('imap:custom-b');
+    assert.equal(row?.id, 'imap:custom-b');
+  }
+});
+
+test('F-3：子串带不过度拒绝 → 合法 flag（含子串接近词根的 --account-id 等）不被以机密为由拒绝', async () => {
+  const repo = new InMemoryMailRepo();
+  // 这些归一名均不含任一长机密词根子串：经子串带后仍不触发「禁经命令行参数」机密拒绝。
+  // 注：用 `list`（机密守卫在路由前对所有子命令统一跑）隔离机密守卫行为，不掺各 flag 自身校验路径。
+  const allowed = [
+    '--account-id',
+    '--no-tls',
+    '--update',
+    '--json',
+    '--email',
+    '--host',
+    '--port',
+    '--password-stdin',
+    '--password-file',
+  ];
+  for (const flag of allowed) {
+    const { deps, err } = makeDeps(repo);
+    await runAccountCli(['list', flag, 'X'], deps);
+    // 不因机密守卫被拒（不出现机密拒绝文案）；各 flag 自身合法性由其它测试覆盖。
+    assert.ok(
+      !err.join('\n').includes('禁经命令行参数'),
+      `${flag} 不应被以机密为由拒绝`,
+    );
+  }
+});
+
+test('F7：归一不误伤 → --password-stdin / --password-file 仍放行（非机密词根）', async () => {
+  const repo = new InMemoryMailRepo();
+  // --password-stdin 走 stdin 来源、不被机密词根集误拒。
+  const { deps } = makeDeps(repo, {
+    stdin: { isTTY: false, read: async () => 'pw\n' },
+    promptHidden: async () => 'SHOULD_NOT_BE_USED',
+  });
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--password-stdin'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK, '--password-stdin 不被机密词根集误拒');
+  assert.equal((await repo.listEnabledAccounts()).length, 1);
+});
+
+// ——————————————————————————————————————————————————————————
+// F2：值缺位的 --password-file（落 bools）不得绕过来源互斥 → 显式拒绝；带值的 --password-stdin 拒绝
+// ——————————————————————————————————————————————————————————
+
+test('F2：值缺位的 --password-file（如 --password-file --password-stdin）→ 拒绝、不静默读 stdin', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo, {
+    // 若被误读 stdin 则会建行；这里断言不建行。
+    stdin: { isTTY: false, read: async () => 'LEAK\n' },
+    promptHidden: async () => 'SHOULD_NOT_BE_USED',
+  });
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--password-file', '--password-stdin'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '值缺位的 --password-file → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '未静默读 stdin 建行');
+  assert.ok(err.join('\n').includes('--password-file'), '提示指明 --password-file 需路径');
+});
+
+test('F2：带值的 --password-stdin（如 --password-stdin=foo）→ 拒绝（应为裸布尔）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--password-stdin=foo'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '带值的 --password-stdin → 参数错误');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '未建行');
+  assert.ok(err.join('\n').includes('--password-stdin'), '提示指明 --password-stdin 不接受值');
 });

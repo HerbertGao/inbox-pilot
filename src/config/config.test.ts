@@ -163,6 +163,43 @@ test('isGmailOnboardingAvailable：redirect_uri 非 loopback/错误 path → onb
   }
 });
 
+// ── 静态 message 不变式（doctor 直通依赖）：configSchema 的任何 issue.message 绝不内插被解析的值 ──
+// doctor 对 safeParse 失败的 issue.message 做直通（只取 path + message），其 leak-safe 全靠每个
+// message 为静态串、不承载密钥字段值。这里用含独特哨兵子串 `LEAKSENTINEL` 的非法值喂入，断言
+// **没有**任何 issue.message 回带该哨兵——若未来某 message 改成内插被解析的值，本测试即失败。
+
+const VALID_ENV = {
+  DATABASE_URL: DB,
+  GMAIL_CLIENT_ID: 'cid',
+  GMAIL_CLIENT_SECRET: 'csecret',
+  GMAIL_REDIRECT_URI: 'http://127.0.0.1/oauth2/callback',
+};
+
+test('静态 message 不变式：非法 DATABASE_URL 的 issue.message 不回带被解析值（无 LEAKSENTINEL）', () => {
+  const parsed = configSchema.safeParse({ ...VALID_ENV, DATABASE_URL: 'not-a-url-LEAKSENTINEL' });
+  assert.equal(parsed.success, false, '非法 DATABASE_URL 应 safeParse 失败');
+  for (const issue of parsed.error!.issues) {
+    assert.ok(
+      !issue.message.includes('LEAKSENTINEL'),
+      `issue.message 绝不内插被解析的值: ${JSON.stringify(issue.message)}`,
+    );
+  }
+});
+
+test('静态 message 不变式：OPENROUTER_BASE_URL refine 失败的 issue.message 不回带被解析值（无 LEAKSENTINEL）', () => {
+  const parsed = configSchema.safeParse({
+    ...VALID_ENV,
+    OPENROUTER_BASE_URL: 'https://api.openai.com/v1?x=LEAKSENTINEL',
+  });
+  assert.equal(parsed.success, false, '指向 openai.com 的 baseURL 应 safeParse 失败');
+  for (const issue of parsed.error!.issues) {
+    assert.ok(
+      !issue.message.includes('LEAKSENTINEL'),
+      `issue.message 绝不内插被解析的值: ${JSON.stringify(issue.message)}`,
+    );
+  }
+});
+
 test('isGmailOnboardingAvailable：client_id/secret 缺一 → onboarding 不可用', () => {
   const base = {
     DATABASE_URL: DB,

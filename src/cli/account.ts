@@ -27,6 +27,11 @@ import {
   type GmailOAuthAppCredentials,
 } from '../providers/gmail/oauth.js';
 import { config, isGmailOnboardingAvailable } from '../config/config.js';
+import { isValidAccountId } from './accountId.js';
+import {
+  resolveImapPassword,
+  PASSWORD_STDIN_USAGE_HINT,
+} from './passwordSource.js';
 
 /** CLI 退出码语义（0 成功 / 1 业务失败 / 2 参数错误）。 */
 export const EXIT_OK = 0;
@@ -49,6 +54,16 @@ export type CliDeps = {
   runOAuth: (app: GmailOAuthAppCredentials) => Promise<GmailAuthResult>;
   /** Gmail app 凭据 + onboarding 是否可用（默认从 config 读）。 */
   gmailApp: () => { available: boolean; clientId?: string; clientSecret?: string };
+  /**
+   * 交互式选择提示（无 provider 标志的 `account add` 用）：给标签 + 候选项 → 返回所选项。
+   * 默认真身经 readline 提示；测试注入桩使交互菜单离线可测。
+   */
+  promptChoice?: (label: string, choices: string[]) => Promise<string>;
+  /**
+   * 可注入 stdin 包装（--password-stdin 用）：isTTY 用于 TTY 守卫，read 读取管道全部内容。
+   * 默认从 process.stdin 构造（见 defaultDeps）。
+   */
+  stdin?: { isTTY: boolean; read: () => Promise<string> };
 };
 
 /** 解析后的 flag 集合（值型 flag + 布尔 flag + 裸位置参数）。 */
@@ -59,10 +74,13 @@ type ParsedFlags = {
   positionals: string[];
 };
 
+/** 短别名 → 长名映射（-e/--email、-H/--host、-p/--port）。 */
+const FLAG_ALIASES: Record<string, string> = { e: 'email', H: 'host', p: 'port' };
+
 /**
- * 极简 flag 解析：支持 `--key value`（值型）、`--key=value`（等号内联值型）与 `--flag`（布尔，
- * 下一 token 以 `--` 开头或缺失时）。`--key=value` 按**首个** `=` 拆 key/value，使 `--password=x`
- * 解析出 key `password`（否则整 token 成 key、绕过机密 flag 检查）。
+ * 极简 flag 解析：支持 `--key value`（值型）、`--key=value`（等号内联值型）、`--flag`（布尔，
+ * 下一 token 以 `-` 开头或缺失时）与短别名 `-e`/`-H`/`-p`（规范化到长名）。`--key=value` 按**首个**
+ * `=` 拆 key/value，使 `--password=x` 解析出 key `password`（否则整 token 成 key、绕过机密 flag 检查）。
  * **不解析任何口令/机密 flag**——口令只经 promptHidden（见文件头硬约束）；机密 flag 由调用方在写前拒绝。
  */
 function parseFlags(args: string[]): ParsedFlags {
@@ -71,12 +89,19 @@ function parseFlags(args: string[]): ParsedFlags {
   const positionals: string[] = [];
   for (let i = 0; i < args.length; i += 1) {
     const tok = args[i]!;
-    if (!tok.startsWith('--')) {
+    if (!tok.startsWith('-')) {
       // 裸 token：收集供调用方拒绝（不静默忽略——防误把机密当位置参数传入而落 argv/shell 历史）。
       positionals.push(tok);
       continue;
     }
-    const body = tok.slice(2);
+    // 短别名 `-e`/`-H`/`-p`：规范化到长名 body（仅识别已知别名；未知短选项不展开、作长名处理）。
+    let body: string;
+    if (tok.startsWith('--')) {
+      body = tok.slice(2);
+    } else {
+      const short = tok.slice(1);
+      body = FLAG_ALIASES[short] ?? short;
+    }
     const eq = body.indexOf('=');
     if (eq !== -1) {
       // `--key=value`：按首个 `=` 拆分（值可含 `=`）。key 仍参与机密 flag 检查。
@@ -87,7 +112,8 @@ function parseFlags(args: string[]): ParsedFlags {
     }
     const key = body;
     const next = args[i + 1];
-    if (next === undefined || next.startsWith('--')) {
+    // 下一 token 以 `-` 开头（含短别名 / `--` 长名）或缺失 → 布尔；否则取值。
+    if (next === undefined || next.startsWith('-')) {
       bools.add(key);
     } else {
       values.set(key, next);
@@ -97,16 +123,75 @@ function parseFlags(args: string[]): ParsedFlags {
   return { values, bools, positionals };
 }
 
-/** 口令/机密的 flag 名单——出现在 argv 即拒绝（口令只经 prompt/stdin）。 */
-const FORBIDDEN_SECRET_FLAGS = ['password', 'pass', 'pw', 'secret', 'refresh-token', 'token'];
+/**
+ * 口令/机密的 flag 词根集（出现在 argv 即拒绝；口令只经 prompt/stdin）。
+ * 按**分段**匹配：flag 名按 `-`/`_` 与 camelCase 边界拆段、逐段小写比对——使
+ * `--password`/`--imap-password`/`--imapPassword`/`--db-password`/`--access-token`/
+ * `--refreshToken`/`--client-secret` 等复合/分隔符/大小写变体都被命中、无法借别名（含**复合**名）
+ * 把机密塞进 argv；而 `--password-stdin`/`--password-file`（白名单豁免）仍被放行。
+ */
+const FORBIDDEN_SECRET_STEMS = new Set([
+  'password',
+  'pass',
+  'pw',
+  'secret',
+  'token',
+  'refreshtoken',
+  'accesstoken',
+  'clientsecret',
+]);
+
+/**
+ * 无边界「粘连」机密名（如 --mypassword / --apikey / --oauthtoken）：对归一全名做子串匹配的长词根集。
+ * 仅收**长且无歧义**的词根（均已核验不是任一合法 flag 归一名的子串），避免过度拒绝。
+ * ponytail: 子串带按当前 flag 集调参；真正的「机密绝不进 argv」由**结构**保证（无任何 argv flag 值
+ * 会落到口令字段，口令只经 resolveImapPassword 读取），此处仅扩宽提示。残留：超短粘连形（--pwd）仍漏，
+ * 未来若新增含某词根子串的合法 flag，需把它加进白名单。
+ */
+const FORBIDDEN_SECRET_SUBSTRINGS = new Set([
+  'password', 'passwd', 'passphrase', 'secret', 'apikey', 'credential',
+  'oauthtoken', 'accesstoken', 'refreshtoken', 'clientsecret', 'privatekey',
+  'sessionkey', 'bearer',
+]);
+
+/**
+ * 机密词根的白名单豁免（按归一全名比对）：`--password-stdin` / `--password-file` 虽含
+ * `password` 段，但它们是口令**来源**选择 flag（值非口令本身），故放行。
+ */
+const SECRET_FLAG_ALLOWLIST = new Set(['passwordstdin', 'passwordfile']);
+
+/** flag 名归一：小写 + 去 `-`/`_` 分隔符（用于白名单全名比对）。 */
+const normalize = (s: string): string => s.toLowerCase().replace(/[-_]/g, '');
+
+/**
+ * flag 名拆段：在 `-`/`_` 边界与 lowercase→uppercase 过渡（camelCase）处切分，逐段小写。
+ * 例：`imap-password`→`[imap, password]`、`imapPassword`→`[imap, password]`、`PW`→`[pw]`。
+ */
+function splitFlagSegments(name: string): string[] {
+  return name
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2') // camelCase 边界插入分隔符
+    .split(/[-_]+/)
+    .filter((seg) => seg.length > 0)
+    .map((seg) => seg.toLowerCase());
+}
 
 /**
  * 拒绝经 argv 传入的口令/机密 flag（落 shell 历史 / ps / proc args）。
- * 命中任一 → 返回该 flag 名（调用方据此报参数错误退出）；否则返回 null。
+ * **分段感知**：flag 名任一分段命中机密词根集 → 拒绝（除非归一全名在白名单内）。
+ * 命中 → 返回**原始** flag 名（调用方据此报参数错误退出）；否则返回 null。
  */
 function findForbiddenSecretFlag(flags: ParsedFlags): string | null {
-  for (const name of FORBIDDEN_SECRET_FLAGS) {
-    if (flags.values.has(name) || flags.bools.has(name)) {
+  for (const name of [...flags.values.keys(), ...flags.bools]) {
+    const norm = normalize(name);
+    if (SECRET_FLAG_ALLOWLIST.has(norm)) {
+      continue;
+    }
+    // 分段命中（分隔符 / camelCase 复合名：--imap-password / --access-token / --client-secret）。
+    if (splitFlagSegments(name).some((seg) => FORBIDDEN_SECRET_STEMS.has(seg))) {
+      return name;
+    }
+    // 无边界粘连名：对归一全名做长词根子串匹配（--mypassword / --apikey / --oauthtoken）。
+    if ([...FORBIDDEN_SECRET_SUBSTRINGS].some((s) => norm.includes(s))) {
       return name;
     }
   }
@@ -114,15 +199,19 @@ function findForbiddenSecretFlag(flags: ParsedFlags): string | null {
 }
 
 const USAGE = [
-  '用法: account <command>',
+  '用法: account <command> [--json]',
   '',
-  '  add --imap --email <addr> --host <h> [--port <n>] [--tls <true|false>] [--account-id <id>] [--update]',
-  '      口令经交互 prompt 读取（echo off）——禁经 argv 传入。',
+  '  add --imap -e|--email <addr> -H|--host <h> [-p|--port <n>] [--tls <true|false>] [--no-tls] [--account-id <id>] [--update]',
+  '      口令默认经交互 prompt 读取（echo off）——禁经 argv 传入。',
+  '      非交互口令来源（互斥）: --password-stdin（从管道读）| --password-file <path>（读文件）。',
+  `      ${PASSWORD_STDIN_USAGE_HINT}`,
   '      同派生 id 已存在默认拒绝；--update 显式确认更新凭据。',
   '  add --gmail',
   '      跑 loopback OAuth 授权；同 id 已存在则 upsert 新 refresh token 并启用（re-auth/恢复）。',
-  '  list',
-  '      列出账号 id/provider/email/enabled（不显示任何凭据）。',
+  '  add（不带 --imap/--gmail）',
+  '      打开交互式 provider 选择菜单。',
+  '  list [--json]',
+  '      列出账号 id/provider/email/enabled（不显示任何凭据）；--json 输出 JSON 数组。',
   '  disable <id>',
   '      置 enabled=false（未重启不生效；撤销已泄露账号后应立即重启）。',
 ].join('\n');
@@ -134,11 +223,20 @@ const USAGE = [
 export async function runAccountCli(argv: string[], deps: CliDeps): Promise<number> {
   const [command, ...rest] = argv;
   try {
+    // 硬约束（**所有**子命令）：口令/机密绝不经 argv（落 shell 历史 / ps）。在路由前对 rest 统一
+    // 拒绝任何机密 flag——使 `list --password X` / `disable id --token X` 等也无法把机密塞进 argv。
+    const forbidden = findForbiddenSecretFlag(parseFlags(rest));
+    if (forbidden !== null) {
+      deps.errln(
+        `拒绝: 口令/机密禁经命令行参数（--${forbidden}）传入（会落 shell 历史 / ps）；请在交互提示中输入。`,
+      );
+      return EXIT_USAGE;
+    }
     switch (command) {
       case 'add':
         return await cmdAdd(rest, deps);
       case 'list':
-        return await cmdList(deps);
+        return await cmdList(rest, deps);
       case 'disable':
         return await cmdDisable(rest, deps);
       case undefined:
@@ -170,27 +268,64 @@ async function cmdAdd(args: string[], deps: CliDeps): Promise<number> {
     return EXIT_USAGE;
   }
 
-  // 硬约束：口令/机密绝不经 argv（落 shell 历史 / ps）。任何机密 flag 出现即拒。
-  const forbidden = findForbiddenSecretFlag(flags);
-  if (forbidden !== null) {
-    deps.errln(
-      `拒绝: 口令/机密禁经命令行参数（--${forbidden}）传入（会落 shell 历史 / ps）；请在交互提示中输入。`,
-    );
-    return EXIT_USAGE;
-  }
+  // 注：机密 flag 已在 runAccountCli 路由前对**所有**子命令统一拒绝（此处不再重复）。
 
-  const isImap = flags.bools.has('imap');
-  const isGmail = flags.bools.has('gmail');
-  if (isImap === isGmail) {
+  let isImap = flags.bools.has('imap');
+  let isGmail = flags.bools.has('gmail');
+  if (isImap && isGmail) {
+    // 两个 provider 同给 → 歧义，仍报参数错误（互斥）。
     deps.errln('add 必须指定且仅指定一个 provider: --imap 或 --gmail');
     deps.errln(USAGE);
     return EXIT_USAGE;
   }
-  return isImap ? cmdAddImap(flags, deps) : cmdAddGmail(deps);
+  if (!isImap && !isGmail) {
+    // 无 provider 标志 →「无参运行 = 交互菜单」：提示运营者选 provider（仅此处触发，不改变裸命令路径）。
+    const prompt = deps.promptChoice ?? defaultPromptChoice;
+    const choice = await prompt('选择 provider', ['imap', 'gmail']);
+    if (choice === 'imap') {
+      isImap = true;
+    } else if (choice === 'gmail') {
+      isGmail = true;
+    } else {
+      deps.errln(`未知 provider 选择: ${JSON.stringify(choice)}（需 imap 或 gmail）。`);
+      return EXIT_USAGE;
+    }
+  }
+  return isImap ? cmdAddImap(flags, deps) : cmdAddGmail(flags, deps);
 }
 
-/** `account add --imap`：口令经交互 prompt（禁 argv）→ createAccount（同 id 默认拒绝）。 */
+/**
+ * --tls / --no-tls 冲突解析（不依赖解析桶、消除静默忽略）。
+ *
+ * `tls` token 可落 `values`（`--tls true|false`）或 `bools`（值缺位的 `--tls`，如 `--tls --no-tls`）——
+ * 两桶都要查。规则：`--no-tls` 与**任意** `tls` token 共存 → `--no-tls` 优先置 tls=false；**仅**真实
+ * 值分歧（`--tls true` + `--no-tls`）→ 冲突；一致对（`--tls false` + `--no-tls`）被接受；值缺位的
+ * `--tls --no-tls` 由 `--no-tls` 胜出（tls=false）、不被静默忽略。
+ * 返回 { ok:true, tls } / { ok:false }（值分歧 → 调用方映射 EXIT_USAGE）。
+ */
+function resolveTls(flags: ParsedFlags): { ok: true; tls: boolean } | { ok: false } {
+  const noTls = flags.bools.has('no-tls');
+  const tlsValue = flags.values.get('tls'); // `--tls true|false`（值形式）
+  const tlsBool = flags.bools.has('tls'); // 值缺位的 `--tls`（如 `--tls --no-tls`）
+  if (noTls) {
+    if (tlsValue !== undefined && tlsValue.toLowerCase() === 'true') {
+      // 真实值分歧：`--tls true` + `--no-tls`。
+      return { ok: false };
+    }
+    // 一致对（`--tls false` + `--no-tls`）、值缺位的 `--tls --no-tls`、或 `--no-tls` 单独 → tls=false。
+    return { ok: true, tls: false };
+  }
+  if (tlsBool && tlsValue === undefined) {
+    // 值缺位的 `--tls`（无 `--no-tls`）：保守按启用（默认 true），不静默禁用。
+    return { ok: true, tls: true };
+  }
+  // 既有语义：默认 true；仅显式 'false'（大小写不敏感）→ false。
+  return { ok: true, tls: tlsValue?.toLowerCase() !== 'false' };
+}
+
+/** `account add --imap`：口令经互斥来源（stdin/file/交互提示）读 → createAccount（同 id 默认拒绝）。 */
 async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
+  const json = flags.bools.has('json');
   const host = flags.values.get('host');
   if (host === undefined || host.length === 0) {
     deps.errln('--imap 需要 --host <host>');
@@ -213,14 +348,51 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     }
     port = parsed;
   }
-  // tls 默认 true；仅显式 'false'（大小写不敏感）→ false。
-  const tls = flags.values.get('tls')?.toLowerCase() !== 'false';
+  const tlsRes = resolveTls(flags);
+  if (!tlsRes.ok) {
+    deps.errln('--tls 与 --no-tls 值分歧（--tls true + --no-tls）：请只用其一。');
+    return EXIT_USAGE;
+  }
+  const tls = tlsRes.tls;
 
   // id：--account-id（对齐既有/自定义 id）优先，否则确定性 `imap:<user>@<host>`。
   const id = deriveAccountId(flags.values.get('account-id'), user, host);
+  // 校验**最终** id（显式或派生），防非法字符 / 控制字符注入 accountId 日志字段 / 污染主键命名空间。
+  // 错误信息用 JSON.stringify 转义渲染违规值——绝不原样回显（防原始控制字符经错误信息再注入 stderr/日志）。
+  if (!isValidAccountId(id)) {
+    deps.errln(
+      `account-id 含非法字符或超长（需匹配 ^[A-Za-z0-9:._@+=][A-Za-z0-9:._@+=-]{0,254}$）: ${JSON.stringify(id)}`,
+    );
+    return EXIT_USAGE;
+  }
 
-  // **口令只经交互 prompt（echo off）**——绝不从 argv、绝不回显。
-  const password = await deps.promptHidden('IMAP 口令: ');
+  // 值缺位的 `--password-file`（落 bools、非 values）会绕过来源互斥 → 静默回落 stdin/提示；显式拒绝。
+  if (flags.bools.has('password-file')) {
+    deps.errln('--password-file 需要一个路径参数');
+    return EXIT_USAGE;
+  }
+  // `--password-stdin` 是裸布尔；若带值（落 values）则是误用 → 拒绝（防误把口令拼到 --password-stdin=...）。
+  if (flags.values.has('password-stdin')) {
+    deps.errln('--password-stdin 不接受值参数');
+    return EXIT_USAGE;
+  }
+
+  // **口令绝不从 argv** → 互斥来源 --password-stdin / --password-file / 交互隐藏提示（默认）。
+  const pwResult = await resolveImapPassword(
+    {
+      passwordStdin: flags.bools.has('password-stdin'),
+      passwordFile: flags.values.get('password-file'),
+    },
+    {
+      promptHidden: () => deps.promptHidden('IMAP 口令: '),
+      stdin: deps.stdin ?? defaultStdin(),
+    },
+  );
+  if (!pwResult.ok) {
+    deps.errln(pwResult.message);
+    return EXIT_USAGE;
+  }
+  const password = pwResult.password;
   if (password.length === 0) {
     deps.errln('口令为空，已中止（未写入任何账号）。');
     return EXIT_FAILURE;
@@ -232,7 +404,7 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   if (wantUpdate) {
     // 显式确认 → upsert（同 id 更新凭据，不分裂；同邮箱重加自然命中同一行）。
     await deps.repo.upsertAccount({ id, provider: 'imap', email, authJson, enabled: true });
-    deps.println(`已更新 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
+    emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已更新 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
     return EXIT_OK;
   }
 
@@ -257,12 +429,31 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     }
     return EXIT_FAILURE;
   }
-  deps.println(`已新增 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
+  emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已新增 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
   return EXIT_OK;
 }
 
+/**
+ * 账号新增结果输出：`--json` → stdout 发字段**白名单** { id, provider, email, enabled }（显式禁
+ * authJson / 口令 / token）；否则人类成功行经 errln（数据走 stdout、人类/日志行走 stderr，使 --json
+ * 时 stdout 保持可解析）。
+ */
+function emitAccountAddOutcome(
+  deps: CliDeps,
+  json: boolean,
+  row: { id: string; provider: string; email: string; enabled: boolean },
+  humanLine: string,
+): void {
+  if (json) {
+    deps.println(JSON.stringify(row));
+  } else {
+    deps.errln(humanLine);
+  }
+}
+
 /** `account add --gmail`：跑 loopback OAuth → upsert（re-auth/恢复路径，不拒绝）。 */
-async function cmdAddGmail(deps: CliDeps): Promise<number> {
+async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
+  const json = flags.bools.has('json');
   const app = deps.gmailApp();
   if (!app.available || app.clientId === undefined || app.clientSecret === undefined) {
     // 沿用「缺 app 凭据 / redirect_uri 非法 → onboarding 显式失败」（config.isGmailOnboardingAvailable）。
@@ -304,9 +495,15 @@ async function cmdAddGmail(deps: CliDeps): Promise<number> {
     enabled: true,
   });
   if (reEnabled) {
-    deps.println('正在重新启用该账号（此前被禁用 / 需重授权）。');
+    // 「正在重新启用」提示（人类/日志行）：--json 时走 stderr 以保 stdout 纯 JSON，否则走 stdout（既有契约）。
+    const hint = '正在重新启用该账号（此前被禁用 / 需重授权）。';
+    if (json) {
+      deps.errln(hint);
+    } else {
+      deps.println(hint);
+    }
   }
-  deps.println(`已接入 Gmail 账号: ${id}。重启后生效。`);
+  emitAccountAddOutcome(deps, json, { id, provider: 'gmail', email: result.email, enabled: true }, `已接入 Gmail 账号: ${id}。重启后生效。`);
   return EXIT_OK;
 }
 
@@ -321,9 +518,19 @@ async function willReEnable(repo: MailRepo, id: string): Promise<boolean> {
 }
 
 /** `account list`：id/provider/email/enabled（**所有**账号，含禁用/reauth-suspend 行）——绝不含凭据。 */
-async function cmdList(deps: CliDeps): Promise<number> {
+async function cmdList(args: string[], deps: CliDeps): Promise<number> {
+  const json = parseFlags(args).bools.has('json');
   // listAccounts（不按 enabled 过滤）：使运营者能看到 enabled=false 的账号并据此重授权/重启。
   const rows = await deps.repo.listAccounts();
+  if (json) {
+    // 字段白名单 { id, provider, email, enabled }——绝不含 authJson / 任何凭据。数据走 stdout。
+    deps.println(
+      JSON.stringify(
+        rows.map((r) => ({ id: r.id, provider: r.provider, email: r.email, enabled: r.enabled })),
+      ),
+    );
+    return EXIT_OK;
+  }
   if (rows.length === 0) {
     deps.println('（无账号）');
     return EXIT_OK;
@@ -338,18 +545,34 @@ async function cmdList(deps: CliDeps): Promise<number> {
 
 /** `account disable <id>`：置 enabled=false + staleness 提示。 */
 async function cmdDisable(args: string[], deps: CliDeps): Promise<number> {
-  const id = args[0];
-  if (id === undefined || id.length === 0 || id.startsWith('--')) {
+  const flags = parseFlags(args);
+  // disable 不接受任何 flag：`disable --json <id>` 会把 <id> 当作 --json 的值吞掉 → 误报缺 id。
+  // disable 无任何合法 flag，未知 flag 一律拒绝并给精确报错（区别于下面的位置参数数量错误）。
+  if (flags.values.size > 0 || flags.bools.size > 0) {
+    deps.errln('disable 不接受任何 flag，仅需一个 id 位置参数');
     deps.errln('用法: account disable <id>');
     return EXIT_USAGE;
   }
+  // 恰好一个位置参数 id（防 `disable id1 id2` 静默丢弃多余 id、只禁用 id1）。
+  if (flags.positionals.length !== 1) {
+    deps.errln('disable 需要且仅需要一个 id 参数');
+    deps.errln('用法: account disable <id>');
+    return EXIT_USAGE;
+  }
+  const id = flags.positionals[0]!;
+  // 刻意**不**对 id 跑 isValidAccountId：校验是 add/派生路径的规则（id 在那里进主键命名空间）；
+  // disable 读取**既有行**，必须能命中任意 id 形态（含历史/直接入库的非常规 id）以履行「撤销已泄露账号」
+  // 职责——把它绑到当前 ACCOUNT_ID_RE 反而会锁死非常规 id（与 accountId.ts 首字符禁 `-` 同类的锁定）。
+  // 无注入面：id 在下面成功/失败两处回显均经 JSON.stringify 转义，setAccountEnabled 走 Prisma 参数化、不裸 log。
   try {
     await deps.repo.setAccountEnabled(id, false);
   } catch {
-    deps.errln(`禁用失败: 未找到账号 ${id}（或写入失败）。`);
+    // id 经 JSON.stringify 转义渲染——绝不原样回显（防嵌入 id 的控制字符伪造 stderr/日志行）。
+    deps.errln(`禁用失败: 未找到账号 ${JSON.stringify(id)}（或写入失败）。`);
     return EXIT_FAILURE;
   }
-  deps.println(`已禁用账号: ${id}。`);
+  // id 经 JSON.stringify 转义渲染（同上）。
+  deps.println(`已禁用账号: ${JSON.stringify(id)}。`);
   deps.println(
     '注意: 未重启不生效（该账号仍会被轮询到下次重启）。撤销/禁用一个凭据已泄露的账号后，应立即重启以停止轮询。',
   );
@@ -389,6 +612,31 @@ function defaultErrln(line: string): void {
   process.stderr.write(`${line}\n`);
 }
 
+/** 真身交互式 provider 选择菜单：readline 提示，反复读到合法候选项（提示走 stderr，保 stdout 干净）。 */
+function defaultPromptChoice(label: string, choices: string[]): Promise<string> {
+  return new Promise<string>((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question(`${label} (${choices.join('/')}): `, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+/** 真身 stdin 包装（--password-stdin 用）：isTTY + 读管道全部内容为字符串。 */
+function defaultStdin(): { isTTY: boolean; read: () => Promise<string> } {
+  return {
+    isTTY: process.stdin.isTTY ?? false,
+    read: () =>
+      new Promise<string>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        process.stdin.on('data', (c: Buffer) => chunks.push(c));
+        process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        process.stdin.on('error', reject);
+      }),
+  };
+}
+
 /** 真身 deps：PrismaMailRepo + 真 OAuth + config app 凭据。 */
 function defaultDeps(): CliDeps {
   return {
@@ -396,6 +644,8 @@ function defaultDeps(): CliDeps {
     println: defaultPrintln,
     errln: defaultErrln,
     promptHidden: defaultPromptHidden,
+    promptChoice: defaultPromptChoice,
+    stdin: defaultStdin(),
     runOAuth: (app) => authorizeGmailAccount(app),
     gmailApp: () => ({
       available: isGmailOnboardingAvailable(config),
@@ -403,6 +653,15 @@ function defaultDeps(): CliDeps {
       clientSecret: config.GMAIL_CLIENT_SECRET,
     }),
   };
+}
+
+/**
+ * 公开生产入口（§1.3）：构造生产 deps 并跑 CLI，**返回**退出码——**绝不**内部 process.exit
+ * （由分发器 / 主模块守卫在自身退出，避免退出码重复触发）。inbox-pilot 分发器与 `pnpm account`
+ * 自跑路径共用此入口、不重复构造 deps。
+ */
+export async function runAccountCliMain(argv: string[]): Promise<number> {
+  return runAccountCli(argv, defaultDeps());
 }
 
 // 真身入口：`node dist/cli/account.js <args>` / `tsx src/cli/account.ts <args>`。
@@ -416,6 +675,5 @@ const isMain = (() => {
 })();
 
 if (isMain) {
-  const code = await runAccountCli(process.argv.slice(2), defaultDeps());
-  process.exit(code);
+  runAccountCliMain(process.argv.slice(2)).then((code) => process.exit(code));
 }
