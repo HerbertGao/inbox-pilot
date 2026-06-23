@@ -62,20 +62,32 @@ model MailClassification {
 
   message MailMessage @relation(fields: [messageId], references: [id])
 
+  // 重建「最新分类」（durable-retry 决策 5/6：drain 每条按 [createdAt desc, id desc] take 1）；
+  // FK 现无索引、否则每条 seq scan。createdAt 降序索引覆盖排序前缀。
+  @@index([messageId, createdAt(sort: Desc)])
   @@map("mail_classifications")
 }
 
 model MailAction {
-  id         String   @id @default(cuid())
-  messageId  String
-  actionType String
-  status     String   @default("pending")
-  error      String?
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  id          String    @id @default(cuid())
+  messageId   String
+  actionType  String
+  // status 仍自由 String（无 enum）；durable-retry 新增取值 retrying/dead_letter。
+  status      String    @default("pending")
+  // durable-retry 列（决策 2；PG16 元数据级 ADD COLUMN、无重写、既有行兼容：retryCount=0、nextRetryAt=null）。
+  retryCount  Int       @default(0)
+  nextRetryAt DateTime?
+  error       String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
 
   message MailMessage @relation(fields: [messageId], references: [id])
 
+  // 活跃行唯一性（决策 4）与 drain 查询索引（决策 6）为 **partial index**（带 WHERE 子句），Prisma schema
+  // **无法表达**，经迁移 raw SQL 落地（见 migration.sql 末尾 mail_actions_active_uniq / mail_actions_due_retry_idx）。
+  // ⚠️ 因 schema 不含这两个 partial index，`prisma migrate dev` 会把它们当 **drift** 并在新迁移写出 `DROP INDEX`
+  //    —— **绝不接受那个 drop**（手 review 任何触及 mail_actions 索引的生成迁移）。生产用 `prisma migrate deploy`
+  //    （只重放已提交迁移、从不 diff/drop）。回滚见同目录 ROLLBACK.sql。
   @@map("mail_actions")
 }
 

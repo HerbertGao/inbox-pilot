@@ -129,7 +129,9 @@ try {
 function buildAccountPoll(account: Account, repo: PrismaMailRepo): (() => Promise<void>) | null {
   if (account.provider === 'imap') {
     // IMAP：每轮新建连接 → pollOnce → logout（连接生命周期归 pollAccount）。
-    return () => pollAccount(account, repo);
+    // durable-retry 5.1：notifier（defaultNotifier）经 pollAccount → pollOnce deps 显式透传进 poll 路径，
+    // drain 重试 notify 动作依赖它（账号无关、非 connection-bound）；复用 digest 同一 telegram notifier。
+    return () => pollAccount(account, repo, undefined, defaultNotifier);
   }
   // gmail：需 app 凭据（GMAIL_CLIENT_ID/SECRET，从 env）。缺则无法构造 client → 跳过该账号。
   const clientId = config.GMAIL_CLIENT_ID;
@@ -167,7 +169,15 @@ function buildAccountPoll(account: Account, repo: PrismaMailRepo): (() => Promis
       },
     });
     const provider = createGmailProvider(account.accountId, gmail);
-    const poller = createGmailPoller(account.accountId, { gmail, repo, provider });
+    // durable-retry 5.1：notifier 经 GmailPollDeps 显式透传进 poll 路径（drain 重试 notify 动作账号无关、
+    // 非 connection-bound）。复用 digest 同一 defaultNotifier（telegram from config，无渠道→skipped 降级）。
+    // clock/drainDeadline 用 gmailPoll 内默认 seam（每轮 drain 起点捕获单调 elapsed），无需在此显式注入。
+    const poller = createGmailPoller(account.accountId, {
+      gmail,
+      repo,
+      provider,
+      notifier: defaultNotifier,
+    });
     return poller.poll();
   };
 }

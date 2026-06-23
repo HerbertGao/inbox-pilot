@@ -32,6 +32,12 @@ import {
   processEmail as defaultProcessEmail,
   type ProcessEmailDeps,
 } from '../../pipeline/processEmail.js';
+import { defaultNotifier, type Notifier } from '../../notify/notifier.js';
+import {
+  drainAccountRetries,
+  type DrainDeadline,
+} from '../../actions/retryQueue.js';
+import { DRAIN_TIME_BUDGET_MS } from '../../actions/retryConstants.js';
 import { createImapProvider } from './imapActions.js';
 import {
   createRealImapConnection,
@@ -66,6 +72,22 @@ export type PollDeps = {
   readonly processEmail?: (email: NormalizedEmail, deps: ProcessEmailDeps) => Promise<void>;
   /** 分类 seam（透传给 processEmail）。默认不传（processEmail 用真身 classifyEmail）。 */
   readonly classify?: (email: NormalizedEmail) => Promise<Classification>;
+  /**
+   * 通知 seam（durable-retry：drain 重试 notify 动作账号无关、非 connection-bound）。
+   * 默认 defaultNotifier（telegram from config）；测试注入假渠道。镜像 processEmail 的默认方式。
+   * 5.1（组 E）经此字段从 main.ts 显式透传；此处只加字段 + 默认 + 用于 drain。
+   */
+  readonly notifier?: Notifier;
+  /**
+   * drain 时钟 seam（durable-retry）。默认 `() => new Date()`；测试注入可控时钟以驱动
+   * staleness / nextRetryAt 计算无需真实等待。
+   */
+  readonly clock?: () => Date;
+  /**
+   * drain 软 deadline seam（durable-retry 决策 6）。默认捕获 drain 起点单调 elapsed +
+   * DRAIN_TIME_BUDGET_MS；测试注入可控 elapsedMs 桩值断言「超软 deadline 提前退出」零真实等待。
+   */
+  readonly drainDeadline?: DrainDeadline;
 };
 
 /**
@@ -78,6 +100,7 @@ export async function pollOnce(accountId: string, deps: PollDeps): Promise<void>
   const { connection, repo } = deps;
   const makeProvider = deps.makeProvider ?? createImapProvider;
   const runProcessEmail = deps.processEmail ?? defaultProcessEmail;
+  const notifier = deps.notifier ?? defaultNotifier;
   const provider = makeProvider(connection);
 
   // —— 1. 打开 INBOX，读当前 UIDVALIDITY 与 UIDNEXT ——
@@ -130,6 +153,20 @@ export async function pollOnce(accountId: string, deps: PollDeps): Promise<void>
   if (toWrite !== null) {
     await repo.setCursor(accountId, toWrite);
   }
+
+  // —— 6. 折叠进 poll 的 durable 重试 drain（durable-retry 决策 1，tasks 4.1/4.3）——
+  // 新邮件处理 + 游标落库**之后**、调用方 logout **之前**：用本轮 live 连接构造的 provider
+  // （reflectPriority/markRead）+ 注入的 notifier（notify、账号无关）排空该账号到期重试。
+  // 软 deadline 用单调 elapsed（起点在 drain 开始时捕获；ponytail：不在 drain 内取 Date.now 以保可测）。
+  // drain 抛 ProviderReauthRequired **不吞**——沿 pollOnce → pollAccount → guard 既有路径隔离账号
+  // （触发 suspend）；普通瞬时异常由 drain 逐条隔离内部处理。
+  const clock = deps.clock ?? (() => new Date());
+  const drainStartMs = Date.now();
+  const deadline: DrainDeadline = deps.drainDeadline ?? {
+    elapsedMs: () => Date.now() - drainStartMs,
+    budgetMs: DRAIN_TIME_BUDGET_MS,
+  };
+  await drainAccountRetries(accountId, { provider, notifier, repo, clock, deadline });
 }
 
 /** processOne 的内部依赖（已解析的 provider / processEmail / classify）。 */
@@ -334,15 +371,20 @@ function computeCursorToWrite(args: ComputeCursorArgs): string | null {
 /**
  * prod 入口：每轮新建连接 → pollOnce → logout（连接生命周期归此处，design 决策 4）。
  * connect/logout 自身失败不在此吞——由调度器（6.1）的 try/finally 锁释放兜底（异常路径锁不死）。
+ *
+ * durable-retry 5.1：`notifier` 经此入口显式透传进 `pollOnce` deps（drain 重试 notify 动作账号无关、
+ * 非 connection-bound）。缺省 `defaultNotifier`，使既有调用（测试/无 notifier）行为不变；main.ts 显式传入。
+ * clock/drainDeadline 用 pollOnce 内默认 seam（每轮 drain 起点捕获单调 elapsed），无需在此显式注入。
  */
 export async function pollAccount(
   account: ImapAccount,
   repo: MailRepo,
   classify?: (email: NormalizedEmail) => Promise<Classification>,
+  notifier?: Notifier,
 ): Promise<void> {
   const connection = await createRealImapConnection(account);
   try {
-    await pollOnce(account.accountId, { connection, repo, classify });
+    await pollOnce(account.accountId, { connection, repo, classify, notifier });
   } finally {
     // 用完即关；logout 失败不掩盖 pollOnce 的原始异常（仅记一条）。
     try {

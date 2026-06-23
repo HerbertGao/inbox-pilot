@@ -373,10 +373,10 @@ test('已 saveEmail 未 markProcessed 的重跑路径 → 复用同一行、不�
 });
 
 // ——————————————————————————————————————————————————————————
-// 动作失败 → failed + 单次调用内 ≤3 次尝试、markProcessed 仍执行
+// 动作失败 → retrying + 单次调用内 ≤3 次尝试、markProcessed 仍执行
 // ——————————————————————————————————————————————————————————
 
-test('标已读失败 → mark_read(failed) + 单次调用内 ≤3 次尝试、markProcessed 仍执行', async () => {
+test('标已读失败 → mark_read(retrying) + 单次调用内 ≤3 次尝试、markProcessed 仍执行', async () => {
   const repo = new InMemoryMailRepo();
   const provider = makeThrowingProvider();
   const channel = makeRecordingChannel();
@@ -388,7 +388,9 @@ test('标已读失败 → mark_read(failed) + 单次调用内 ≤3 次尝试、m
 
   const rowId = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!.id;
   const markRead = repo.getActions(rowId).find((a) => a.actionType === 'mark_read');
-  assert.equal(markRead?.status, 'failed');
+  assert.equal(markRead?.status, 'retrying');
+  assert.equal(markRead?.retryCount, 0, '入队首轮 retryCount 应为 0');
+  assert.ok(markRead?.nextRetryAt != null, 'retrying 行应有 nextRetryAt');
   // 单次调用内尝试次数有上限（≤3，不声称跨重启累计）。
   assert.ok(provider.attempts >= 1 && provider.attempts <= 3, `尝试次数应 ∈ [1,3]，实际 ${provider.attempts}`);
   // markProcessed 仍执行（不以动作成功为前提）。
@@ -396,7 +398,7 @@ test('标已读失败 → mark_read(failed) + 单次调用内 ≤3 次尝试、m
   assert.ok(after.processedAt !== null, 'markProcessed 应仍执行');
 });
 
-test('推送失败 → notify(failed) + 单次调用内 ≤3 次尝试、markProcessed 仍执行', async () => {
+test('推送失败 → notify(retrying) + 单次调用内 ≤3 次尝试、markProcessed 仍执行', async () => {
   const repo = new InMemoryMailRepo();
   const provider = new FakeProviderActions();
   const channel = makeRecordingChannel({ outcome: 'failed', error: 'telegram-http-500' });
@@ -408,7 +410,7 @@ test('推送失败 → notify(failed) + 单次调用内 ≤3 次尝试、markPro
 
   const rowId = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!.id;
   const notify = repo.getActions(rowId).find((a) => a.actionType === 'notify');
-  assert.equal(notify?.status, 'failed');
+  assert.equal(notify?.status, 'retrying');
   // 单次调用内 ≤3 次尝试。
   assert.ok(channel.sendCount >= 1 && channel.sendCount <= 3, `sendCount 应 ∈ [1,3]，实际 ${channel.sendCount}`);
   const after = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!;
@@ -464,7 +466,7 @@ test('推送失败 → 持久化失败证据不含 textBody/htmlBody，且 paylo
 
   const rowId = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!.id;
   const notify = repo.getActions(rowId).find((a) => a.actionType === 'notify')!;
-  assert.equal(notify.status, 'failed');
+  assert.equal(notify.status, 'retrying');
 
   // 失败证据（mail_actions.error）不含 textBody/htmlBody 的值（子串断言）。
   const errorEvidence = notify.error ?? '';

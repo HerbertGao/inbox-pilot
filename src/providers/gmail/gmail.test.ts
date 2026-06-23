@@ -43,6 +43,11 @@ import { ProviderReauthRequired } from '../provider.js';
 import { REDACT_PATHS, logger as prodLogger } from '../../logger.js';
 import { pino } from 'pino';
 import type { Classification } from '../../classifier/schema.js';
+import type { Notifier, NotifyResult } from '../../notify/notifier.js';
+import type { FinalDecision } from '../../rules/finalDecision.js';
+import { ActionType } from '../../actions/actionTypes.js';
+import type { DrainDeadline } from '../../actions/retryQueue.js';
+import type { NormalizedEmail } from '../../normalizer/normalizeEmail.js';
 
 // 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
 // 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
@@ -787,7 +792,7 @@ test('读侧 get invalid_grant（HTTP 400）→ ProviderReauthRequired（绕过�
 // 8. 写侧 429 非致命仍 markProcessed；403 → reauth → markProcessed 跳过
 // ——————————————————————————————————————————————————————————
 
-test('写侧 429 非致命：reflectPriority/markRead 失败仍落 failed、processEmail 仍 markProcessed', async () => {
+test('写侧 429 非致命：reflectPriority/markRead 失败仍落 retrying（durable 兜底）、processEmail 仍 markProcessed', async () => {
   _clearLabelCacheForTest();
   const gmail = new FakeGmail();
   // 标签 create 成功，但 messages.modify 始终 429。
@@ -803,8 +808,8 @@ test('写侧 429 非致命：reflectPriority/markRead 失败仍落 failed、proc
   const stored = (await repo.findByDedupKey(ACCOUNT_ID, 'm1'))!;
   assert.ok(stored.processedAt !== null, '写侧 429 非致命：markProcessed 仍执行');
   const markRead = repo.getActions(stored.id).find((a) => a.actionType === 'mark_read');
-  assert.equal(markRead?.status, 'failed');
-  assert.equal(markRead?.error, GMAIL_ACTION_FAILED, 'failed error 是脱敏固定 kind 串');
+  assert.equal(markRead?.status, 'retrying');
+  assert.equal(markRead?.error, GMAIL_ACTION_FAILED, 'retrying 行仍记脱敏固定 kind 串');
 });
 
 test('写侧 403 scope 失配（insufficientPermissions）→ markRead 抛 ProviderReauthRequired', async () => {
@@ -1334,3 +1339,151 @@ function fireRaw(redirectUri: string, params: { state?: string; code?: string; e
     req.on('error', reject);
   });
 }
+
+// ——————————————————————————————————————————————————————————
+// 15. durable-retry：折叠进 gmailPoll 的 drain（tasks 4.4）
+//
+// 一轮 gmailPoll 处理新邮件后，在同一 gmail client + provider + 注入的 notifier 内排空该账号到期重试。
+// 经 GmailPollDeps 新增的 notifier/clock/drainDeadline 注入 seam 驱动，全离线零真实等待。
+// ——————————————————————————————————————————————————————————
+
+/** 记录 notify 调用的假 Notifier（默认 sent）。断言 drain 经注入 notifier 重发 notify。 */
+function makeNotifierSpy(
+  outcome: NotifyResult = { outcome: 'sent', channel: 'fake' },
+): Notifier & { calls: Array<{ decision: FinalDecision; email: NormalizedEmail }> } {
+  const calls: Array<{ decision: FinalDecision; email: NormalizedEmail }> = [];
+  return {
+    calls,
+    async notify(d: FinalDecision, email: NormalizedEmail): Promise<NotifyResult> {
+      calls.push({ decision: d, email });
+      return outcome;
+    },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'skipped', reason: 'no-channel' };
+    },
+  };
+}
+
+/**
+ * 播种一条「到期 retrying」动作（gmail 账号）：saveEmail（已 markProcessed）+ saveClassification
+ * （供 drain 重建已存裁定）+ recordAction + enqueueRetry(retryCount=0, nextRetryAt=now)。
+ * receivedAt 默认 now（避免 notify 误命中 staleness 上界）。
+ */
+async function seedDueRetry(
+  repo: InMemoryMailRepo,
+  actionType: typeof ActionType[keyof typeof ActionType],
+  opts: { providerMessageId?: string } = {},
+): Promise<{ actionRowId: string; messageRowId: string }> {
+  const now = new Date();
+  const providerMessageId = opts.providerMessageId ?? `retry-${actionType}`;
+  const stored = await repo.saveEmail({
+    accountId: ACCOUNT_ID,
+    provider: 'gmail',
+    providerMessageId,
+    subject: '到期重试主题',
+    fromEmail: 'sender@example.test',
+    to: [],
+    date: now.toISOString(),
+    hasAttachments: false,
+    headers: {},
+  });
+  await repo.markProcessed(stored.id);
+  await repo.saveClassification(stored.id, makeClassification(), decision('P0'));
+  const rec = await repo.recordAction(stored.id, actionType);
+  await repo.enqueueRetry(rec.actionRowId, 0, now, 'seed');
+  return { actionRowId: rec.actionRowId, messageRowId: stored.id };
+}
+
+test('gmailPoll drain：一轮处理新邮件后排空该账号到期重试（经注入 notifier 重发 notify）', async () => {
+  const gmail = new FakeGmail();
+  gmail.pages = [['m1']];
+  gmail.messages.set('m1', plainMessage('m1'));
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  const notifySeed = await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-notify' });
+  const markReadSeed = await seedDueRetry(repo, ActionType.MarkRead, { providerMessageId: 'r-markread' });
+
+  await gmailPoll(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      notifier,
+      processEmail: async () => {}, // 不关心新邮件处理细节，仅验证 drain 在其后运行。
+    }),
+  );
+
+  assert.equal(notifier.calls.length, 1, 'drain 经注入 notifier 重发到期 notify');
+  const notifyRow = repo.getActions(notifySeed.messageRowId).find((a) => a.id === notifySeed.actionRowId)!;
+  assert.equal(notifyRow.status, 'done', 'notify 重发 sent → done');
+  assert.equal(provider.markReadCalls.length, 1, 'drain 经 provider 重发到期 mark_read');
+  const markReadRow = repo.getActions(markReadSeed.messageRowId).find((a) => a.id === markReadSeed.actionRowId)!;
+  assert.equal(markReadRow.status, 'done', 'mark_read 重发成功 → done');
+});
+
+test('gmailPoll drain：账号 disabled → 自然不被调度、其重试暂停', async () => {
+  const repo = await makeRepo();
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-disabled' });
+  await repo.setAccountEnabled(ACCOUNT_ID, false);
+
+  const enabled = await repo.listEnabledAccounts();
+  assert.equal(enabled.length, 0, '禁用账号不在可调度集 → 不进 gmailPoll → 其 retrying 自然暂停');
+  const due = await repo.selectDueRetries(ACCOUNT_ID, new Date(), 50);
+  assert.equal(due.length, 1, 'retrying 保持在队列（暂停、不丢失）');
+});
+
+test('gmailPoll drain 超软 deadline → 提前退出（剩余下轮续，经注入 deadline 零真实等待）', async () => {
+  const gmail = new FakeGmail();
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-1' });
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-2' });
+  const exhaustedDeadline: DrainDeadline = { elapsedMs: () => 100, budgetMs: 1 };
+
+  await gmailPoll(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      notifier,
+      drainDeadline: exhaustedDeadline,
+      processEmail: async () => {},
+    }),
+  );
+
+  assert.equal(notifier.calls.length, 0, '超软 deadline：本轮 drain 提前退出、不发任何到期项');
+  const due = await repo.selectDueRetries(ACCOUNT_ID, new Date(), 50);
+  assert.equal(due.length, 2, '剩余到期项保持 retrying、下轮续');
+});
+
+test('gmailPoll drain：三动作 sink 不读 to/headers（合成空值投影对三动作无影响）', async () => {
+  const gmail = new FakeGmail();
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-n' });
+  await seedDueRetry(repo, ActionType.MarkRead, { providerMessageId: 'r-m' });
+  await seedDueRetry(repo, ActionType.ReflectPriority, { providerMessageId: 'r-p' });
+
+  await gmailPoll(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      notifier,
+      processEmail: async () => {},
+    }),
+  );
+
+  // 三动作 sink 都被经合成空值（to:[]、headers:{}）的重建 email 调用且成功。
+  assert.equal(notifier.calls.length, 1, 'notify sink 经重建 email 重发');
+  assert.deepEqual(notifier.calls[0]!.email.to, [], 'notify sink 收到合成 to:[]');
+  assert.deepEqual(notifier.calls[0]!.email.headers, {}, 'notify sink 收到合成 headers:{}');
+  assert.equal(provider.markReadCalls.length, 1, 'markRead sink 经重建 email 重发');
+  assert.deepEqual(provider.markReadCalls[0]!.headers, {}, 'markRead sink 收到合成 headers:{}');
+  assert.equal(provider.reflectPriorityCalls.length, 1, 'reflectPriority sink 经重建 email 重发');
+  assert.deepEqual(provider.reflectPriorityCalls[0]!.email.to, [], 'reflectPriority sink 收到合成 to:[]');
+  for (const pmid of ['r-n', 'r-m', 'r-p']) {
+    const stored = (await repo.findByDedupKey(ACCOUNT_ID, pmid))!;
+    assert.ok(repo.getActions(stored.id).every((a) => a.status === 'done'), `${pmid} 动作落 done`);
+  }
+});
