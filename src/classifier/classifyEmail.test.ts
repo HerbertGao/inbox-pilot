@@ -16,7 +16,9 @@ import { config } from '../config/config.js';
 import {
   classifyEmail,
   buildClassifierInput,
+  TRANSPORT_RETRY_BACKOFF_MS,
   type ChatFn,
+  type SleepFn,
 } from './classifyEmail.js';
 import type { Classification } from './schema.js';
 import {
@@ -55,6 +57,16 @@ function httpError(status: number, message = `HTTP ${status}`): Error & { status
   const err = new Error(message) as Error & { status: number };
   err.status = status;
   return err;
+}
+
+// 假时钟 sleep（组 C 退避）：不真实等待，记录每次退避 ms 以断言「传输分支退避一次、内容分支无退避」。
+function makeSleepSpy(): SleepFn & { calls: number[] } {
+  const calls: number[] = [];
+  const fn = (async (ms: number): Promise<void> => {
+    calls.push(ms);
+  }) as SleepFn & { calls: number[] };
+  fn.calls = calls;
+  return fn;
 }
 
 // 一封合法的 NormalizedEmail（直接构造，绕过 normalizeEmail 的细节，聚焦分类器逻辑）。
@@ -268,6 +280,105 @@ test('空字符串 API key → 不调用 chat → 安全默认', async () => {
 
   assertSafeDefault(result);
   assert.equal(chat.calls.length, 0);
+});
+
+// ——————————————————————————————————————————————————————————
+// 组 C 退避（4.2/4.3）：传输/可用性分支退避一次、calls≤2 不变、内容分支无退避
+// ——————————————————————————————————————————————————————————
+
+// 传输失败（5xx）→ 第 2 次 chat() 前**恰好一次**退避；calls≤2；fallback 合法 → 成功。
+test('传输失败（5xx）→ 第 2 次调用前退避一次（注入假时钟）、calls≤2', async () => {
+  const sleep = makeSleepSpy();
+  const chat = makeChatSpy([
+    { throw: httpError(503) },
+    { return: validClassificationJson({ priority: 'P2', category: 'work' }) },
+  ]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  assert.equal(result.priority, 'P2');
+  assert.equal(chat.calls.length, 2, 'calls≤2：传输分支恰好两次调用');
+  assert.equal(sleep.calls.length, 1, '传输分支必须退避恰好一次');
+  assert.equal(sleep.calls[0], TRANSPORT_RETRY_BACKOFF_MS);
+  // 退避不增 calls：仍 ≤ 2。
+  assert.ok(chat.calls.length <= 2);
+  // 退避 ≤ 单封分类器预算（与动作退避求和 ≤~1s 的分类器份额）。
+  assert.ok((sleep.calls[0] ?? 0) <= 250, '分类器退避 ≤250ms（单封 ≤~1s 预算的份额）');
+});
+
+// 传输失败（无 status，超时/网络）→ 退避一次后 fallback 仍失败 → P1 不标已读、calls≤2。
+test('传输超时 → 退避后仍失败 → 安全默认（P1 不标已读）、calls≤2、退避一次', async () => {
+  const sleep = makeSleepSpy();
+  const chat = makeChatSpy([
+    { throw: new Error('socket hang up') }, // 无 status → transport
+    { throw: httpError(500) }, // fallback 也失败
+  ]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  // AI 失败 → 降级 P1、不标已读、入摘要（硬约束）。
+  assertSafeDefault(result);
+  assert.equal(result.priority, 'P1');
+  assert.equal(result.should_mark_read, false);
+  assert.equal(chat.calls.length, 2, 'calls≤2');
+  assert.equal(sleep.calls.length, 1, '传输分支退避恰好一次（即便最终失败）');
+});
+
+// 内容失败（200 但非法 JSON）重试路径**无退避**——gate 在传输分支、retryOnce 共用故禁止无条件 sleep。
+test('内容失败重试路径无退避（gate 在传输分支）、calls≤2', async () => {
+  const sleep = makeSleepSpy();
+  const chat = makeChatSpy([
+    { return: '非法 JSON {{{' }, // 内容失败 → 同主模型 json_object 重试
+    { return: validClassificationJson({ priority: 'P3' }) },
+  ]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  assert.equal(result.priority, 'P3');
+  assert.equal(chat.calls.length, 2);
+  assert.equal(sleep.calls.length, 0, '内容重试路径必须无退避（其延迟无收益）');
+});
+
+// content（4xx 不支持 json_schema）抛错重试路径**无退避**——同主模型 json_object 降级。
+test('content 4xx（不支持 json_schema）重试路径无退避、calls≤2', async () => {
+  const sleep = makeSleepSpy();
+  const contentErr = httpError(400, 'response_format json_schema not supported');
+  const chat = makeChatSpy([
+    { throw: contentErr },
+    { return: validClassificationJson({ priority: 'P2', category: 'work' }) },
+  ]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  assert.equal(result.priority, 'P2');
+  assert.equal(chat.calls.length, 2);
+  // 第 2 次同主模型（非 fallback）+ json_object。
+  assert.equal(chat.calls[1]?.model, config.OPENROUTER_MODEL);
+  assert.equal(chat.calls[1]?.responseFormat, 'json_object');
+  assert.equal(sleep.calls.length, 0, 'content 4xx 重试路径必须无退避');
+});
+
+// 不重试路径（401 鉴权 / 429 未归类）→ 无退避、总调用 = 1。
+test('鉴权 401 不重试路径无退避、calls=1', async () => {
+  const sleep = makeSleepSpy();
+  const chat = makeChatSpy([{ throw: httpError(401) }]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  assertSafeDefault(result);
+  assert.equal(chat.calls.length, 1);
+  assert.equal(sleep.calls.length, 0, '不重试路径无退避');
+});
+
+test('未归类 429 不重试路径无退避、calls=1', async () => {
+  const sleep = makeSleepSpy();
+  const chat = makeChatSpy([{ throw: httpError(429) }]);
+
+  const result = await classifyEmail(sampleEmail(), { chat, apiKey: 'sk-test', sleep });
+
+  assertSafeDefault(result);
+  assert.equal(chat.calls.length, 1);
+  assert.equal(sleep.calls.length, 0, '不重试路径无退避');
 });
 
 // ——————————————————————————————————————————————————————————

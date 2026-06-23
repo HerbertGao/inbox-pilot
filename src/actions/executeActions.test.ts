@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { executeActions } from './executeActions.js';
+import { executeActions, type SleepFn } from './executeActions.js';
 import { ActionType } from './actionTypes.js';
 import { ProviderReauthRequired } from '../providers/provider.js';
 import { InMemoryMailRepo } from '../repo/inMemoryMailRepo.js';
@@ -68,6 +68,16 @@ function makeOrderedProvider(): ProviderActions & { calls: string[] } {
     },
   };
   return provider;
+}
+
+/** 假时钟 sleep（组 C 退避）：不真实等待，记录每次退避 ms 以断言退避被调用、求和有上限。 */
+function makeSleepSpy(): SleepFn & { calls: number[] } {
+  const calls: number[] = [];
+  const fn = (async (ms: number): Promise<void> => {
+    calls.push(ms);
+  }) as SleepFn & { calls: number[] };
+  fn.calls = calls;
+  return fn;
 }
 
 /** 永远返回 sent 的假 notifier（记调用次数）。 */
@@ -287,6 +297,138 @@ test('markRead 抛 ProviderReauthRequired（reflectPriority 先成功）→ 重�
 // 与既有 markRead 契约一致：reflectPriority/markRead 的 done-写入在重试 try 内（动作幂等，
 // done-写入失败重试重打无害），故 done-I/O 故障经耗尽分支的 updateAction(failed) 向上传播——
 // 当 failed-写入自身也持久故障（真正的终态落库失败）时，executeActions 不吞、向上传播。
+
+// ——————————————————————————————————————————————————————————
+// 组 C 退避（4.1/4.3）：动作重试间退避（注入假时钟）、单封总退避有上限、不跳过其余动作
+// ——————————————————————————————————————————————————————————
+
+// reflectPriority 瞬时失败两次、第三次成功 → 重试间退避两次（指数 100→200）、注入假时钟。
+test('动作重试间有退避（注入假时钟）：100ms→200ms 指数、每次 ≤500ms', async () => {
+  const repo = new InMemoryMailRepo();
+  let attempts = 0;
+  const provider: ProviderActions = {
+    async reflectPriority(): Promise<void> {
+      attempts += 1;
+      if (attempts < 3) {
+        throw new Error('transient 429'); // 前两次瞬时失败、第三次成功
+      }
+    },
+    async markRead(): Promise<void> {},
+  };
+  const notifier = makeSentNotifier();
+  const sleep = makeSleepSpy();
+  const email = makeEmail();
+  const decision = makeDecision({ priority: 'P2', shouldMarkRead: false, shouldNotifyNow: false });
+  const rowId = await seedRow(repo, email);
+
+  await executeActions(email, decision, rowId, { repo, provider, notifier, sleep });
+
+  // 两次失败 → 两次退避（第三次尝试成功、其后不退避）。
+  assert.equal(sleep.calls.length, 2, '两次失败之间应退避两次');
+  assert.equal(sleep.calls[0], 100, '首次退避 ~100ms 起始');
+  assert.equal(sleep.calls[1], 200, '指数翻倍 → 200ms');
+  // 每次退避 ≤500ms 封顶。
+  assert.ok(sleep.calls.every((ms) => ms <= 500), '每次退避 ≤500ms');
+  // reflect_priority 最终成功 done（重试耗尽前成功）。
+  const reflect = repo.getActions(rowId).find((a) => a.actionType === ActionType.ReflectPriority);
+  assert.equal(reflect?.status, 'done');
+});
+
+// 单封总退避有上限（≤~750ms 动作份额）：三个动作全部瞬时失败、退避总和封顶。
+test('单封总退避有上限（动作份额 ≤~750ms）：三动作全失败、退避求和不超封顶', async () => {
+  const repo = new InMemoryMailRepo();
+  const provider: ProviderActions = {
+    async reflectPriority(): Promise<void> {
+      throw new Error('always fail');
+    },
+    async markRead(): Promise<void> {
+      throw new Error('always fail');
+    },
+  };
+  // 通知器永远 failed（纳入有界重试 + 退避）。
+  const notifier: Notifier = {
+    async notify(): Promise<NotifyResult> {
+      return { outcome: 'failed', channel: 'fake', error: 'always fail' };
+    },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'sent', channel: 'fake' };
+    },
+  };
+  const sleep = makeSleepSpy();
+  const email = makeEmail();
+  // 三动作都触发：reflect（始终）+ markRead（shouldMarkRead）+ notify（shouldNotifyNow）。
+  const decision = makeDecision({ priority: 'P3', shouldMarkRead: true, shouldNotifyNow: true });
+  const rowId = await seedRow(repo, email);
+
+  await executeActions(email, decision, rowId, { repo, provider, notifier, sleep });
+
+  // 退避总和受单封封顶约束（动作份额 750ms）；与分类器 250ms 求和 ≤~1s。
+  const totalBackoff = sleep.calls.reduce((sum, ms) => sum + ms, 0);
+  assert.ok(totalBackoff <= 750, `单封动作退避总和应 ≤~750ms，实际 ${totalBackoff}`);
+  // 每次退避 ≤500ms。
+  assert.ok(sleep.calls.every((ms) => ms <= 500), '每次退避 ≤500ms');
+  // 三动作均耗尽落 failed（退避延迟本封但不跳过其余动作）。
+  const actions = repo.getActions(rowId);
+  assert.equal(actions.find((a) => a.actionType === ActionType.ReflectPriority)?.status, 'failed');
+  assert.equal(actions.find((a) => a.actionType === ActionType.MarkRead)?.status, 'failed');
+  assert.equal(actions.find((a) => a.actionType === ActionType.Notify)?.status, 'failed');
+  // 预算耗尽后退避降为 0，但后续动作仍照常发起（不跳过）——三动作行齐全即证。
+  assert.equal(actions.length, 3, '退避不跳过该封其余动作');
+});
+
+// 退避延迟本封但不跳过其余动作：reflect 失败耗尽（退避）后 markRead 仍照常发起并成功。
+test('退避延迟本封但不跳过该封其余动作：reflect 失败后 markRead 仍发起', async () => {
+  const repo = new InMemoryMailRepo();
+  let markReadCalled = false;
+  const provider: ProviderActions = {
+    async reflectPriority(): Promise<void> {
+      throw new Error('transient fail'); // 耗尽 → failed（退避）
+    },
+    async markRead(): Promise<void> {
+      markReadCalled = true;
+    },
+  };
+  const notifier = makeSentNotifier();
+  const sleep = makeSleepSpy();
+  const email = makeEmail();
+  const decision = makeDecision({ priority: 'P2', shouldMarkRead: true });
+  const rowId = await seedRow(repo, email);
+
+  await executeActions(email, decision, rowId, { repo, provider, notifier, sleep });
+
+  assert.ok(sleep.calls.length >= 1, 'reflect 失败应触发退避');
+  assert.ok(markReadCalled, '退避不应跳过该封其余动作（markRead 仍发起）');
+  assert.equal(
+    repo.getActions(rowId).find((a) => a.actionType === ActionType.MarkRead)?.status,
+    'done',
+  );
+});
+
+// 无渠道降级（skipped）不进退避路径、不消耗退避预算。
+test('无渠道降级（notify skipped）→ 不退避、不消耗预算', async () => {
+  const repo = new InMemoryMailRepo();
+  const provider = makeOrderedProvider();
+  const notifier: Notifier = {
+    async notify(): Promise<NotifyResult> {
+      return { outcome: 'skipped', channel: 'none', reason: 'no-channel' };
+    },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'sent', channel: 'fake' };
+    },
+  };
+  const sleep = makeSleepSpy();
+  const email = makeEmail();
+  const decision = makeDecision({ priority: 'P0', shouldMarkRead: false, shouldNotifyNow: true });
+  const rowId = await seedRow(repo, email);
+
+  await executeActions(email, decision, rowId, { repo, provider, notifier, sleep });
+
+  assert.equal(sleep.calls.length, 0, 'skipped 不进退避路径');
+  assert.equal(
+    repo.getActions(rowId).find((a) => a.actionType === ActionType.Notify)?.status,
+    'skipped',
+  );
+});
 
 test('reflect_priority 终态落库持久失败（updateAction 全抛）→ 向上传播、markRead 不发起', async () => {
   class ThrowOnReflectUpdateRepo extends InMemoryMailRepo {

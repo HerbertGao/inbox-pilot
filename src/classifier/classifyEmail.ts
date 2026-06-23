@@ -24,15 +24,37 @@ export type ChatFn = (args: {
   model: string;
 }) => Promise<string>;
 
+/**
+ * 可注入睡眠 seam（组 C 退避）：默认真实 setTimeout，测试注入假时钟以零真实等待断言退避被调用。
+ * 真实失败/超时路径罕见，毫秒级 setTimeout 不阻塞主流程，仅在重试前裸 delay 一次。
+ */
+export type SleepFn = (ms: number) => Promise<void>;
+
+const realSleep: SleepFn = (ms: number) =>
+  new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
 // classifyEmail 的可注入依赖。chat 默认真实 OpenRouter 调用；apiKey 默认取 config，
 // 测试可传 apiKey:undefined 模拟「缺 key」而无需改 frozen config。
 export type ClassifyDeps = {
   chat?: ChatFn;
   apiKey?: string;
+  /** 退避睡眠 seam（默认真实 setTimeout，测试注入假时钟断言退避而不真实等待）。 */
+  sleep?: SleepFn;
 };
 
 // textBody 截断上限（约 6000 字符，§11）。
 const TEXT_BODY_MAX = 6000;
+
+/**
+ * 传输/可用性失败重试前的退避 delay（ms，组 C 决策 5）。
+ * 起始小常数、有上限；分类器至多插入**恰好一次**裸 delay（calls≤2 结构内只有一次重试），
+ * 故单封分类器退避恒 ≤ 此常数 —— 与动作退避求和后受单封 ≤~1s 总预算约束
+ * （此处 250ms + executeActions 的 ≤750ms 累计退避封顶 = ≤~1s，见 executeActions.ts）。
+ * 裸 delay **不增 `calls`**（不是一次模型调用），`calls ≤ 2` 硬上限结构不变。
+ */
+export const TRANSPORT_RETRY_BACKOFF_MS = 250;
 
 // 送模型 header 的固定闭集白名单（仅这些 key 可进入模型输入，其余一律剔除）。
 const HEADER_WHITELIST = [
@@ -231,6 +253,7 @@ export async function classifyEmail(
   deps: ClassifyDeps = {},
 ): Promise<Classification> {
   const chat = deps.chat ?? openRouterChat;
+  const sleep = deps.sleep ?? realSleep;
   const apiKey = 'apiKey' in deps ? deps.apiKey : config.OPENROUTER_API_KEY;
 
   // 缺 key 短路：不构造、不发起任何网络调用，直接安全默认、不抛异常（spec「密钥缺失」场景）。
@@ -266,8 +289,11 @@ export async function classifyEmail(
     // content（4xx 不支持 json_schema）→ 同主模型 + json_object 重试 1 次。
     // transport（5xx/超时/网络）→ fallback 模型 + json_object 重试 1 次。
     const retryModel = kind === 'transport' ? fallbackModel : primaryModel;
+    // 退避**按失败类别 gate 在传输/可用性分支**：transport 路径在第 2 次 chat() 前裸 delay 一次；
+    // content 重试路径**无退避**（其延迟无收益）。retryOnce 被两路共用，故由调用方传 backoffMs 决定。
+    const backoffMs = kind === 'transport' ? TRANSPORT_RETRY_BACKOFF_MS : 0;
     logFailure({ kind, model: primaryModel, attempt: 1 });
-    return retryOnce({ chat, messages, model: retryModel, calls });
+    return retryOnce({ chat, sleep, messages, model: retryModel, calls, backoffMs });
   }
 
   // 第 1 次返回字符串 → 解析 + zod。
@@ -276,26 +302,37 @@ export async function classifyEmail(
     return firstParsed.value;
   }
 
-  // 内容失败（200 但解析/zod 失败）→ 同主模型 + json_object 重试 1 次。
+  // 内容失败（200 但解析/zod 失败）→ 同主模型 + json_object 重试 1 次；**无退避**（gate 在传输分支）。
   logFailure({ kind: 'content', model: primaryModel, attempt: 1, zodIssuePaths: firstParsed.zodIssuePaths });
-  return retryOnce({ chat, messages, model: primaryModel, calls });
+  return retryOnce({ chat, sleep, messages, model: primaryModel, calls, backoffMs: 0 });
 }
 
 /**
  * 第 2 次调用（json_object）。任何失败（抛错 / 解析 / zod）→ 安全默认。
  * `calls` 由调用方传入（第 1 次已 +1），本函数再 +1 并断言总调用 ≤ 2（硬上限的内层防线）。
+ *
+ * **退避**（`backoffMs`，组 C 决策 5）：仅当 `> 0`（传输/可用性分支）时在第 2 次 `chat()` **之前**
+ * 裸 delay 一次。content 重试路径由调用方传 `backoffMs: 0` → 无退避。delay **不增 `calls`**
+ * （不是一次模型调用），`calls ≤ 2` 硬上限结构不变。delay 落在 totalCalls 防线**之后**——越界时
+ * 直接安全默认、连退避都不发起（不浪费时间）。
  */
 async function retryOnce(args: {
   chat: ChatFn;
+  sleep: SleepFn;
   messages: ChatMessage[];
   model: string;
   calls: number;
+  backoffMs: number;
 }): Promise<Classification> {
   const totalCalls = args.calls + 1; // 此刻为第 2 次，硬上限。
   if (totalCalls > 2) {
     // 不可达防线：状态机线性、无循环，最多两次。若越界则安全默认而非超额调用。
     logFailure({ kind: 'catch-all', model: args.model, attempt: totalCalls });
     return safeDefault();
+  }
+  // 传输/可用性分支退避：第 2 次 chat() 前裸 delay 一次（不增 calls）。
+  if (args.backoffMs > 0) {
+    await args.sleep(args.backoffMs);
   }
   let raw: string;
   try {

@@ -74,20 +74,3 @@ export const SECURITY_PAYMENT_KEYWORDS: readonly string[] = [
 export const SENSITIVE_CATEGORIES: ReadonlySet<Classification['category']> = new Set<
   Classification['category']
 >(['finance', 'security', 'transaction']);
-
-/**
- * 敏感发件域名（银行/医院/保险/支付/合同类）。发件域命中 → 强制
- * shouldMarkRead=false（护栏）。参考 §12.2 never_mark_read_domains。
- * 匹配方应对发件域同做小写归一，并按「等于该域或为其子域」判断。
- *
- * 域名轴=**可选补充**（硬约束已由关键词轴确定性兜底 + 类别轴概率性广覆盖落地，不要求穷举域名）。
- * 但**默认非空、非穷举**：保留示例项使域名轴可被实例化、不破坏既有域名轴用例——**禁止清空**
- * （清空会使域名轴场景 vacuous）。真实/完整名单 P6 YAML 可配。
- */
-export const SENSITIVE_DOMAINS: readonly string[] = [
-  'bank.com',
-  'hospital.com',
-  'insurance.com',
-  'payment.com',
-  'contract.com',
-];

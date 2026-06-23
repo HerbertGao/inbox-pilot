@@ -17,9 +17,16 @@
 //   - P2/P3 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取重跑、无孤儿行。
 
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 
 import { pollOnce, type PollDeps } from './imapPoller.js';
+import { resetRulesConfigForTest } from '../../rules/rulesConfig.js';
+
+// 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
+// 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
+beforeEach(() => {
+  resetRulesConfigForTest();
+});
 import type {
   FetchedMessage,
   ImapConnection,
@@ -34,7 +41,6 @@ import type { NotificationChannel } from '../../notify/notifier.js';
 import type { ChannelSendResult } from '../../notify/telegram.js';
 import type { Classification } from '../../classifier/schema.js';
 import type { NormalizedEmail } from '../../normalizer/normalizeEmail.js';
-import { SENSITIVE_DOMAINS } from '../../rules/lists.js';
 
 const ACCOUNT_ID = 'imap:u@h';
 
@@ -112,7 +118,9 @@ function fetched(uid: number, overrides: Partial<FetchedMessage> = {}): FetchedM
     messageId: `<mid-${uid}@example.com>`,
     subject: `主题 ${uid}`,
     fromName: '发件人',
-    fromEmail: 'sender@example.com',
+    // 中性发件域（RFC-6761 保留测试域，不在 rules.yaml vip/important/域名轴）——
+    // 避免命中示例 important_domains:[example.com] 被 floor 轴抬升 P1。
+    fromEmail: 'sender@example.test',
     to: ['me@example.com'],
     date: new Date('2026-06-20T00:00:00.000Z'),
     textBody: `正文 ${uid}`,
@@ -233,13 +241,20 @@ test('含 Message-ID → 跨轮稳定去重：同邮件第二轮经 dedup 跳过
 });
 
 // ——————————————————————————————————————————————————————————
-// 显示名形态发件人 `客服 <u@bank.com>` → 裸 u@bank.com + 触发敏感域护栏（不标已读）
+// 显示名形态发件人 → 裸地址正确送入流水线 + 敏感内容护栏（不标已读）
+//
+// 双职责：(a) 裸地址提取（imapClient 已拆 envelope.from[0].address）；
+// (b) 敏感邮件不自动标已读。域名内置默认已清空（决策 1：不维护域名白名单）——
+// 决定性护栏在内容轴，故 (b) 改用内置 SECURITY_PAYMENT_KEYWORDS 关键词（主题含「医院」）触发
+// 关键词轴；发件域用中性 example.test。断言意图不变（shouldMarkRead=false）。
 // ——————————————————————————————————————————————————————————
 
-test('显示名形态发件人 → fromEmail 裸地址 u@bank.com 并触发敏感域护栏（不标已读）', async () => {
+test('显示名形态发件人 → fromEmail 裸地址送入流水线 并触发敏感关键词护栏（不标已读）', async () => {
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 7 });
-  // 模拟 envelope.from[0] = { name:'客服', address:'u@bank.com' }（imapClient 已拆裸地址）。
-  conn.setMessage(fetched(6, { fromName: '客服', fromEmail: `u@${SENSITIVE_DOMAINS[0]}` }));
+  // 模拟 envelope.from[0] = { name:'客服', address:'u@example.test' }（imapClient 已拆裸地址）。
+  conn.setMessage(
+    fetched(6, { fromName: '客服', fromEmail: 'u@example.test', subject: '医院预约确认' }),
+  );
   const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
   const { deps, provider } = makeDeps(conn, repo, classify);
@@ -247,9 +262,9 @@ test('显示名形态发件人 → fromEmail 裸地址 u@bank.com 并触发敏�
   await pollOnce(ACCOUNT_ID, deps);
 
   // 裸地址送进流水线。
-  assert.equal(classify.calls[0]!.fromEmail, `u@${SENSITIVE_DOMAINS[0]}`);
+  assert.equal(classify.calls[0]!.fromEmail, 'u@example.test');
   assert.equal(classify.calls[0]!.fromName, '客服');
-  // 敏感域护栏：shouldMarkRead=false → 不标已读。
+  // 敏感关键词护栏：shouldMarkRead=false → 不标已读。
   assert.equal((provider as FakeProviderActions).markReadCalls.length, 0);
 });
 
