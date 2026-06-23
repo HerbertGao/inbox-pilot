@@ -12,8 +12,10 @@ services:
       retries: 10
       start_period: 30s
     ports:
-      # 默认 5432:5432（宿主侧 migrate/dev）；宿主端口可被 POSTGRES_HOST_PORT 覆盖以绕开本机端口冲突。
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      # 仅绑 127.0.0.1（loopback）：postgres **不对外、不上网络**（Tailscale/LAN 不可达），仅宿主本机可连
+      # （local dev 的宿主侧 migrate/dev 用）；容器化 app 经 @postgres:5432 **内网**连库、不走此映射。
+      # 宿主端口可被 POSTGRES_HOST_PORT 覆盖以绕开本机端口冲突。
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
 
