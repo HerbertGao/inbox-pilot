@@ -30,8 +30,12 @@ services:
     environment:
       # 容器内 DNS：覆盖 .env 的 localhost 形态为 @postgres:5432。
       DATABASE_URL: postgresql://mail_router:mail_router_password@postgres:5432/mail_router
-      # 容器时区：每日摘要定点（DIGEST_TIMES）依赖时区，随 .env 透传（缺省由进程内兜底 Asia/Shanghai）。
-      TZ: ${TZ:-Asia/Shanghai}
+      # 容器时区：每日摘要定点（DIGEST_TIMES）依赖时区，随 env_file (.env) 透传；compose 不注入默认值，
+      # 使未设置 / 为空的 TZ 抵达应用回退分支（兜底 Asia/Shanghai）、tz-fallback-default 告警可观测。
     ports:
       # 默认 3000:3000；宿主端口可被 APP_HOST_PORT 覆盖以绕开本机端口冲突（与 POSTGRES_HOST_PORT 同模式，多主机部署用）。
       - "${APP_HOST_PORT:-3000}:3000"
+    volumes:
+      # rules.yaml bind-mount：提供宿主可编辑的 rules.yaml（改内容即被 mtime 热加载、实时生效），
+      # 存在时遮蔽镜像内烘焙拷贝（Dockerfile COPY rules）；无挂载时回落到该烘焙拷贝。:ro 因 app 只读不写。
+      - ./rules:/app/rules:ro

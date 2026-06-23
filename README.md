@@ -47,6 +47,9 @@ curl localhost:3000/health  # 两容器就绪后返 {"status":"ok"}（200）
 
 > 若宿主 5432 已被占用，用 `POSTGRES_HOST_PORT` 覆盖 postgres 的宿主端口：
 > `POSTGRES_HOST_PORT=55432 docker compose up -d`（app 容器内部仍连 `postgres:5432`，不受影响）。
+> 同理宿主 3000 被占时用 `APP_HOST_PORT`（默认 `3000`）覆盖 app 的宿主端口：
+> `APP_HOST_PORT=33000 docker compose up -d`（容器内部仍监听 3000，不受影响）。
+> 完整部署 / 运维 runbook（配置生效语义、`reload`、远程 DB 隧道等）见 **[docs/DEPLOY.md](./docs/DEPLOY.md)**。
 
 ### 本地开发（宿主直跑）
 
