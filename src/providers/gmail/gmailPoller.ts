@@ -27,6 +27,12 @@ import {
   processEmail as defaultProcessEmail,
   type ProcessEmailDeps,
 } from '../../pipeline/processEmail.js';
+import { defaultNotifier, type Notifier } from '../../notify/notifier.js';
+import {
+  drainAccountRetries,
+  type DrainDeadline,
+} from '../../actions/retryQueue.js';
+import { DRAIN_TIME_BUDGET_MS } from '../../actions/retryConstants.js';
 import type { GmailApi, GmailMessage, GmailMessagePart } from './gmailClient.js';
 import { isInvalidGrant, isReauth403, readErrorCode, readHttpStatus, throwReauth } from './gmailClient.js';
 
@@ -55,6 +61,22 @@ export type GmailPollDeps = {
   readonly processEmail?: (email: NormalizedEmail, deps: ProcessEmailDeps) => Promise<void>;
   /** 分类 seam（透传给 processEmail）。默认不传（processEmail 用真身 classifyEmail）。 */
   readonly classify?: (email: NormalizedEmail) => Promise<Classification>;
+  /**
+   * 通知 seam（durable-retry：drain 重试 notify 动作账号无关、非 connection-bound）。
+   * 默认 defaultNotifier（telegram from config）；测试注入假渠道。镜像 processEmail 的默认方式。
+   * 5.1（组 E）经此字段从 main.ts 显式透传；此处只加字段 + 默认 + 用于 drain。
+   */
+  readonly notifier?: Notifier;
+  /**
+   * drain 时钟 seam（durable-retry）。默认 `() => new Date()`；测试注入可控时钟以驱动
+   * staleness / nextRetryAt 计算无需真实等待。
+   */
+  readonly clock?: () => Date;
+  /**
+   * drain 软 deadline seam（durable-retry 决策 6）。默认捕获 drain 起点单调 elapsed +
+   * DRAIN_TIME_BUDGET_MS；测试注入可控 elapsedMs 桩值断言「超软 deadline 提前退出」零真实等待。
+   */
+  readonly drainDeadline?: DrainDeadline;
 };
 
 /**
@@ -67,6 +89,7 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
   const { gmail, repo, provider } = deps;
   const getBudget = deps.getBudget ?? DEFAULT_GET_BUDGET;
   const runProcessEmail = deps.processEmail ?? defaultProcessEmail;
+  const notifier = deps.notifier ?? defaultNotifier;
 
   // —— 1. 穷尽翻页 list(q='is:unread')（纯 id、轻）。429/配额绕过 → 结束本轮并隔离 ——
   const allUnreadIds: string[] = [];
@@ -172,6 +195,19 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
     }
     await runProcessEmail(normalized, processDeps);
   }
+
+  // —— 折叠进 poll 的 durable 重试 drain（durable-retry 决策 1，tasks 4.2/4.3）——
+  // 新邮件循环之后：用同一 gmail client + provider（reflectPriority/markRead）+ 注入的 notifier
+  // （notify、账号无关）排空该账号到期重试。软 deadline 用单调 elapsed（起点在 drain 开始时捕获）。
+  // drain 抛 ProviderReauthRequired **不吞**——沿既有 poll reauth 路径隔离账号（触发 suspend）；
+  // 普通瞬时异常由 drain 逐条隔离内部处理。
+  const clock = deps.clock ?? (() => new Date());
+  const drainStartMs = Date.now();
+  const deadline: DrainDeadline = deps.drainDeadline ?? {
+    elapsedMs: () => Date.now() - drainStartMs,
+    budgetMs: DRAIN_TIME_BUDGET_MS,
+  };
+  await drainAccountRetries(accountId, { provider, notifier, repo, clock, deadline });
 }
 
 /**

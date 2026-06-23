@@ -19,7 +19,8 @@ import { logger } from '../logger.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
-import type { ActionStatus, ActionType } from '../actions/actionTypes.js';
+import { ActionStatus } from '../actions/actionTypes.js';
+import type { ActionType } from '../actions/actionTypes.js';
 
 /** Gmail authJson 的默认 scope（scopes 缺省回落，避免写 scopes:undefined）。与 oauth.ts 同值、不耦合其重量级依赖。 */
 const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
@@ -54,6 +55,50 @@ export type StoredEmail = {
   id: string;
   processedAt: Date | null;
 };
+
+/**
+ * `recordAction` 的活跃行分流信号（durable-retry 决策 4）。`recordAction` 改为对 `(messageId, actionType)`
+ * 活跃行 upsert，返回行 id + 处置信号供 executeActions 据此 SKIP / 继续：
+ *   - `proceed`：命中活跃 `pending`（崩溃残留、复用同行）或无活跃行（INSERT pending）→ 正常执行该动作。
+ *   - `already-retrying`：命中活跃 `retrying` 行（drain 拥有它）→ executeActions **SKIP 本轮内联执行**，
+ *     保持 retrying 原样、不清零 retryCount/nextRetryAt（避免清零 durable 进度 / 留孤儿 pending）。
+ */
+export type RecordActionDisposition = 'proceed' | 'already-retrying';
+
+/** `recordAction` 返回：动作行 id + 活跃行分流信号。 */
+export type RecordActionResult = {
+  actionRowId: string;
+  disposition: RecordActionDisposition;
+};
+
+/**
+ * `selectDueRetries` 选中的一条到期重试动作（决策 5/6）。**先选 retry 动作行、再 LEFT join/单独 fetch
+ * 重建输入**——关联行缺失（`mail_classifications` 无 FK 保护）的动作仍被选中、以 `rebuild` 的可识别
+ * "缺失"返回值流向永久死信路径（禁 INNER join 丢行）。
+ */
+export type DueRetryAction = {
+  /** mail_actions 行 id（drain 据此 enqueueRetry / markActionDeadLetter / updateAction）。 */
+  actionRowId: string;
+  actionType: ActionType;
+  /** 当前 retryCount（drain 推进时 +1 后判 `≥MAX_DURABLE_ATTEMPTS`）。 */
+  retryCount: number;
+  /** 邮件的 receivedAt（notify staleness 上界判定基准；markRead/reflectPriority 不用）。 */
+  receivedAt: Date;
+  /**
+   * 重建输入结果（决策 5）：
+   *   - `{ ok: true, email, decision }`：成功重建 action-input-sufficient 投影；drain 据此复发原动作。
+   *   - `{ ok: false }`：**永久重建失败**（mail_messages/mail_classifications 行查询返回 null，
+   *     或 rawAiJson 不可解析 / finalDecision shape 校验失败）→ drain 落 `dead_letter`、不崩。
+   * 注：**瞬时 DB I/O 错误不走此判别**——它在 `selectDueRetries` 的行查询本身抛出、向上传播（保持
+   * retrying、不推进 retryCount、不死信），绝不表现为 `{ ok: false }`。
+   */
+  rebuild: RebuildResult;
+};
+
+/** 重建输入的可识别结果（决策 5：永久失败 = `{ ok: false }`，瞬时 DB 错误向上传播不入此类型）。 */
+export type RebuildResult =
+  | { ok: true; email: NormalizedEmail; decision: FinalDecision }
+  | { ok: false };
 
 /**
  * 注册表加载读到的 `MailAccount` 行（design 决策 1/2：`MailAccount` 是唯一账号真相源）。
@@ -193,15 +238,58 @@ export type MailRepo = {
     decision: FinalDecision,
   ): Promise<string>;
 
-  /** 以 pending 落 mail_actions 一行，返回行 id。 */
-  recordAction(messageRowId: string, actionType: ActionType): Promise<string>;
+  /**
+   * 对 `(messageId, actionType)` 活跃行 **upsert**，按既有活跃态分流并返回处置信号（durable-retry 决策 4）。
+   * 活跃 = `status ∈ {pending, retrying}`。配合活跃态 partial unique index 强制至多一条活跃行，使 re-poll
+   * 重跑既不产生第二条活跃行、也不清零 durable 进度：
+   *   - 命中活跃 `retrying` 行 → **保持 `retrying` 原样、不清零 retryCount/nextRetryAt**，返回
+   *     `disposition='already-retrying'`（drain 拥有它，executeActions SKIP 内联执行）。
+   *   - 命中活跃 `pending` 行（崩溃残留）→ 复用同行，返回 `disposition='proceed'`。
+   *   - 无活跃行 → INSERT `pending`，返回 `disposition='proceed'`。
+   * 终态行（done/failed/skipped/dead_letter）可多条、不受活跃约束、不被命中。
+   */
+  recordAction(
+    messageRowId: string,
+    actionType: ActionType,
+  ): Promise<RecordActionResult>;
 
-  /** 把 mail_actions 行更新为终态（done|failed|skipped，+error）。 */
+  /** 把 mail_actions 行更新为终态（done|failed|skipped|dead_letter，+error）。 */
   updateAction(
     actionRowId: string,
-    status: Exclude<ActionStatus, 'pending'>,
+    status: Exclude<ActionStatus, 'pending' | 'retrying'>,
     error?: string,
   ): Promise<void>;
+
+  /**
+   * 把 mail_actions 行落 `retrying`（durable-retry 决策 2）：发送态瞬时失败耗尽（首次入队
+   * retryCount=0）或 drain 失败推进（retryCount+1、未达上限）时调用。写 retryCount/nextRetryAt/error。
+   */
+  enqueueRetry(
+    actionRowId: string,
+    retryCount: number,
+    nextRetryAt: Date,
+    error?: string,
+  ): Promise<void>;
+
+  /**
+   * 把 mail_actions 行落终态 `dead_letter`（durable-retry 决策 2/3）：retryCount 达 MAX_DURABLE_ATTEMPTS
+   * 或超 notify staleness 上界或永久重建失败时调用。写脱敏 error（kind 摘要、绝不正文/凭据/PII）。
+   */
+  markActionDeadLetter(actionRowId: string, retryCount: number, error?: string): Promise<void>;
+
+  /**
+   * 选取该账号到期可重试动作并重建输入（durable-retry 决策 5/6、tasks 1.2）。
+   * **先选 retry 动作行**（`status='retrying' ∧ nextRetryAt ≤ now ∧ message.accountId=accountId`，
+   * 按 nextRetryAt 升序、至多 `limit` 条），**再以 LEFT join/单独 fetch 取重建输入**（mail_messages 行 +
+   * 最新 mail_classifications 行 `[{createdAt:'desc'},{id:'desc'}] take 1`）。**禁 INNER join**——关联行
+   * 缺失的 retry 动作仍被选中、以 `rebuild.ok===false` 流向永久死信路径。
+   * **瞬时 DB I/O 错误**（行读取本身抛出）**向上传播**（不返回 `ok:false`、不死信）——同 repo-I/O 通道。
+   */
+  selectDueRetries(
+    accountId: string,
+    now: Date,
+    limit: number,
+  ): Promise<DueRetryAction[]>;
 
   /** 置 mail_messages.processedAt（流水线最后一步，标记处理完）。 */
   markProcessed(messageRowId: string): Promise<void>;
@@ -270,6 +358,138 @@ export function buildRawAiJson(
       shouldIncludeDigest: decision.shouldIncludeDigest,
       riskFlags: decision.riskFlags,
     },
+  };
+}
+
+/**
+ * 最新分类行的重建输入投影（prisma 与内存实现共用，行查询结果在各自实现内取出后传入此处组装）。
+ * `rawAiJson` 已是 DB JSONB 解析后的 JS 值（unknown），本函数对其 `finalDecision` 块做 shape 校验。
+ */
+type ClassificationRebuildInput = {
+  priority: string;
+  category: string;
+  confidence: number;
+  reason: string;
+  rawAiJson: unknown;
+};
+
+/**
+ * 把账号行的自由 String `provider` 派生为 `'gmail'|'imap'`（决策 5）；非法值返回 null →
+ * 视为永久重建失败（不应发生：注册表加载已校验 provider，但行查询不再保证、防御性兜底）。
+ */
+function coerceProvider(provider: string): 'gmail' | 'imap' | null {
+  return provider === 'gmail' || provider === 'imap' ? provider : null;
+}
+
+/** mail_messages 行的重建输入投影（action-input-sufficient 字段；prisma 与内存共用）。 */
+type MessageRebuildInput = {
+  providerMessageId: string;
+  messageId: string | null;
+  threadId: string | null;
+  uid: number | null;
+  subject: string;
+  fromEmail: string;
+  fromName: string | null;
+  snippet: string | null;
+  bodyText: string | null;
+  receivedAt: Date;
+  hasAttachments: boolean;
+};
+
+/**
+ * 校验并取出 rawAiJson 的 `finalDecision` 块（决策 5：永久判别）。**调用方须把此函数包在独立解析 `try` 内**：
+ * 任何 throw（不可解析的 rawAiJson 上游已是 JS 值，但 shape 不符在此 throw）= **永久重建失败**。
+ * `finalDecision` 块缺字段/类型不符即 throw（shape-invalid → 永久）。
+ */
+function parseFinalDecisionBlock(rawAiJson: unknown): RawAiJson['finalDecision'] {
+  if (rawAiJson === null || typeof rawAiJson !== 'object') {
+    throw new Error('rawAiJson 非对象（shape-invalid，永久）');
+  }
+  const fd = (rawAiJson as Record<string, unknown>).finalDecision;
+  if (fd === null || typeof fd !== 'object') {
+    throw new Error('rawAiJson.finalDecision 缺失或非对象（shape-invalid，永久）');
+  }
+  const block = fd as Record<string, unknown>;
+  const isBool = (v: unknown): v is boolean => typeof v === 'boolean';
+  const isStrArr = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every((x) => typeof x === 'string');
+  if (
+    !isStrArr(block.appliedRules) ||
+    !isBool(block.shouldNotifyNow) ||
+    !isBool(block.shouldMarkRead) ||
+    !isBool(block.shouldIncludeDigest) ||
+    !isStrArr(block.riskFlags)
+  ) {
+    throw new Error('rawAiJson.finalDecision 字段缺失/类型不符（shape-invalid，永久）');
+  }
+  return {
+    appliedRules: block.appliedRules,
+    shouldNotifyNow: block.shouldNotifyNow,
+    shouldMarkRead: block.shouldMarkRead,
+    shouldIncludeDigest: block.shouldIncludeDigest,
+    riskFlags: block.riskFlags,
+  };
+}
+
+/**
+ * 从行重建 **action-input-sufficient 投影** `NormalizedEmail`（决策 5、tasks 1.4，prisma 与内存共用）。
+ * `mail_messages` 不存 `to`/`cc`/`headers`/`htmlBody`/`provider`——重建**合成** `to:[]`、`headers:{}`，
+ * `provider` 由 `MailAccount.provider` 派生传入。安全前提：三动作 sink 不读 to/headers（断言测试守，tasks 4.4）。
+ */
+export function rebuildNormalizedEmail(
+  accountId: string,
+  provider: 'gmail' | 'imap',
+  msg: MessageRebuildInput,
+): NormalizedEmail {
+  const email: NormalizedEmail = {
+    accountId,
+    provider,
+    providerMessageId: msg.providerMessageId,
+    subject: msg.subject,
+    fromEmail: msg.fromEmail,
+    to: [], // 合成（库中无；action-input-sufficient 投影，三动作 sink 不读）。
+    date: msg.receivedAt.toISOString(),
+    hasAttachments: msg.hasAttachments,
+    headers: {}, // 合成（库中无；三动作 sink 不读）。
+  };
+  if (msg.threadId !== null) {
+    email.providerThreadId = msg.threadId;
+  }
+  if (msg.uid !== null) {
+    email.uid = msg.uid;
+  }
+  if (msg.messageId !== null) {
+    email.messageId = msg.messageId;
+  }
+  if (msg.fromName !== null) {
+    email.fromName = msg.fromName;
+  }
+  if (msg.snippet !== null) {
+    email.snippet = msg.snippet;
+  }
+  if (msg.bodyText !== null) {
+    email.textBody = msg.bodyText;
+  }
+  return email;
+}
+
+/**
+ * 从最新分类行重建 `FinalDecision`（决策 5、tasks 1.4，prisma 与内存共用）：priority/category/confidence/
+ * reason 专列 + `rawAiJson.finalDecision` 块。**调用方须在独立解析 `try` 内调用**（parseFinalDecisionBlock
+ * 的 shape 校验 throw = 永久重建失败）。
+ */
+export function rebuildFinalDecision(cls: ClassificationRebuildInput): FinalDecision {
+  const block = parseFinalDecisionBlock(cls.rawAiJson);
+  return {
+    priority: cls.priority as FinalDecision['priority'],
+    category: cls.category as FinalDecision['category'],
+    confidence: cls.confidence,
+    reason: cls.reason,
+    shouldNotifyNow: block.shouldNotifyNow,
+    shouldMarkRead: block.shouldMarkRead,
+    shouldIncludeDigest: block.shouldIncludeDigest,
+    riskFlags: block.riskFlags,
+    appliedRules: block.appliedRules,
   };
 }
 
@@ -444,23 +664,174 @@ export class PrismaMailRepo implements MailRepo {
   async recordAction(
     messageRowId: string,
     actionType: ActionType,
-  ): Promise<string> {
+  ): Promise<RecordActionResult> {
+    // 对 (messageId, actionType) 活跃行 upsert（决策 4）：先查活跃行（status ∈ {pending, retrying}）。
+    // 逐账号串行化前提（drain 与 re-poll 同受 per-account isPolling 锁）下，单实例 find-then-insert 无并发竞态。
+    const active = await prisma.mailAction.findFirst({
+      where: {
+        messageId: messageRowId,
+        actionType,
+        status: { in: ['pending', 'retrying'] },
+      },
+      select: { id: true, status: true },
+    });
+    if (active !== null) {
+      if (active.status === 'retrying') {
+        // 命中活跃 retrying：保持原样、不清零 retryCount/nextRetryAt；executeActions SKIP 内联执行。
+        return { actionRowId: active.id, disposition: 'already-retrying' };
+      }
+      // 命中活跃 pending（崩溃残留）：复用同行继续执行。
+      return { actionRowId: active.id, disposition: 'proceed' };
+    }
+    // 无活跃行：INSERT pending（status 走 schema 默认）。
     const row = await prisma.mailAction.create({
-      // status 走 schema 默认 'pending'。
       data: { messageId: messageRowId, actionType },
       select: { id: true },
     });
-    return row.id;
+    return { actionRowId: row.id, disposition: 'proceed' };
   }
 
   async updateAction(
     actionRowId: string,
-    status: Exclude<ActionStatus, 'pending'>,
+    status: Exclude<ActionStatus, 'pending' | 'retrying'>,
     error?: string,
   ): Promise<void> {
     await prisma.mailAction.update({
       where: { id: actionRowId },
       data: { status, error: error ?? null },
+    });
+  }
+
+  async enqueueRetry(
+    actionRowId: string,
+    retryCount: number,
+    nextRetryAt: Date,
+    error?: string,
+  ): Promise<void> {
+    // 落 retrying（决策 2）：写 retryCount/nextRetryAt/error。首次入队 retryCount=0；drain 推进 +1（未达上限）。
+    await prisma.mailAction.update({
+      where: { id: actionRowId },
+      data: {
+        status: ActionStatus.Retrying,
+        retryCount,
+        nextRetryAt,
+        error: error ?? null,
+      },
+    });
+  }
+
+  async markActionDeadLetter(actionRowId: string, retryCount: number, error?: string): Promise<void> {
+    // 落终态 dead_letter（决策 2/3）：脱敏 error（kind 摘要，绝不正文/凭据/PII）。nextRetryAt 不再相关、清空。
+    // 落**死亡时的 retryCount**（max-attempts 死亡 = MAX；staleness/rebuild 死亡 = 当前未推进值）。
+    await prisma.mailAction.update({
+      where: { id: actionRowId },
+      data: {
+        status: ActionStatus.DeadLetter,
+        retryCount,
+        nextRetryAt: null,
+        error: error ?? null,
+      },
+    });
+  }
+
+  async selectDueRetries(
+    accountId: string,
+    now: Date,
+    limit: number,
+  ): Promise<DueRetryAction[]> {
+    // 先选 retry 动作行（决策 5/6）：status='retrying' ∧ nextRetryAt ≤ now ∧ message.accountId=accountId，
+    // 按 nextRetryAt 升序、至多 limit 条。**禁 INNER join 重建输入**——关联行缺失的动作仍须被选中，
+    // 故经动作行的 message 关联过滤 accountId（mail_messages 受 Restrict FK 保护、必在），分类行另查（LEFT 语义）。
+    const rows = await prisma.mailAction.findMany({
+      where: {
+        status: ActionStatus.Retrying,
+        nextRetryAt: { lte: now },
+        message: { accountId },
+      },
+      select: {
+        id: true,
+        actionType: true,
+        retryCount: true,
+        // mail_messages 行（受 Restrict FK 保护、必在）：重建 NormalizedEmail 投影 + receivedAt（staleness 基准）。
+        message: {
+          select: {
+            accountId: true,
+            providerMessageId: true,
+            messageId: true,
+            threadId: true,
+            uid: true,
+            subject: true,
+            fromEmail: true,
+            fromName: true,
+            snippet: true,
+            bodyText: true,
+            receivedAt: true,
+            hasAttachments: true,
+            // 派生 provider（'gmail'|'imap'）；mail_messages 不存 provider，取自账号行。
+            account: { select: { provider: true } },
+            // 最新分类行（LEFT 语义：无分类行 → classifications=[] → 永久重建失败，不丢动作行）。
+            classifications: {
+              select: {
+                priority: true,
+                category: true,
+                confidence: true,
+                reason: true,
+                rawAiJson: true,
+              },
+              orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+              take: 1,
+            },
+          },
+        },
+      },
+      orderBy: [{ nextRetryAt: 'asc' }],
+      take: limit,
+    });
+
+    // 行读取本身（上面的 findMany）抛 I/O 错误 = 瞬时，已自然向上传播（不入此循环、不返回 ok:false）。
+    return rows.map((row) => {
+      const msg = row.message;
+      const provider = coerceProvider(msg.account.provider);
+      const latest = msg.classifications[0];
+      // 重建分流（决策 5）：行缺失（无分类行 / provider 非法）→ 永久；rawAiJson 解析/shape 失败 → 永久（独立 try）。
+      let rebuild: RebuildResult;
+      if (latest === undefined || provider === null) {
+        rebuild = { ok: false };
+      } else {
+        try {
+          const email = rebuildNormalizedEmail(msg.accountId, provider, {
+            providerMessageId: msg.providerMessageId,
+            messageId: msg.messageId,
+            threadId: msg.threadId,
+            uid: msg.uid,
+            subject: msg.subject,
+            fromEmail: msg.fromEmail,
+            fromName: msg.fromName,
+            snippet: msg.snippet,
+            bodyText: msg.bodyText,
+            receivedAt: msg.receivedAt,
+            hasAttachments: msg.hasAttachments,
+          });
+          const decision = rebuildFinalDecision({
+            priority: latest.priority,
+            category: latest.category,
+            confidence: latest.confidence,
+            reason: latest.reason,
+            rawAiJson: latest.rawAiJson,
+          });
+          rebuild = { ok: true, email, decision };
+        } catch {
+          // rawAiJson 不可解析 / finalDecision shape 不符 = 永久（独立 try 内 throw，决策 5）。
+          rebuild = { ok: false };
+        }
+      }
+      return {
+        actionRowId: row.id,
+        actionType: row.actionType as ActionType,
+        retryCount: row.retryCount,
+        receivedAt: msg.receivedAt,
+        rebuild,
+      };
     });
   }
 

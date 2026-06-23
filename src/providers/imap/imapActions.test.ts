@@ -229,10 +229,10 @@ test('经 executeActions：P0/P1/P4/敏感 → 不标 \\Seen（保持未读）',
 });
 
 // ——————————————————————————————————————————————————————————
-// markRead 失败耗尽 → mail_actions=failed、processEmail 仍 markProcessed、保持未读、不重试
+// markRead 失败耗尽 → mail_actions=retrying、processEmail 仍 markProcessed、本轮保持未读、由 drain 跨重启重试
 // ——————————————————————————————————————————————————————————
 
-test('markRead 失败耗尽 → mark_read(failed)、markProcessed 仍执行、保持未读、不重试', async () => {
+test('markRead 失败耗尽 → mark_read(retrying)、markProcessed 仍执行、本轮保持未读、由 drain 跨重启重试', async () => {
   let attempts = 0;
   const connection = makeFakeConnection(async () => {
     attempts += 1;
@@ -250,16 +250,17 @@ test('markRead 失败耗尽 → mark_read(failed)、markProcessed 仍执行、�
   const stored = (await repo.findByDedupKey(email.accountId, email.providerMessageId))!;
   // markProcessed 仍执行（不以动作成功为前提）。
   assert.ok(stored.processedAt !== null, 'markProcessed 应仍执行');
-  // mail_actions = mark_read(failed)；error 是脱敏固定 kind 串（经 redactError 截断后仍等于它）。
+  // mail_actions = mark_read(retrying)；error 是脱敏固定 kind 串（经 redactError 截断后仍等于它）。
   const markRead = repo.getActions(stored.id).find((a) => a.actionType === 'mark_read');
-  assert.equal(markRead?.status, 'failed');
-  assert.equal(markRead?.error, IMAP_MARK_READ_FAILED, 'failed error 应是脱敏固定 kind 串');
-  // 「保持未读」是安全方向：addSeenFlag 始终抛、从未成功 → 邮件未被标 \Seen。
-  // 单次调用内有界重试（≤3），不重试到下轮（at-most-once-after-retry）。
+  assert.equal(markRead?.status, 'retrying');
+  assert.equal(markRead?.error, IMAP_MARK_READ_FAILED, 'retrying 行仍记脱敏固定 kind 串');
+  // 「本轮保持未读」是安全方向：addSeenFlag 始终抛、从未成功 → 本轮邮件未被标 \Seen。
+  // 单次调用内有界重试（≤3）；耗尽后落 retrying，跨重启由 drain 重投（不在本 processEmail 内继续）。
   assert.ok(attempts >= 1 && attempts <= 3, `尝试次数应 ∈ [1,3]，实际 ${attempts}`);
 
-  // 「不重试」：同邮件下轮（dedup 命中已 processedAt）→ 跳过、不再标已读。
+  // 同邮件下一轮 poll：dedup 命中已 processedAt → 跳过、不再经 processEmail 重标已读。
+  // （durable 重试由 retry-drain 走 mail_actions(retrying) 行驱动，与本 poll 路径正交。）
   attempts = 0;
   await processEmail(email, { repo, provider, notifier, classify });
-  assert.equal(attempts, 0, '已处理邮件下轮 dedup 跳过，不再尝试标已读');
+  assert.equal(attempts, 0, '已处理邮件下轮 dedup 跳过，processEmail 不再尝试标已读');
 });

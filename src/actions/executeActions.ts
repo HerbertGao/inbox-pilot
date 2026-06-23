@@ -8,14 +8,17 @@
 //     通知仅当 decision.shouldNotifyNow 为 true。**禁止**读原始 Classification 决定动作。
 //   - shouldIncludeDigest 本期**不产生动作**（摘要属 P5）；它已由 saveClassification 持久化进 rawAiJson，
 //     executeActions 不为它建 mail_actions 行。
-//   - 每个动作先 recordAction(pending) → 执行后 updateAction(done|failed|skipped, error?)。
-//     {done,failed,skipped} 为终态、pending 为唯一中间态。
-//   - 失败有界重试：**单次 executeActions 调用内**的内存计数器（小常数，禁无限、禁跨重启累计、
-//     无 retryCount 列）；只把终态落 mail_actions。
+//   - 每个动作先 recordAction（活跃行 upsert 分流）：命中活跃 retrying 行（disposition=
+//     'already-retrying'）→ drain 拥有它，**SKIP 本轮内联执行**（保留 durable 进度、不重复入队/重发）；
+//     否则执行后 updateAction(done|skipped)/enqueueRetry(retrying)。状态全集：中间态 {pending,retrying}、
+//     终态 {done,failed,skipped,dead_letter}（failed 仍是 reauth/repo-I/O 致命通道的合法终态）。
+//   - 失败有界重试：**单次 executeActions 调用内**的内存计数器（小常数，禁无限）；发送态瞬时失败耗尽
+//     **落 retrying**（带 retryCount=0/nextRetryAt，durable-retry 决策 2）而非终态 failed，由 poll 内
+//     drain 跨重启重试至成功 / 死信（不再 at-most-once 永久丢失）。
 //   - 无渠道降级（notify skipped）：**直接**落 skipped、不进入重试循环、不计入重试预算。
 //   - 单个动作失败**禁止**阻断其余动作；markProcessed 由 processEmail 在本函数返回后照常执行，
-//     **不以通知成功为前提**（P0/P4 通知重试耗尽仍 failed 时 markProcessed 仍照常 —— P2 接受的
-//     at-most-once-after-retry）。
+//     **不以通知成功为前提**（P0/P4 通知发送态耗尽落 retrying 时 markProcessed 仍照常 —— durable-retry
+//     行粒度兜底，与 processedAt 的 email 粒度 re-poll 互补不重叠）。
 //   - 脱敏 error：截断为摘要，禁含 token / chat_id / 正文。
 
 import { logger } from '../logger.js';
@@ -26,6 +29,7 @@ import type { Notifier, NotifyResult } from '../notify/notifier.js';
 import { ActionType } from './actionTypes.js';
 import type { ProviderActions } from './providerActions.js';
 import { ProviderReauthRequired } from '../providers/provider.js';
+import { durableBackoffMs } from './retryConstants.js';
 
 /**
  * 单次 executeActions 调用内每个动作的尝试上限（含首次）。小常数、禁无限。
@@ -112,9 +116,9 @@ function redactError(err: unknown): string {
 
 /**
  * 优先级落地动作：**始终**被 executeActions 调用（标签是分类可见性、不被 shouldMarkRead 门控）。
- * recordAction(pending) → 单次调用内有界重试地调 provider.reflectPriority → done；
- * 发送态失败耗尽 → updateAction(failed, 脱敏error)、**不抛**（不阻断 markRead/notify/markProcessed）。
- * reflectPriority 真实实现幂等（重复打同一标签安全），重试安全。
+ * recordAction（活跃 retrying → SKIP 交给 drain）→ 单次调用内有界重试地调 provider.reflectPriority → done；
+ * 发送态瞬时失败耗尽 → enqueueRetry(retrying, retryCount=0, nextRetryAt)、**不抛**（durable drain 跨重启兜底，
+ * 不阻断 markRead/notify/markProcessed）。reflectPriority 真实实现幂等（重复打同一标签安全），重试安全。
  *
  * **致命错误通道（区别于发送态瞬时失败）**：provider 抛 `ProviderReauthRequired`（token 撤销 /
  * scope 403）时，必须在本作用域内把该 in-flight 行置 `failed`(reauth kind)、**不留 orphan pending**，
@@ -128,7 +132,16 @@ async function executeReflectPriority(
   messageRowId: string,
   budget: BackoffBudget,
 ): Promise<void> {
-  const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.ReflectPriority);
+  // durable-retry：recordAction 返回 { actionRowId, disposition }（活跃行 upsert 分流）。命中活跃
+  // retrying 行（disposition='already-retrying'）→ drain 拥有它，SKIP 本轮内联执行（保留 durable 进度、
+  // 不清零 retryCount/nextRetryAt、不重复入队/重发），直接返回交给 drain。
+  const { actionRowId, disposition } = await deps.repo.recordAction(
+    messageRowId,
+    ActionType.ReflectPriority,
+  );
+  if (disposition === 'already-retrying') {
+    return;
+  }
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -148,22 +161,29 @@ async function executeReflectPriority(
       }
     }
   }
+  // 发送态瞬时失败耗尽：落 retrying（retryCount=0、nextRetryAt=now+backoff(0)、脱敏 error），
+  // 由 poll 内 drain 跨重启重试至成功或死信（durable-retry 决策 2）；**不**落终态 failed（避免永久丢失）。
   const summary = redactError(lastError);
   logger.warn(
-    { kind: 'reflect-priority-failed', attempts: MAX_ATTEMPTS, error: summary },
-    '优先级落地动作重试耗尽，落 failed',
+    { kind: 'reflect-priority-retrying', attempts: MAX_ATTEMPTS, error: summary },
+    '优先级落地动作发送态重试耗尽，落 retrying 入 durable 队列',
   );
-  await deps.repo.updateAction(actionRowId, 'failed', summary);
+  await deps.repo.enqueueRetry(
+    actionRowId,
+    0,
+    new Date(Date.now() + durableBackoffMs(0)),
+    summary,
+  );
 }
 
 /**
  * 标已读动作：仅当 decision.shouldMarkRead 为 true 时调用。
- * recordAction(pending) → 单次调用内有界重试地调 provider.markRead → done；
- * 发送态失败耗尽 → updateAction(failed, 脱敏error)、**不抛**。markRead 真实实现幂等，重试安全。
- * 发送态不抛 —— markRead 的发送失败只落 mail_actions、不阻断其余动作与 markProcessed。
+ * recordAction（活跃 retrying → SKIP 交给 drain）→ 单次调用内有界重试地调 provider.markRead → done；
+ * 发送态瞬时失败耗尽 → enqueueRetry(retrying)、**不抛**。markRead 真实实现幂等，重试安全。
+ * 发送态不抛 —— markRead 的发送失败只落 mail_actions（retrying）、不阻断其余动作与 markProcessed。
  * 注：updateAction('done') 仍在重试 try 内（与 executeNotify **有意**不对称——markRead 幂等，
  * done-写入失败时重试重标已读无害；notify 不幂等故其 done-写入移出 try）。repo 写入持久故障会
- * 经耗尽分支的 updateAction(failed) 向上传播 → processEmail at-least-once 重跑兜底。
+ * 经耗尽分支的 enqueueRetry/updateAction 向上传播 → processEmail at-least-once 重跑兜底。
  *
  * **致命错误通道**：同 executeReflectPriority——provider 抛 `ProviderReauthRequired` 时本作用域内
  * 置 failed(reauth kind)、不留 orphan pending，然后 re-throw（不当发送态瞬时失败吞掉）。
@@ -174,7 +194,14 @@ async function executeMarkRead(
   messageRowId: string,
   budget: BackoffBudget,
 ): Promise<void> {
-  const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.MarkRead);
+  // durable-retry：命中活跃 retrying 行 → drain 拥有它，SKIP 本轮内联执行（保留 durable 进度）。
+  const { actionRowId, disposition } = await deps.repo.recordAction(
+    messageRowId,
+    ActionType.MarkRead,
+  );
+  if (disposition === 'already-retrying') {
+    return;
+  }
   let lastError: unknown;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     try {
@@ -197,21 +224,29 @@ async function executeMarkRead(
   // ponytail: 假 provider 仅抛固定串，redactError 截断即可；接真实 IMAP/Gmail（P3/P4）时
   // markRead 异常 message 可能含账号/服务器 URL 片段，需与 notify 渠道同级脱敏（届时在 provider
   // 实现内做结构化脱敏，不改本期 seam）。
+  // 发送态瞬时失败耗尽：落 retrying（retryCount=0、nextRetryAt=now+backoff(0)、脱敏 error），
+  // 由 poll 内 drain 跨重启重试（markRead 幂等、无 staleness 上界）；**不**落终态 failed。
   const summary = redactError(lastError);
   logger.warn(
-    { kind: 'mark-read-failed', attempts: MAX_ATTEMPTS, error: summary },
-    '标已读动作重试耗尽，落 failed',
+    { kind: 'mark-read-retrying', attempts: MAX_ATTEMPTS, error: summary },
+    '标已读动作发送态重试耗尽，落 retrying 入 durable 队列',
   );
-  await deps.repo.updateAction(actionRowId, 'failed', summary);
+  await deps.repo.enqueueRetry(
+    actionRowId,
+    0,
+    new Date(Date.now() + durableBackoffMs(0)),
+    summary,
+  );
 }
 
 /**
  * 通知动作：仅当 decision.shouldNotifyNow 为 true 时调用。
- * recordAction(pending) → 调 notifier.notify（**不抛**、返回 NotifyResult）：
+ * recordAction（活跃 retrying → SKIP 交给 drain，不在 re-poll 内联重发）→ 调 notifier.notify
+ * （**不抛**、返回 NotifyResult）：
  *   - sent     → updateAction(done)。
  *   - skipped  → updateAction(skipped, reason)：**直接**落、不进重试循环、不计入重试预算。
- *   - failed   → 单次调用内有界重试地再调 notify；耗尽仍 failed → updateAction(failed, error)。
- * 发送态不抛 —— notify 的发送失败只落 mail_actions（failed/skipped）、不阻断 markProcessed。
+ *   - failed   → 单次调用内有界重试地再调 notify；耗尽仍 failed → enqueueRetry(retrying)（durable drain 兜底）。
+ * 发送态不抛 —— notify 的发送失败只落 mail_actions（retrying/skipped）、不阻断 markProcessed。
  * 但终态落库 updateAction 已移出重试 try：notify 成功后若 updateAction 自身抛（repo I/O 故障），
  * 该异常**向上传播**（不在同一调用内重发通知，保 spec「每次调用至多一条」），由 processEmail 的
  * at-least-once 重跑兜底（跨重跑 ≤1 重复，spec 已接受）。
@@ -223,7 +258,15 @@ async function executeNotify(
   messageRowId: string,
   budget: BackoffBudget,
 ): Promise<void> {
-  const actionRowId = await deps.repo.recordAction(messageRowId, ActionType.Notify);
+  // durable-retry：命中活跃 retrying 行 → drain 拥有它，SKIP 本轮内联重发（notify 非幂等，SKIP 对
+  // 三动作一致是不依赖幂等也不超额重发的关键——re-poll 不再内联补发，仅由 drain 服务）。
+  const { actionRowId, disposition } = await deps.repo.recordAction(
+    messageRowId,
+    ActionType.Notify,
+  );
+  if (disposition === 'already-retrying') {
+    return;
+  }
   let lastError = 'unknown error';
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
     // 只把 notify() 调用纳入 try：notify 契约为「不抛、返回 NotifyResult」，此 try 仅防御未来
@@ -257,11 +300,19 @@ async function executeNotify(
       await budget.backoff(attempt);
     }
   }
+  // 发送态瞬时失败耗尽：落 retrying（retryCount=0、nextRetryAt=now+backoff(0)、脱敏 error），
+  // 由 poll 内 drain 跨重启重试至成功 / 超 staleness / 死信（durable-retry 决策 2/3）；**不**落终态 failed
+  // （P0/P4 通知不再 at-most-once 永久丢失）。
   logger.warn(
-    { kind: 'notify-action-failed', attempts: MAX_ATTEMPTS, error: lastError },
-    '通知动作重试耗尽，落 failed',
+    { kind: 'notify-action-retrying', attempts: MAX_ATTEMPTS, error: lastError },
+    '通知动作发送态重试耗尽，落 retrying 入 durable 队列',
   );
-  await deps.repo.updateAction(actionRowId, 'failed', lastError);
+  await deps.repo.enqueueRetry(
+    actionRowId,
+    0,
+    new Date(Date.now() + durableBackoffMs(0)),
+    lastError,
+  );
 }
 
 /**

@@ -21,6 +21,10 @@ import { beforeEach, test } from 'node:test';
 
 import { pollOnce, type PollDeps } from './imapPoller.js';
 import { resetRulesConfigForTest } from '../../rules/rulesConfig.js';
+import type { Notifier, NotifyResult } from '../../notify/notifier.js';
+import type { FinalDecision } from '../../rules/finalDecision.js';
+import { ActionType } from '../../actions/actionTypes.js';
+import type { DrainDeadline } from '../../actions/retryQueue.js';
 
 // 隔离：每个用例对中性 reset 规则集（内置 security ∪ 空 vip/important/marketing/域名）跑，
 // 解耦于随仓发布的 rules/rules.yaml 内容（编辑样例不会静默打破这些集成测试）。
@@ -35,6 +39,7 @@ import type {
 } from './imapClient.js';
 import { InMemoryMailRepo } from '../../repo/inMemoryMailRepo.js';
 import { FakeProviderActions, type ProviderActions } from '../../actions/providerActions.js';
+import { ProviderReauthRequired } from '../provider.js';
 import { processEmail, type ClassifyFn } from '../../pipeline/processEmail.js';
 import { createNotifier } from '../../notify/notifier.js';
 import type { NotificationChannel } from '../../notify/notifier.js';
@@ -628,4 +633,229 @@ test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取�
   assert.equal(provider.markReadCalls.length, 2);
   // 游标推进过 15 → 5:15。
   assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:15');
+});
+
+// ——————————————————————————————————————————————————————————
+// durable-retry：折叠进 poll 的 drain（tasks 4.4）
+//
+// 一轮 pollOnce 处理新邮件后，在同一 live 连接 + 注入的 notifier 内排空该账号到期重试。
+// 经 PollDeps 新增的 notifier/clock/drainDeadline 注入 seam 驱动，全离线零真实等待。
+// ——————————————————————————————————————————————————————————
+
+/** 记录 notify 调用的假 Notifier（默认 sent；可配 failed）。断言 drain 经注入 notifier 重发 notify。 */
+function makeNotifierSpy(
+  outcome: NotifyResult = { outcome: 'sent', channel: 'fake' },
+): Notifier & { calls: Array<{ decision: FinalDecision; email: NormalizedEmail }> } {
+  const calls: Array<{ decision: FinalDecision; email: NormalizedEmail }> = [];
+  return {
+    calls,
+    async notify(decision: FinalDecision, email: NormalizedEmail): Promise<NotifyResult> {
+      calls.push({ decision, email });
+      return outcome;
+    },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'skipped', reason: 'no-channel' };
+    },
+  };
+}
+
+function makeFinalDecision(overrides: Partial<FinalDecision> = {}): FinalDecision {
+  return {
+    priority: 'P0',
+    category: 'work',
+    confidence: 0.9,
+    shouldNotifyNow: true,
+    shouldMarkRead: false,
+    shouldIncludeDigest: false,
+    reason: '测试',
+    riskFlags: [],
+    appliedRules: [],
+    ...overrides,
+  };
+}
+
+/**
+ * 播种一条「到期 retrying」动作：saveEmail（已 markProcessed）+ saveClassification（供 drain 重建
+ * 已存裁定）+ recordAction + enqueueRetry(retryCount=0, nextRetryAt=now)。返回 actionRowId + messageRowId。
+ * receivedAt 默认设为 now（避免 notify 误命中 staleness 上界）。
+ */
+async function seedDueRetry(
+  repo: InMemoryMailRepo,
+  actionType: typeof ActionType[keyof typeof ActionType],
+  opts: { providerMessageId?: string; receivedAt?: Date; decision?: FinalDecision } = {},
+): Promise<{ actionRowId: string; messageRowId: string }> {
+  const receivedAt = opts.receivedAt ?? new Date();
+  const providerMessageId = opts.providerMessageId ?? `retry-${actionType}`;
+  const stored = await repo.saveEmail({
+    accountId: ACCOUNT_ID,
+    provider: 'imap',
+    providerMessageId,
+    uid: 999,
+    subject: '到期重试主题',
+    fromName: '发件人',
+    fromEmail: 'sender@example.test',
+    to: ['me@example.com'],
+    date: receivedAt.toISOString(),
+    textBody: '正文',
+  });
+  await repo.markProcessed(stored.id);
+  const decision = opts.decision ?? makeFinalDecision();
+  await repo.saveClassification(stored.id, makeClassification(), decision);
+  const rec = await repo.recordAction(stored.id, actionType);
+  // 落 retrying，nextRetryAt = receivedAt（≤ now）→ 到期可被 drain 选中。
+  await repo.enqueueRetry(rec.actionRowId, 0, receivedAt, 'seed');
+  return { actionRowId: rec.actionRowId, messageRowId: stored.id };
+}
+
+test('drain（折叠进 poll）：一轮处理新邮件后排空该账号到期重试（经注入 notifier 重发 notify）', async () => {
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
+  conn.setMessage(fetched(10));
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  // 播种到期 retrying：一条 notify（→ 经 notifier 重发）、一条 mark_read（→ 经 provider 重发）。
+  const notifySeed = await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-notify' });
+  const markReadSeed = await seedDueRetry(repo, ActionType.MarkRead, { providerMessageId: 'r-markread' });
+
+  const deps: PollDeps = {
+    connection: conn,
+    repo,
+    makeProvider: () => provider,
+    notifier,
+    processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify }),
+  };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 新邮件先被处理（UID 10 进流水线）。
+  assert.equal(classify.calls.length, 1, '新邮件先处理');
+  // drain 重发 notify（经注入 notifier，账号无关）→ notify 动作落 done。
+  assert.equal(notifier.calls.length, 1, 'drain 经注入 notifier 重发到期 notify');
+  const notifyRow = repo.getActions(notifySeed.messageRowId).find((a) => a.id === notifySeed.actionRowId)!;
+  assert.equal(notifyRow.status, 'done', 'notify 重发 sent → done');
+  // drain 重发 mark_read（经 live 连接 provider）→ mark_read 动作落 done。
+  // 注：新邮件 UID 10（P2 shouldMarkRead）也标已读一次 → 此处 ≥ 2（含 drain 重发那次）。
+  assert.ok(provider.markReadCalls.length >= 1, 'drain 经 provider 重发到期 mark_read');
+  const markReadRow = repo.getActions(markReadSeed.messageRowId).find((a) => a.id === markReadSeed.actionRowId)!;
+  assert.equal(markReadRow.status, 'done', 'mark_read 重发成功 → done');
+});
+
+test('drain 抛 ProviderReauthRequired → 穿透 pollOnce 向上传播（驱动 scheduler suspend）', async () => {
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 }); // 无新邮件 → 仅 drain 跑。
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  // drain 重发 mark_read 时 provider.markRead 抛账号级致命 ProviderReauthRequired。
+  const reauthProvider: ProviderActions = {
+    async reflectPriority(): Promise<void> {},
+    async markRead(): Promise<void> {
+      throw new ProviderReauthRequired(ACCOUNT_ID, 'reauth-required');
+    },
+  };
+  await seedDueRetry(repo, ActionType.MarkRead, { providerMessageId: 'r-reauth' });
+
+  const deps: PollDeps = {
+    connection: conn,
+    repo,
+    makeProvider: () => reauthProvider,
+    notifier: makeNotifierSpy(),
+    processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify }),
+  };
+
+  // drain 的 reauth **必须穿透 pollOnce 向上传播**（不被吞）→ pollAccount/guard 据此 suspend 账号。
+  await assert.rejects(
+    pollOnce(ACCOUNT_ID, deps),
+    (err: unknown) => err instanceof ProviderReauthRequired && err.accountId === ACCOUNT_ID,
+  );
+});
+
+test('drain：账号 disabled → 自然不被调度、其重试暂停（pollOnce 不被调用 → 不 drain）', async () => {
+  // pollOnce 是「已被调度的一轮」入口；disabled/suspended 账号根本不进 scheduler 的 pollOnce
+  // （listEnabledAccounts 过滤），故其 retrying 自然暂停。这里直接断言：禁用账号不在可调度集，
+  // 故不会有 pollOnce 调用去 drain 它（重新 enable 后下轮 drain 续）。
+  const repo = await makeRepo();
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-disabled' });
+  await repo.setAccountEnabled(ACCOUNT_ID, false);
+
+  const enabled = await repo.listEnabledAccounts();
+  assert.equal(enabled.length, 0, '禁用账号不在可调度集 → 不进 pollOnce → 其 retrying 自然暂停');
+
+  // 该到期 retrying 仍在队列（未被 drain），待重新 enable 后下轮排空。
+  const due = await repo.selectDueRetries(ACCOUNT_ID, new Date(), 50);
+  assert.equal(due.length, 1, 'retrying 保持在队列（暂停、不丢失）');
+});
+
+test('drain 超软 deadline → 提前退出、不撑爆轮超时（剩余下轮续，经注入 deadline 零真实等待）', async () => {
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 11 });
+  conn.setMessage(fetched(10));
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  // 两条到期 notify。注入 deadline：首条前即超预算（elapsed 始终 ≥ budget）→ drain 一条都不发。
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-1' });
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-2' });
+  const exhaustedDeadline: DrainDeadline = { elapsedMs: () => 100, budgetMs: 1 };
+
+  const deps: PollDeps = {
+    connection: conn,
+    repo,
+    makeProvider: () => provider,
+    notifier,
+    drainDeadline: exhaustedDeadline,
+    processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify }),
+  };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 新邮件仍处理（drain 在其后）；超软 deadline → 一条到期 notify 都没发（剩余下轮续）。
+  assert.equal(classify.calls.length, 1, '新邮件不受 drain 软 deadline 影响');
+  assert.equal(notifier.calls.length, 0, '超软 deadline：本轮 drain 提前退出、不发任何到期项');
+  // 两条 retrying 仍在队列、未推进（下轮续）。
+  const due = await repo.selectDueRetries(ACCOUNT_ID, new Date(), 50);
+  assert.equal(due.length, 2, '剩余到期项保持 retrying、下轮续');
+});
+
+test('drain：三动作 sink 不读 to/headers（合成空值投影对 notify/markRead/reflectPriority 无影响）', async () => {
+  // 重建出的 NormalizedEmail 合成 to:[]、headers:{}（库中无）。本测试经真实 drain 路径断言三动作
+  // 都在合成空值下成功重发——即三 sink 都不读 to/headers。捕获 drain 传给 notifier 的 email 断言其
+  // to/headers 确为合成空值（且 notify 仍 sent）。
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 2 }); // 无新邮件（仅测 drain）。
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const provider = new FakeProviderActions();
+  const notifier = makeNotifierSpy();
+
+  await seedDueRetry(repo, ActionType.Notify, { providerMessageId: 'r-n' });
+  await seedDueRetry(repo, ActionType.MarkRead, { providerMessageId: 'r-m' });
+  await seedDueRetry(repo, ActionType.ReflectPriority, { providerMessageId: 'r-p' });
+
+  const deps: PollDeps = {
+    connection: conn,
+    repo,
+    makeProvider: () => provider,
+    notifier,
+    processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify }),
+  };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 三动作 sink 都被经合成空值的重建 email 调用且成功（drain 全部落 done）。
+  assert.equal(notifier.calls.length, 1, 'notify sink 经重建 email 重发');
+  // 合成空值断言：drain 传给 notify 的 email.to=[]、headers={}（库中无、合成）。
+  assert.deepEqual(notifier.calls[0]!.email.to, [], 'notify sink 收到合成 to:[]');
+  assert.deepEqual(notifier.calls[0]!.email.headers, {}, 'notify sink 收到合成 headers:{}');
+  assert.equal(provider.markReadCalls.length, 1, 'markRead sink 经重建 email 重发');
+  assert.deepEqual(provider.markReadCalls[0]!.to, [], 'markRead sink 收到合成 to:[]');
+  assert.deepEqual(provider.markReadCalls[0]!.headers, {}, 'markRead sink 收到合成 headers:{}');
+  assert.equal(provider.reflectPriorityCalls.length, 1, 'reflectPriority sink 经重建 email 重发');
+  assert.deepEqual(provider.reflectPriorityCalls[0]!.email.headers, {}, 'reflectPriority sink 收到合成 headers:{}');
+  // 三动作均落 done（不读 to/headers，合成空值不影响）。
+  for (const pmid of ['r-n', 'r-m', 'r-p']) {
+    const stored = (await repo.findByDedupKey(ACCOUNT_ID, pmid))!;
+    const rows = repo.getActions(stored.id);
+    assert.ok(rows.every((a) => a.status === 'done'), `${pmid} 动作落 done（合成空值不影响 sink）`);
+  }
 });

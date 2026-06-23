@@ -6,9 +6,12 @@
 // 覆盖（逐条对应 §3.2 intent）：
 //   - P0/P4（shouldMarkRead=false）→ reflectPriority 调、markRead 不调；
 //   - P2/P3（shouldMarkRead=true）→ 顺序 reflectPriority → markRead →（notify 仅 shouldNotifyNow）；
-//   - reflectPriority **发送态**失败（瞬时）→ 不阻断 markRead、不抛、仍记 failed；
+//   - 三动作**发送态**瞬时失败耗尽 → 不阻断其余、不抛、落 **retrying**（retryCount=0+nextRetryAt）而非
+//     终态 failed（durable-retry task 2.1/2.3）；
 //   - reflectPriority/markRead 抛 **ProviderReauthRequired** → executeActions 重抛、且 in-flight 行
-//     为 failed（非 orphan pending）；终态落库失败向上传播。
+//     为 failed（非 orphan pending、非 retrying）；终态落库失败向上传播。
+//   - 活跃行唯一性：已 retrying 行再 recordAction（模拟 re-poll 重跑）→ 命中同一行、保持 retrying、
+//     retryCount 不清零、executeActions SKIP 内联执行（durable 进度不被 re-poll 清零）。
 //   - 不接真实 provider/网络；不发送邮件。
 
 import assert from 'node:assert/strict';
@@ -173,10 +176,10 @@ test('P3（shouldMarkRead=true, shouldNotifyNow=true）→ 顺序 reflectPriorit
 });
 
 // ——————————————————————————————————————————————————————————
-// reflectPriority 发送态失败（瞬时）→ 不阻断 markRead、不抛、记 failed
+// reflectPriority 发送态瞬时失败耗尽 → 不阻断 markRead、不抛、落 retrying（durable-retry task 2.1/2.3）
 // ——————————————————————————————————————————————————————————
 
-test('reflectPriority 发送态失败（瞬时）→ 不阻断 markRead、不抛、reflect_priority 落 failed', async () => {
+test('reflectPriority 发送态瞬时失败耗尽 → 不阻断 markRead、不抛、reflect_priority 落 retrying（retryCount=0+nextRetryAt）', async () => {
   const repo = new InMemoryMailRepo();
   let markReadCalled = false;
   const provider: ProviderActions = {
@@ -191,17 +194,21 @@ test('reflectPriority 发送态失败（瞬时）→ 不阻断 markRead、不抛
   const email = makeEmail();
   const decision = makeDecision({ priority: 'P2', shouldMarkRead: true });
   const rowId = await seedRow(repo, email);
+  const before = Date.now();
 
   // 不抛。
   await executeActions(email, decision, rowId, { repo, provider, notifier });
 
   assert.ok(markReadCalled, 'reflectPriority 发送态失败不应阻断 markRead');
   const actions = repo.getActions(rowId);
-  assert.equal(
-    actions.find((a) => a.actionType === ActionType.ReflectPriority)?.status,
-    'failed',
-    'reflect_priority 瞬时失败落 failed',
-  );
+  const reflect = actions.find((a) => a.actionType === ActionType.ReflectPriority)!;
+  // 发送态瞬时耗尽落 retrying（durable-retry 决策 2）、**不**落终态 failed。
+  assert.equal(reflect.status, 'retrying', 'reflect_priority 瞬时耗尽落 retrying（非 failed）');
+  assert.notEqual(reflect.status, 'failed', '瞬时耗尽不得落终态 failed（否则永久丢失）');
+  // 首次入队 retryCount=0 + nextRetryAt 落库（now+backoff(0)=now+60s，非 null）。
+  assert.equal(reflect.retryCount, 0, '首次入队 retryCount=0');
+  assert.ok(reflect.nextRetryAt instanceof Date, 'nextRetryAt 应落库（非 null）');
+  assert.ok(reflect.nextRetryAt!.getTime() >= before, 'nextRetryAt 应为 now+backoff(0) 未来时刻');
   assert.equal(
     actions.find((a) => a.actionType === ActionType.MarkRead)?.status,
     'done',
@@ -209,7 +216,7 @@ test('reflectPriority 发送态失败（瞬时）→ 不阻断 markRead、不抛
   );
 });
 
-test('reflectPriority 发送态失败摘要脱敏、不含正文', async () => {
+test('reflectPriority 发送态瞬时耗尽摘要脱敏、不含正文（落 retrying 行的 error）', async () => {
   const repo = new InMemoryMailRepo();
   const provider: ProviderActions = {
     async reflectPriority(): Promise<void> {
@@ -225,7 +232,7 @@ test('reflectPriority 发送态失败摘要脱敏、不含正文', async () => {
   await executeActions(email, decision, rowId, { repo, provider, notifier });
 
   const reflect = repo.getActions(rowId).find((a) => a.actionType === ActionType.ReflectPriority)!;
-  assert.equal(reflect.status, 'failed');
+  assert.equal(reflect.status, 'retrying');
   assert.ok(!(reflect.error ?? '').includes('SENTINEL_BODY'), 'error 摘要不应含正文');
 });
 
@@ -367,11 +374,11 @@ test('单封总退避有上限（动作份额 ≤~750ms）：三动作全失败�
   assert.ok(totalBackoff <= 750, `单封动作退避总和应 ≤~750ms，实际 ${totalBackoff}`);
   // 每次退避 ≤500ms。
   assert.ok(sleep.calls.every((ms) => ms <= 500), '每次退避 ≤500ms');
-  // 三动作均耗尽落 failed（退避延迟本封但不跳过其余动作）。
+  // 三动作均发送态耗尽落 retrying（durable-retry 决策 2；退避延迟本封但不跳过其余动作）、非终态 failed。
   const actions = repo.getActions(rowId);
-  assert.equal(actions.find((a) => a.actionType === ActionType.ReflectPriority)?.status, 'failed');
-  assert.equal(actions.find((a) => a.actionType === ActionType.MarkRead)?.status, 'failed');
-  assert.equal(actions.find((a) => a.actionType === ActionType.Notify)?.status, 'failed');
+  assert.equal(actions.find((a) => a.actionType === ActionType.ReflectPriority)?.status, 'retrying');
+  assert.equal(actions.find((a) => a.actionType === ActionType.MarkRead)?.status, 'retrying');
+  assert.equal(actions.find((a) => a.actionType === ActionType.Notify)?.status, 'retrying');
   // 预算耗尽后退避降为 0，但后续动作仍照常发起（不跳过）——三动作行齐全即证。
   assert.equal(actions.length, 3, '退避不跳过该封其余动作');
 });
@@ -430,19 +437,33 @@ test('无渠道降级（notify skipped）→ 不退避、不消耗预算', async
   );
 });
 
-test('reflect_priority 终态落库持久失败（updateAction 全抛）→ 向上传播、markRead 不发起', async () => {
+test('reflect_priority 落库持久失败（updateAction/enqueueRetry 全抛）→ 向上传播、markRead 不发起', async () => {
   class ThrowOnReflectUpdateRepo extends InMemoryMailRepo {
     async updateAction(
       id: string,
-      status: 'done' | 'failed' | 'skipped',
+      status: 'done' | 'failed' | 'skipped' | 'dead_letter',
       error?: string,
     ): Promise<void> {
-      // reflect_priority 的任何终态写入都抛（模拟持久 DB I/O 故障）。
+      // reflect_priority 的任何 done 写入都抛（模拟持久 DB I/O 故障）。
       const row = this.actions.find((a) => a.id === id);
       if (row?.actionType === ActionType.ReflectPriority) {
         throw new Error('fake DB write failure');
       }
       return super.updateAction(id, status, error);
+    }
+    async enqueueRetry(
+      id: string,
+      retryCount: number,
+      nextRetryAt: Date,
+      error?: string,
+    ): Promise<void> {
+      // 发送态耗尽落 retrying 也是 repo 写入：reflect_priority 的终态/中间态落库持久故障同样向上传播
+      // （repo-I/O 传播通道不变，durable-retry 决策 2）。
+      const row = this.actions.find((a) => a.id === id);
+      if (row?.actionType === ActionType.ReflectPriority) {
+        throw new Error('fake DB write failure');
+      }
+      return super.enqueueRetry(id, retryCount, nextRetryAt, error);
     }
   }
   const repo = new ThrowOnReflectUpdateRepo();
@@ -460,4 +481,114 @@ test('reflect_priority 终态落库持久失败（updateAction 全抛）→ 向�
   // 在重试 try 内被当作瞬时失败重试（动作幂等、重打无害），故可能被调多次、但绝不到 markRead。
   assert.ok(provider.calls.every((c) => c === 'reflectPriority'), '只应调 reflectPriority、不到 markRead');
   assert.ok(!provider.calls.includes('markRead'), '终态落库故障后不应发起 markRead');
+});
+
+// ——————————————————————————————————————————————————————————
+// durable-retry task 2.3：notify 发送态瞬时耗尽落 retrying（非终态 failed）
+// ——————————————————————————————————————————————————————————
+
+test('notify 发送态瞬时耗尽 → 落 retrying（retryCount=0+nextRetryAt）、不落 failed', async () => {
+  const repo = new InMemoryMailRepo();
+  const provider = makeOrderedProvider();
+  // 通知器永远 failed（纳入有界重试，耗尽落 retrying）。
+  const notifier: Notifier = {
+    async notify(): Promise<NotifyResult> {
+      return { outcome: 'failed', channel: 'fake', error: 'telegram 5xx' };
+    },
+    async notifyDigest(): Promise<NotifyResult> {
+      return { outcome: 'sent', channel: 'fake' };
+    },
+  };
+  const sleep = makeSleepSpy();
+  const email = makeEmail();
+  // P0 通知：shouldNotifyNow=true、shouldMarkRead=false（仅 reflect + notify）。
+  const decision = makeDecision({ priority: 'P0', shouldMarkRead: false, shouldNotifyNow: true });
+  const rowId = await seedRow(repo, email);
+  const before = Date.now();
+
+  await executeActions(email, decision, rowId, { repo, provider, notifier, sleep });
+
+  const notify = repo.getActions(rowId).find((a) => a.actionType === ActionType.Notify)!;
+  assert.equal(notify.status, 'retrying', 'notify 瞬时耗尽落 retrying（durable drain 兜底，非 at-most-once 丢失）');
+  assert.notEqual(notify.status, 'failed', '瞬时耗尽不得落终态 failed');
+  assert.equal(notify.retryCount, 0, '首次入队 retryCount=0');
+  assert.ok(notify.nextRetryAt instanceof Date, 'nextRetryAt 应落库（非 null）');
+  assert.ok(notify.nextRetryAt!.getTime() >= before, 'nextRetryAt 应为未来时刻');
+});
+
+// ——————————————————————————————————————————————————————————
+// durable-retry task 2.3：reauth 仍 failed + re-throw、**不入 retrying**
+// ——————————————————————————————————————————————————————————
+
+test('reflectPriority 抛 ProviderReauthRequired → 行 failed、**非 retrying**（致命通道不入 durable 队列）', async () => {
+  const repo = new InMemoryMailRepo();
+  const provider: ProviderActions = {
+    async reflectPriority(): Promise<void> {
+      throw new ProviderReauthRequired('acct-1');
+    },
+    async markRead(): Promise<void> {},
+  };
+  const notifier = makeSentNotifier();
+  const email = makeEmail();
+  const decision = makeDecision({ priority: 'P2', shouldMarkRead: true });
+  const rowId = await seedRow(repo, email);
+
+  await assert.rejects(
+    executeActions(email, decision, rowId, { repo, provider, notifier }),
+    (err: unknown) => err instanceof ProviderReauthRequired,
+  );
+
+  const reflect = repo.getActions(rowId).find((a) => a.actionType === ActionType.ReflectPriority)!;
+  assert.equal(reflect.status, 'failed', 'reauth 仍落终态 failed');
+  assert.notEqual(reflect.status, 'retrying', 'reauth 致命通道**禁止**入 retrying');
+  assert.equal(reflect.nextRetryAt, null, 'failed 行不应有 nextRetryAt');
+});
+
+// ——————————————————————————————————————————————————————————
+// durable-retry task 2.3：活跃行唯一性 + 进度不清零（re-poll 重跑命中同一 retrying 行、SKIP 内联执行）
+// ——————————————————————————————————————————————————————————
+
+test('reflectPriority 已 retrying(retryCount=3) → re-poll 重跑 recordAction 命中同一行、保持 retrying、retryCount 仍 3、executeActions SKIP 内联执行', async () => {
+  const repo = new InMemoryMailRepo();
+  const email = makeEmail();
+  const decision = makeDecision({ priority: 'P2', shouldMarkRead: false, shouldNotifyNow: false });
+  const rowId = await seedRow(repo, email);
+
+  // 先模拟该 reflect_priority 已被 drain 推进到 retryCount=3（落 retrying）。
+  const { actionRowId } = await repo.recordAction(rowId, ActionType.ReflectPriority);
+  const drainNextRetryAt = new Date('2099-01-01T00:00:00.000Z'); // 远期、断言不被清零
+  await repo.enqueueRetry(actionRowId, 3, drainNextRetryAt, 'drain transient');
+
+  // 再模拟 re-poll 整条重跑 executeActions：provider 若被调到即失败（断言 SKIP 后不应内联执行）。
+  let reflectCalled = false;
+  const provider: ProviderActions = {
+    async reflectPriority(): Promise<void> {
+      reflectCalled = true;
+      throw new Error('内联执行不应发生：drain 拥有该 retrying 行');
+    },
+    async markRead(): Promise<void> {},
+  };
+  const notifier = makeSentNotifier();
+
+  // 不抛（SKIP 直接 return、不进入执行/退避路径）。
+  await executeActions(email, decision, rowId, { repo, provider, notifier });
+
+  // SKIP：内联 provider.reflectPriority 未被调。
+  assert.equal(reflectCalled, false, 'executeActions 应 SKIP 内联执行（drain 拥有 retrying 行）');
+
+  // 至多一条活跃行：该 (messageId, reflectPriority) 仍是同一行、未新建第二条。
+  const reflectRows = repo
+    .getActions(rowId)
+    .filter((a) => a.actionType === ActionType.ReflectPriority);
+  assert.equal(reflectRows.length, 1, '不得新建第二条活跃行（partial unique index + upsert）');
+  const row = reflectRows[0]!;
+  // 命中同一行、保持 retrying、retryCount 仍 3（不被 re-poll 的 recordAction 清零）。
+  assert.equal(row.id, actionRowId, '命中同一行（upsert 活跃 retrying）');
+  assert.equal(row.status, 'retrying', '保持 retrying 原样');
+  assert.equal(row.retryCount, 3, 'durable 进度不被 re-poll 清零（retryCount 仍 3）');
+  assert.equal(
+    row.nextRetryAt?.getTime(),
+    drainNextRetryAt.getTime(),
+    'nextRetryAt 不被清零（保留 drain 进度）',
+  );
 });
