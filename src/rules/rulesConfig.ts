@@ -31,15 +31,16 @@ import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 type WarnSink = { warn: (obj: Record<string, unknown>, msg: string) => void };
 let logSink: WarnSink = { warn: (obj, msg) => logger.warn(obj, msg) };
 
-/** 五类可配置名单的有效快照（getActiveRules 返回此形状的 ref）。 */
+/** 五类可配置名单的有效快照（getActiveRules 返回此形状的 ref；属性 + 数组皆 readonly 并 Object.freeze，
+ *  防消费者经重赋值/强转改动这个全局安全策略快照——见 assembleActive 的冻结）。 */
 export type ActiveRules = {
   /** 有效集 = 整个内置 SECURITY_PAYMENT_KEYWORDS ∪ YAML（只增不减）。 */
-  securityKeywords: readonly string[];
+  readonly securityKeywords: readonly string[];
   /** 可选、非决定性域名轴；内置默认空（项目不维护域名白名单）。 */
-  neverMarkReadDomains: readonly string[];
-  vipSenders: readonly string[];
-  importantDomains: readonly string[];
-  marketingKeywords: readonly string[];
+  readonly neverMarkReadDomains: readonly string[];
+  readonly vipSenders: readonly string[];
+  readonly importantDomains: readonly string[];
+  readonly marketingKeywords: readonly string[];
 };
 
 // rules.yaml 默认路径（仓库根 rules/rules.yaml），可经 env RULES_FILE 覆盖。
@@ -103,13 +104,15 @@ function builtinLastValid(): LastValid {
 
 /** 由 LastValid 装配出对外的 ActiveRules（security 与内置整集求并集）。 */
 function assembleActive(last: LastValid): ActiveRules {
-  return {
-    securityKeywords: unionSecurity(last.securityYaml),
-    neverMarkReadDomains: last.neverMarkReadDomains,
-    vipSenders: last.vipSenders,
-    importantDomains: last.importantDomains,
-    marketingKeywords: last.marketingKeywords,
-  };
+  // 深冻结：消费者拿到的快照（及每个数组）不可变——防经重赋值/强转污染这个驱动「不标已读」裁定的全局策略。
+  // 单一工厂处冻结即覆盖全部赋值点（同步初始化 / publish / resetForTest）。数组皆复制后冻结，不动 LastValid 的 carry-forward 内部数组。
+  return Object.freeze({
+    securityKeywords: Object.freeze(unionSecurity(last.securityYaml)),
+    neverMarkReadDomains: Object.freeze([...last.neverMarkReadDomains]),
+    vipSenders: Object.freeze([...last.vipSenders]),
+    importantDomains: Object.freeze([...last.importantDomains]),
+    marketingKeywords: Object.freeze([...last.marketingKeywords]),
+  });
 }
 
 /** security 整集并集：整个内置常量 ∪ YAML（去重、保持确定顺序：内置在前、YAML 新增在后）。 */
