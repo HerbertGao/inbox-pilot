@@ -437,7 +437,11 @@ test('reauth 包进 .cause 仍被穿透重抛（防御性 unwrap）', async () =
     },
     async markRead(): Promise<void> {},
   };
-  await assert.rejects(drainAccountRetries(ACCOUNT_ID, makeDeps(repo, { provider: wrappedReauth })));
+  // 必须重抛**unwrap 后的** ProviderReauthRequired（非外层 wrapper）——否则上游 instanceof 漏判、不 suspend。
+  await assert.rejects(
+    drainAccountRetries(ACCOUNT_ID, makeDeps(repo, { provider: wrappedReauth })),
+    (err: unknown) => err instanceof ProviderReauthRequired && err.accountId === ACCOUNT_ID,
+  );
   // 当前行保持 retrying（不被当瞬时失败推进）。
   const row = findAction(repo, id);
   assert.equal(row.status, ActionStatus.Retrying);

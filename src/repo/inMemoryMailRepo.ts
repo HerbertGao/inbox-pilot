@@ -319,6 +319,8 @@ export class InMemoryMailRepo implements MailRepo {
     }
     row.status = status;
     row.error = error ?? null;
+    // 离开 retrying 落终态：清空 nextRetryAt（维持「仅 retrying 行有 nextRetryAt」不变量，与 prisma 一致）。
+    row.nextRetryAt = null;
   }
 
   async enqueueRetry(

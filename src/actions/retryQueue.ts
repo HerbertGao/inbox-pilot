@@ -36,9 +36,7 @@ import {
   NOTIFY_STALENESS_MS,
   DRAIN_BATCH_CAP,
 } from './retryConstants.js';
-
-/** 脱敏 error 摘要上限（与 executeActions 同值）：截断为短摘要，禁含 token / chat_id / 正文。 */
-const ERROR_SUMMARY_MAX = 200;
+import { redactError } from './redactError.js';
 
 /**
  * drain 软 deadline seam（决策 6 ponytail：用**单调 elapsed**，不在 drain 内取 `Date.now`，以保可测）。
@@ -72,30 +70,17 @@ export type DrainDeps = {
 };
 
 /**
- * 把抛出的未知错误脱敏为短摘要（与 executeActions.redactError 同语义）：只取 message（或 String(err)）
- * 并截断。禁含 token / chat_id / 正文——provider/notifier 的 error 本就只是传输层摘要，这里再截断兜底。
- */
-function redactError(err: unknown): string {
-  const raw =
-    err instanceof Error
-      ? err.message
-      : typeof err === 'string'
-        ? err
-        : 'unknown error';
-  return raw.length > ERROR_SUMMARY_MAX ? raw.slice(0, ERROR_SUMMARY_MAX) : raw;
-}
-
-/**
- * 判别一个抛出的错误是否（最终）是 `ProviderReauthRequired`（决策 6 不变量）：
+ * 从一个抛出的错误里取出**展开后的** `ProviderReauthRequired`（决策 6 不变量），无则 null：
  * `instanceof` 充分**当且仅当**各 sink 裸抛 reauth（现 provider.ts 构造时无 cause、notifier 不抛 reauth）；
- * 防御性地 unwrap 一层 `.cause`（防未来 sink 包裹 reauth 致逐条隔离失效）。
+ * 防御性地 unwrap 一层 `.cause`（防未来 sink 包裹 reauth）。**返回展开后的实例**而非布尔——使调用方
+ * **重抛 unwrap 后的 reauth**，否则上游 `instanceof ProviderReauthRequired` 会漏判被包装的 reauth → 不 suspend。
  */
-function isReauthError(err: unknown): err is ProviderReauthRequired {
+function unwrapReauthError(err: unknown): ProviderReauthRequired | null {
   if (err instanceof ProviderReauthRequired) {
-    return true;
+    return err;
   }
   const cause = (err as { cause?: unknown } | null | undefined)?.cause;
-  return cause instanceof ProviderReauthRequired;
+  return cause instanceof ProviderReauthRequired ? cause : null;
 }
 
 /** 重建成功（rebuild.ok===true）的到期重试动作——drain 据此复发原动作（email/decision 已就绪）。 */
@@ -265,10 +250,12 @@ export async function drainAccountRetries(
       await redispatch(action as RebuiltAction, deps);
       redispatched = true;
     } catch (err) {
-      // reauth：穿透逐条隔离重抛（停本账号本轮 drain）——当前行**保持 retrying**（不推进 retryCount、
-      // 不进死信），其后未试行不动；账号级失败沿 poll → scheduler 传播触发 suspend。
-      if (isReauthError(err)) {
-        throw err;
+      // reauth：穿透逐条隔离**重抛 unwrap 后的 reauth**（停本账号本轮 drain）——当前行**保持 retrying**
+      // （不推进 retryCount、不进死信），其后未试行不动；账号级失败沿 poll → scheduler 传播触发 suspend。
+      // 重抛 unwrap 后的实例（非外层包装）：保证上游 `instanceof ProviderReauthRequired` 命中（决策 6 不变量）。
+      const reauth = unwrapReauthError(err);
+      if (reauth !== null) {
+        throw reauth;
       }
       // 普通瞬时失败：逐条隔离（不阻断同账号其余 drain），按瞬时失败推进 retryCount/nextRetryAt（或死信）。
       await advanceTransientFailure(action, redactError(err), deps);

@@ -30,15 +30,13 @@ import { ActionType } from './actionTypes.js';
 import type { ProviderActions } from './providerActions.js';
 import { ProviderReauthRequired } from '../providers/provider.js';
 import { durableBackoffMs } from './retryConstants.js';
+import { redactError } from './redactError.js';
 
 /**
  * 单次 executeActions 调用内每个动作的尝试上限（含首次）。小常数、禁无限。
  * 内存计数器、不落 retryCount 列、不跨重启累计（durable 跨重启重试预算属 P6）。
  */
 const MAX_ATTEMPTS = 3;
-
-/** 脱敏 error 摘要上限：截断为短摘要，禁含 token / chat_id / 正文。 */
-const ERROR_SUMMARY_MAX = 200;
 
 /**
  * 退避参数（组 C 决策 5「有紧上限的指数退避」）：
@@ -101,20 +99,6 @@ export type ExecuteActionsDeps = {
 };
 
 /**
- * 把抛出的未知错误脱敏为短摘要：只取 message（或 String(err)）并截断。
- * 禁含 token / chat_id / 正文 —— provider/notifier 的 error 本就只是传输层摘要，这里再截断兜底。
- */
-function redactError(err: unknown): string {
-  const raw =
-    err instanceof Error
-      ? err.message
-      : typeof err === 'string'
-        ? err
-        : 'unknown error';
-  return raw.length > ERROR_SUMMARY_MAX ? raw.slice(0, ERROR_SUMMARY_MAX) : raw;
-}
-
-/**
  * 优先级落地动作：**始终**被 executeActions 调用（标签是分类可见性、不被 shouldMarkRead 门控）。
  * recordAction（活跃 retrying → SKIP 交给 drain）→ 单次调用内有界重试地调 provider.reflectPriority → done；
  * 发送态瞬时失败耗尽 → enqueueRetry(retrying, retryCount=0, nextRetryAt)、**不抛**（durable drain 跨重启兜底，
@@ -155,7 +139,7 @@ async function executeReflectPriority(
         throw err;
       }
       lastError = err;
-      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（reflectPriority 幂等，重试安全）；耗尽后落 failed、不抛。
+      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（reflectPriority 幂等，重试安全）；耗尽后落 retrying（durable drain 兜底）、不抛。
       if (attempt < MAX_ATTEMPTS) {
         await budget.backoff(attempt);
       }
@@ -215,7 +199,7 @@ async function executeMarkRead(
         throw err;
       }
       lastError = err;
-      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（标已读幂等，重试安全）；耗尽后落 failed、不抛。
+      // 发送态瞬时失败：退避（除最后一次尝试外）后继续（标已读幂等，重试安全）；耗尽后落 retrying（durable drain 兜底）、不抛。
       if (attempt < MAX_ATTEMPTS) {
         await budget.backoff(attempt);
       }

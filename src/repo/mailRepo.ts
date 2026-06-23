@@ -698,7 +698,9 @@ export class PrismaMailRepo implements MailRepo {
   ): Promise<void> {
     await prisma.mailAction.update({
       where: { id: actionRowId },
-      data: { status, error: error ?? null },
+      // 离开 retrying 落终态：清空 nextRetryAt（维持「仅 retrying 行有 nextRetryAt」不变量；终态行残留时间戳虽
+      // 不被 selectDueRetries 选中、但清掉更干净，与 markActionDeadLetter 一致）。
+      data: { status, error: error ?? null, nextRetryAt: null },
     });
   }
 
