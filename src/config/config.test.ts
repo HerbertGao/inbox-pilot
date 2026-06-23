@@ -35,18 +35,28 @@ test('configSchema：缺 DATABASE_URL → safeParse 失败（P0 不变量）', (
 });
 
 test('configSchema：显式指向 api.openai.com → 拒绝（硬约束：仅经 OpenRouter）', () => {
-  for (const u of ['http://api.openai.com', 'https://api.openai.com/v1', 'https://API.OpenAI.com']) {
+  for (const u of [
+    'http://api.openai.com',
+    'https://api.openai.com/v1',
+    'https://API.OpenAI.com',
+    'https://openai.com/v1', // 裸根域
+    'https://chat.openai.com/v1', // 任意子域
+    'https://api.openai.com:8443/v1', // 非默认端口不得逃逸（host 含 :8443 会漏判，须用 hostname）
+    'https://api.openai.com:80/v1',
+  ]) {
     const result = configSchema.safeParse({ DATABASE_URL: DB, OPENROUTER_BASE_URL: u });
     assert.equal(result.success, false, `应拒绝 openai.com host: ${u}`);
   }
 });
 
-test('configSchema：OpenRouter 兼容代理 / 自建网关 URL → 接受（不强绑 openrouter.ai）', () => {
-  const result = configSchema.parse({
-    DATABASE_URL: DB,
-    OPENROUTER_BASE_URL: 'https://my-proxy.example.com/v1',
-  });
-  assert.equal(result.OPENROUTER_BASE_URL, 'https://my-proxy.example.com/v1');
+test('configSchema：OpenRouter 兼容代理 / 自建网关 / openai.com 仿冒域 → 接受（不强绑 openrouter.ai、不误拒 lookalike）', () => {
+  for (const u of [
+    'https://my-proxy.example.com/v1',
+    'https://notopenai.com/v1', // 仿冒域：endsWith('openai.com') 会误命中，hostname 精确判定不应拒绝
+  ]) {
+    const result = configSchema.parse({ DATABASE_URL: DB, OPENROUTER_BASE_URL: u });
+    assert.equal(result.OPENROUTER_BASE_URL, u);
+  }
 });
 
 // ── POLL_INTERVAL_SECONDS：空串/省略 → 默认 180，显式值 → coerce ──

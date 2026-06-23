@@ -19,7 +19,11 @@ const emptyToUndefined = (v: unknown) => (v === '' ? undefined : v);
 // 仅拒 openai.com host，不强绑 openrouter.ai——保留 OpenRouter 兼容代理 / 自建网关的合法用法。
 const isOpenAiHost = (v: string): boolean => {
   try {
-    return new URL(v).host.toLowerCase().endsWith('openai.com');
+    // 用 hostname（已剥端口）精确判定：== openai.com 或其子域 *.openai.com。
+    // 不用 host（含非默认端口：api.openai.com:8443 的 host 末尾是 ':8443'，endsWith('openai.com')
+    // 漏判 → 逃逸），也不用裸 endsWith 子串（notopenai.com 会误命中 → 过度拒绝）。
+    const hostname = new URL(v).hostname.toLowerCase();
+    return hostname === 'openai.com' || hostname.endsWith('.openai.com');
   } catch {
     return false;
   }
