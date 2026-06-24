@@ -418,7 +418,7 @@ test('InMemory createAccount 播种 processFrom = 接入瞬时（new Date()）',
   const row = await repo.getAccountById('imap:u@h');
   assert.ok(row?.processFrom instanceof Date, 'createAccount seed 出 Date（非 NULL）');
   const t = row!.processFrom!.getTime();
-  // 精确瞬时（new Date()）：落在 create 调用前后的 wall-clock 窗口内；非 UTC 零点。
+  // 精确瞬时（new Date()）：落在 create 调用前后的 wall-clock 窗口内；非容器时区零点。
   assert.ok(t >= before && t <= after, 'processFrom 为接入瞬时、落在调用窗口内');
 });
 

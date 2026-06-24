@@ -15,6 +15,8 @@
     "account": "tsx src/cli/account.ts",
     "build": "tsc",
     "test": "tsx --test 'src/**/*.test.ts'",
+    "test:tz": "TZ=Asia/Shanghai tsx --test 'src/cli/processFromDate.test.ts' 'src/cli/account.test.ts'",
+    "test:tz-utc": "TZ=UTC tsx --test 'src/cli/processFromDate.test.ts' 'src/cli/account.test.ts'",
     "start": "node dist/main.js",
     "postinstall": "prisma generate",
     "migrate": "prisma migrate dev",

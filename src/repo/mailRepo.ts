@@ -602,8 +602,8 @@ export class PrismaMailRepo implements MailRepo {
         email: input.email,
         authJson,
         enabled,
-        // 行创建分支播种水位线：显式 --process-from（UTC 零点）优先，否则默认**精确瞬时** new Date()
-        // （onboarding-watermark；UTC 零点仅用于 date-string，避免默认 seed 凭空提前 ≤24h）。
+        // 行创建分支播种水位线：显式 --process-from（容器时区零点）优先，否则默认**精确瞬时** new Date()
+        // （onboarding-watermark；容器时区零点仅用于 date-string，避免默认 seed 凭空提前 ≤24h）。
         processFrom: input.processFrom ?? new Date(),
       },
       // 同邮箱重加 / re-auth：更新凭据/email/enabled（命中同一行、不分裂）。
