@@ -28,6 +28,7 @@ import {
   type StoredAccount,
   type StoredEmail,
 } from './mailRepo.js';
+import { passesWatermark } from './watermark.js';
 
 /** 内存邮件行（保留去重键以支持 findByDedupKey / saveEmail 幂等）。 */
 type EmailRow = {
@@ -79,6 +80,8 @@ type AccountRow = {
   email: string;
   authJson: unknown;
   enabled: boolean;
+  /** 起算日期水位线（onboarding-watermark；NULL = 不设下界）。镜像 StoredAccount.processFrom。 */
+  processFrom: Date | null;
 };
 
 export class InMemoryMailRepo implements MailRepo {
@@ -137,6 +140,12 @@ export class InMemoryMailRepo implements MailRepo {
   }
 
   async upsertAccount(input: AccountWriteInput): Promise<void> {
+    // 水位线 get-before-set（onboarding-watermark 决策 7，顺序 load-bearing）：读必须先于下面的 .set，
+    // 因 .set 会整行替换、clobber 既有 processFrom。existing 存在（update/re-auth）⇒ 保留 existing.processFrom、
+    // **忽略 input**（Prisma 经省略字段达成相同语义）；不存在（create）⇒ input.processFrom ?? 精确瞬时。
+    const existing = this.accountsById.get(input.id);
+    const processFrom =
+      existing !== undefined ? existing.processFrom : input.processFrom ?? new Date();
     // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
     this.accountsById.set(input.id, {
       id: input.id,
@@ -144,6 +153,7 @@ export class InMemoryMailRepo implements MailRepo {
       email: input.email,
       authJson: input.authJson,
       enabled: input.enabled ?? true,
+      processFrom,
     });
     // 写入路径即「播种」游标命名空间（取代旧 ensureAccountAnchor）；幂等：已存不重置游标。
     if (!this.cursorsByAccountId.has(input.id)) {
@@ -165,6 +175,15 @@ export class InMemoryMailRepo implements MailRepo {
       throw new Error(`InMemoryMailRepo.setAccountEnabled: 未知 accountId ${id}`);
     }
     row.enabled = enabled;
+  }
+
+  async setProcessFrom(id: string, date: Date): Promise<void> {
+    // 无条件覆盖既有水位线（onboarding-watermark：唯一改既有行 processFrom 的路径，与 prisma 一致）。
+    const row = this.accountsById.get(id);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.setProcessFrom: 未知 accountId ${id}`);
+    }
+    row.processFrom = date;
   }
 
   async getCursor(accountId: string): Promise<string | null> {
@@ -480,6 +499,13 @@ export class InMemoryMailRepo implements MailRepo {
       ) {
         continue;
       }
+      // 水位线下界（onboarding-watermark 决策 9，与 prisma 同一谓词）：排除 receivedAt < 该账号 processFrom
+      // 的接入前历史积压；NULL 或账号缺失（accountsById 无此行）⇒ undefined ⇒ passesWatermark 放行。
+      // prisma 用 MailMessage.receivedAt = new Date(email.date)；内存镜像同一映射。
+      const receivedAt = new Date(row.email.date);
+      if (!passesWatermark(receivedAt, this.accountsById.get(row.accountId)?.processFrom)) {
+        continue;
+      }
       const latest = this.getLatestClassification(row.id);
       if (latest === null) {
         logger.debug(
@@ -504,8 +530,8 @@ export class InMemoryMailRepo implements MailRepo {
         fromEmail: email.fromEmail,
         ...(email.fromName !== undefined ? { fromName: email.fromName } : {}),
         reason: latest.reason,
-        // prisma 用 MailMessage.receivedAt = new Date(email.date)；内存镜像同一映射。
-        receivedAt: new Date(email.date),
+        // 复用上面水位线判定算出的 receivedAt（= new Date(email.date)，与 prisma MailMessage.receivedAt 一致）。
+        receivedAt,
         id: row.id,
       });
     }

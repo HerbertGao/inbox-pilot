@@ -60,8 +60,10 @@ export type ImapConnection = {
 
   /**
    * 按给定 IMAP SEARCH 条件检索，返回命中的 **UID 列表**（按服务器返回，poller 自行升序排序）。
-   * - 退化轮（首轮 / UIDVALIDITY 变化）：`{ seen: false }` → SEARCH UNSEEN（当前未读积压）。
+   * - 退化轮（首轮 / UIDVALIDITY 变化）：`{ seen: false }` → SEARCH UNSEEN（当前未读积压）；
+   *   `processFrom` 非空时 `{ seen: false, since }` → SEARCH `UNSEEN SINCE`（合取日期下界）。
    * - 增量轮：`{ uid: '<游标+1>:*' }` → SEARCH `UID 游标+1:*`（不带 seen 过滤，保崩溃重取）。
+   * - `{ uid: '1:*' }`：退化轮空集且 UIDNEXT 缺失时取邮箱现有最大 UID（design 决策 8）。
    * 空结果集返回 `[]`。
    */
   search(criteria: ImapSearchCriteria): Promise<number[]>;
@@ -83,11 +85,13 @@ export type ImapConnection = {
 
 /**
  * search 条件（窄化的 imapflow SearchObject 子集，poller 只用到两种形态）。
- * - `{ seen: false }`：SEARCH UNSEEN（退化轮）。
- * - `{ uid: '<lo>:*' }`：SEARCH `UID <lo>:*`（增量轮，含崩溃重取）。
+ * - `{ seen: false, since? }`：SEARCH UNSEEN（退化轮）；`since` 非空时与 UNSEEN **合取**
+ *   （`UNSEEN AND SINCE`，按 INTERNALDATE 粗粒度日期下界，design 决策 5）——`since` **不**替换
+ *   `seen`，否则会丢 UNSEEN 过滤摄入已读旧邮件。
+ * - `{ uid: '<lo>:*' }`：SEARCH `UID <lo>:*`（增量轮，含崩溃重取；不带日期下界）。
  */
 export type ImapSearchCriteria =
-  | { seen: false }
+  | { seen: false; since?: Date }
   | { uid: string };
 
 /** FETCH 时请求的字段（envelope + text/plain 正文）；poller 与真身实现共用。 */

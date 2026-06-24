@@ -93,7 +93,8 @@ function parseImap(row: StoredAccount, authJson: Record<string, unknown>): Accou
   }
   const port = typeof authJson.port === 'number' && Number.isFinite(authJson.port) ? authJson.port : 993;
   const tls = typeof authJson.tls === 'boolean' ? authJson.tls : true;
-  const imap: ImapAccount = { accountId: row.id, host, port, user, password, tls };
+  // processFrom 显式枚举进字面量（本字面量非 `...row` 展开，不写则下游 spread 凭空丢失水位线）。
+  const imap: ImapAccount = { accountId: row.id, host, port, user, password, tls, processFrom: row.processFrom };
   return { provider: 'imap', ...imap };
 }
 
@@ -103,7 +104,8 @@ function parseGmail(row: StoredAccount, authJson: Record<string, unknown>): Acco
     skip(row, 'gmail-incomplete-credentials');
     return null;
   }
-  const gmail: GmailAccount = { accountId: row.id, refreshToken };
+  // processFrom 显式枚举进字面量（同 parseImap：本字面量非 `...row` 展开）。
+  const gmail: GmailAccount = { accountId: row.id, refreshToken, processFrom: row.processFrom };
   const scopes = authJson.scopes;
   if (Array.isArray(scopes) && scopes.every((s) => typeof s === 'string')) {
     gmail.scopes = scopes as string[];

@@ -62,6 +62,11 @@ export type ImapAccount = {
   user: string;
   password: string;
   tls: boolean;
+  /**
+   * 起算日期水位线（UTC 语义）；NULL = 不设日期下界（保持全量行为）。
+   * 退化轮摄入按此合取 `SINCE`（粗粒度日期下界，design 决策 5/8）。
+   */
+  processFrom: Date | null;
 };
 
 /**
@@ -75,6 +80,11 @@ export type GmailAccount = {
   refreshToken: string;
   /** 授权 scope（恰等 `{gmail.modify}`，见 gmail-integration）。 */
   scopes?: string[];
+  /**
+   * 起算日期水位线（UTC 语义）；NULL = 不设日期下界（保持全量 `is:unread`）。
+   * 摄入按此给查询附加 `after:<epoch>`（design 决策 5/8）。
+   */
+  processFrom: Date | null;
 };
 
 /**

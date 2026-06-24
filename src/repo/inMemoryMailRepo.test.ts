@@ -10,8 +10,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
+import { prisma } from '../db/prisma.js';
 import { InMemoryMailRepo } from './inMemoryMailRepo.js';
-import { DIGEST_TYPE_DAILY } from './mailRepo.js';
+import { DIGEST_TYPE_DAILY, PrismaMailRepo, type AccountWriteInput } from './mailRepo.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
@@ -71,6 +72,7 @@ async function seedEmail(
   repo: InMemoryMailRepo,
   opts: {
     providerMessageId: string;
+    accountId?: string; // 默认 'acct-1'（= makeEmail 默认）；水位线用例跨多账号时显式传
     date?: string;
     fromName?: string | null;
     fromEmail?: string;
@@ -84,6 +86,7 @@ async function seedEmail(
   const emailOverrides: Partial<NormalizedEmail> = {
     providerMessageId: opts.providerMessageId,
   };
+  if (opts.accountId !== undefined) emailOverrides.accountId = opts.accountId;
   if (opts.date !== undefined) emailOverrides.date = opts.date;
   if (opts.subject !== undefined) emailOverrides.subject = opts.subject;
   if (opts.fromEmail !== undefined) emailOverrides.fromEmail = opts.fromEmail;
@@ -116,6 +119,35 @@ async function seedEmail(
   }
   if (opts.processed !== false) await repo.markProcessed(id);
   return id;
+}
+
+/**
+ * 落一个账号行（水位线用例用）。processFrom 经 setProcessFrom 落具体值（含可早可晚双向）。
+ * createAccount 默认 seed `new Date()`；传 processFrom 时再用 setProcessFrom 覆盖到确定值，
+ * 使断言不依赖 wall-clock。不传 processFrom ⇒ 保留 createAccount 的默认 seed（接入瞬时）。
+ */
+async function seedAccount(
+  repo: InMemoryMailRepo,
+  opts: { id: string; provider?: 'imap' | 'gmail'; processFrom?: Date | null },
+): Promise<void> {
+  await repo.createAccount({
+    id: opts.id,
+    provider: opts.provider ?? 'gmail',
+    email: `${opts.id}@example.com`,
+    authJson: { refreshToken: 'tok', scopes: ['s'] },
+  });
+  // processFrom === null：把账号水位线显式置回 NULL（createAccount 已 seed 瞬时，需清回「不设下界」）。
+  // 生产中 NULL 水位线账号经迁移默认 NULL（行存在但该列从未 seed）；setProcessFrom 只收 Date、置不回 NULL，
+  // getAccountById 返回 {...row} 浅拷贝改它不动内部 Map——故就地改内部 Map 的 live 行还原该「行存在 + NULL」态。
+  if (opts.processFrom === null) {
+    const internal = (
+      repo as unknown as { accountsById: Map<string, { processFrom: Date | null }> }
+    ).accountsById;
+    const liveRow = internal.get(opts.id);
+    if (liveRow) liveRow.processFrom = null;
+  } else if (opts.processFrom !== undefined) {
+    await repo.setProcessFrom(opts.id, opts.processFrom);
+  }
 }
 
 // 注：以下用例（尤其「重复 markDigested 不抛」与各 listDigestCandidates 用例）跑的是 InMemoryMailRepo —— 内存 JS 镜像，
@@ -230,4 +262,330 @@ test('listDigestCandidates: fromName 缺省时不带 fromName 字段', async () 
   const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
   assert.equal(out.length, 1);
   assert.ok(!('fromName' in out[0]!));
+});
+
+// ───────────────────────── 摘要水位线下界（task 6.4，design 决策 2/9）─────────────────────────
+// 「按账号 receivedAt 下界」而非固定年龄窗：排除接入前历史积压（receivedAt < processFrom），含界纳入，
+// 停机期间收到（receivedAt >= processFrom）仍入。受测谓词 passesWatermark 是两 repo 单一真源（5.1），
+// 故 InMemory 覆盖即覆盖两 repo 的判定逻辑（passesWatermark 五分支另由 watermark.test.ts 钉死）。
+
+test('listDigestCandidates 水位线: 接入前积压排除（receivedAt < processFrom）', async () => {
+  const repo = new InMemoryMailRepo();
+  const WATERMARK = new Date('2026-06-10T00:00:00.000Z');
+  await seedAccount(repo, { id: 'acct-w', processFrom: WATERMARK });
+  // 接入前半年的历史积压：receivedAt 远早于水位线 → 排除（即便 processedAt != null）。
+  await seedEmail(repo, {
+    providerMessageId: 'old-backlog',
+    accountId: 'acct-w',
+    priority: 'P1',
+    date: '2026-01-01T00:00:00.000Z',
+  });
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out.map((c) => c.messageRowId), []);
+});
+
+test('listDigestCandidates 水位线: 停机期间收到（receivedAt > processFrom）仍入摘要', async () => {
+  const repo = new InMemoryMailRepo();
+  const WATERMARK = new Date('2026-06-10T00:00:00.000Z');
+  await seedAccount(repo, { id: 'acct-w', processFrom: WATERMARK });
+  // 停机期间收到（receivedAt 在水位线之后）：按收到时间下界、不受「固定年龄窗」误删 → 纳入。
+  const fresh = await seedEmail(repo, {
+    providerMessageId: 'downtime-arrived',
+    accountId: 'acct-w',
+    priority: 'P1',
+    date: '2026-06-15T00:00:00.000Z',
+  });
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out.map((c) => c.messageRowId), [fresh]);
+});
+
+test('listDigestCandidates 水位线: 边界 receivedAt == processFrom 含界纳入', async () => {
+  const repo = new InMemoryMailRepo();
+  const WATERMARK = new Date('2026-06-10T08:30:00.000Z');
+  await seedAccount(repo, { id: 'acct-w', processFrom: WATERMARK });
+  // 同刻（同一毫秒）：边界含界（receivedAt >= processFrom）→ 纳入。
+  const onBoundary = await seedEmail(repo, {
+    providerMessageId: 'on-boundary',
+    accountId: 'acct-w',
+    priority: 'P2',
+    date: '2026-06-10T08:30:00.000Z',
+  });
+  // 早 1ms：排除（确认边界判定是 >= 而非 >）。
+  await seedEmail(repo, {
+    providerMessageId: 'just-before',
+    accountId: 'acct-w',
+    priority: 'P2',
+    date: '2026-06-10T08:29:59.999Z',
+  });
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out.map((c) => c.messageRowId), [onBoundary]);
+});
+
+test('listDigestCandidates 水位线: 缺 Date 头 ⇒ receivedAt 回落、按回落值判下界', async () => {
+  const repo = new InMemoryMailRepo();
+  // InMemory 的 receivedAt = new Date(row.email.date)（与 prisma MailMessage.receivedAt 同一映射）。
+  // email.date 不可解析（空串）⇒ new Date('') = Invalid Date ⇒ getTime() = NaN ⇒ NaN >= x 恒 false ⇒ 排除。
+  // 这建模 spec「缺 Date 头回落 receivedAt」+「运维须盖到接入处理之后」：回落 receivedAt 早于/不可比时被下界排除。
+  const WATERMARK = new Date('2026-06-10T00:00:00.000Z');
+  await seedAccount(repo, { id: 'acct-w', processFrom: WATERMARK });
+  await seedEmail(repo, {
+    providerMessageId: 'no-date-header',
+    accountId: 'acct-w',
+    priority: 'P1',
+    date: '', // 不可解析 → receivedAt 回落（NaN）→ 被水位线下界排除
+  });
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out.map((c) => c.messageRowId), []);
+
+  // 对照：NULL 水位线账号下，同样缺 Date 头的邮件不受下界约束 → 仍入（不被静默丢）。
+  await seedAccount(repo, { id: 'acct-null', processFrom: null });
+  const nullAcctNoDate = await seedEmail(repo, {
+    providerMessageId: 'no-date-null-acct',
+    accountId: 'acct-null',
+    priority: 'P1',
+    date: '',
+  });
+  const out2 = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out2.map((c) => c.messageRowId), [nullAcctNoDate]);
+});
+
+test('listDigestCandidates 水位线: 同一调用混入 NULL 账号 + 非 NULL 账号，各自正确', async () => {
+  const repo = new InMemoryMailRepo();
+  const WATERMARK = new Date('2026-06-10T00:00:00.000Z');
+  // 非 NULL 账号：水位线挡其接入前积压、放行停机期间邮件。
+  await seedAccount(repo, { id: 'acct-wm', processFrom: WATERMARK });
+  const wmOld = await seedEmail(repo, {
+    providerMessageId: 'wm-old',
+    accountId: 'acct-wm',
+    priority: 'P1',
+    date: '2026-01-01T00:00:00.000Z', // < 水位线 → 排除
+  });
+  const wmFresh = await seedEmail(repo, {
+    providerMessageId: 'wm-fresh',
+    accountId: 'acct-wm',
+    priority: 'P2',
+    date: '2026-06-20T00:00:00.000Z', // >= 水位线 → 纳入
+  });
+  // NULL 账号（行存在、processFrom 为 NULL）：不设下界——同样很旧的邮件仍入（不被混入的水位线误删）。
+  await seedAccount(repo, { id: 'acct-null', processFrom: null });
+  const nullOld = await seedEmail(repo, {
+    providerMessageId: 'null-old',
+    accountId: 'acct-null',
+    priority: 'P3',
+    date: '2026-01-01T00:00:00.000Z', // NULL 不设下界 → 纳入
+  });
+
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  const ids = new Set(out.map((c) => c.messageRowId));
+  // 非 NULL 账号：旧的排除、新的纳入。
+  assert.ok(!ids.has(wmOld), 'acct-wm 接入前积压被水位线排除');
+  assert.ok(ids.has(wmFresh), 'acct-wm 停机期邮件纳入');
+  // NULL 账号：旧的也纳入（不受混入的非 NULL 水位线波及）。
+  assert.ok(ids.has(nullOld), 'NULL 账号旧邮件不设下界、纳入');
+  assert.equal(out.length, 2);
+});
+
+test('listDigestCandidates 水位线: 候选 accountId 不在 processFrom map 中（disabled/并发删窗）不被静默丢（task 6.5）', async () => {
+  // 闭合 design 决策 9 的残缺：纯函数单测只覆盖分支逻辑，未覆盖 map-build/lookup——
+  // 当候选的 accountId 在 accountsById 中缺失（prisma 路径下：disabled 账号被 enabled-only map 漏掉，
+  // 或两次 findMany 之间账号被并发删除），map.get(accountId) ⇒ undefined ⇒ passesWatermark 放行、不丢候选。
+  // InMemory 同构：accountsById.get(accountId)?.processFrom ⇒ undefined（无账号行）⇒ 放行。
+  const repo = new InMemoryMailRepo();
+  // 故意**不** seedAccount —— 邮件的 accountId 'orphan-acct' 在 accountsById 中无对应行。
+  const orphan = await seedEmail(repo, {
+    providerMessageId: 'orphan-msg',
+    accountId: 'orphan-acct',
+    priority: 'P1',
+    date: '2026-01-01T00:00:00.000Z', // 即便很旧：缺失 accountId ⇒ undefined ⇒ 放行（不被静默丢）
+  });
+  const out = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
+  assert.deepEqual(out.map((c) => c.messageRowId), [orphan]);
+});
+
+// ───────────────────────── 播种 / re-auth 水位线（task 6.6，design 决策 7）─────────────────────────
+// seed-on-create / preserve-on-update / 只有 setProcessFrom 改既有。InMemory 须经 get-before-set 保留。
+
+test('InMemory createAccount 播种 processFrom = 接入瞬时（new Date()）', async () => {
+  const repo = new InMemoryMailRepo();
+  const before = Date.now();
+  await repo.createAccount({
+    id: 'imap:u@h',
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+  });
+  const after = Date.now();
+  const row = await repo.getAccountById('imap:u@h');
+  assert.ok(row?.processFrom instanceof Date, 'createAccount seed 出 Date（非 NULL）');
+  const t = row!.processFrom!.getTime();
+  // 精确瞬时（new Date()）：落在 create 调用前后的 wall-clock 窗口内；非 UTC 零点。
+  assert.ok(t >= before && t <= after, 'processFrom 为接入瞬时、落在调用窗口内');
+});
+
+test('InMemory upsertAccount(create 分支) 首次接入 + 显式 processFrom 播种该值', async () => {
+  const repo = new InMemoryMailRepo();
+  // Gmail 首次接入未给 --process-from：upsert 走 create 分支 seed new Date()。
+  const before = Date.now();
+  await repo.upsertAccount({
+    id: 'gmail:a@b',
+    provider: 'gmail',
+    email: 'a@b',
+    authJson: { refreshToken: 'r', scopes: ['s'] },
+  });
+  const after = Date.now();
+  const r1 = await repo.getAccountById('gmail:a@b');
+  assert.ok(r1?.processFrom instanceof Date);
+  assert.ok(r1!.processFrom!.getTime() >= before && r1!.processFrom!.getTime() <= after);
+
+  // 另一账号显式给 processFrom：create 分支用 input.processFrom（非默认瞬时）。
+  const explicit = new Date('2026-06-01T00:00:00.000Z');
+  await repo.upsertAccount({
+    id: 'gmail:c@d',
+    provider: 'gmail',
+    email: 'c@d',
+    authJson: { refreshToken: 'r', scopes: ['s'] },
+    processFrom: explicit,
+  });
+  const r2 = await repo.getAccountById('gmail:c@d');
+  assert.equal(r2?.processFrom?.getTime(), explicit.getTime());
+});
+
+test('InMemory Gmail re-auth(upsert update 分支)经 get-before-set 保留既有 processFrom、不被 input 重置', async () => {
+  const repo = new InMemoryMailRepo();
+  const T0 = new Date('2026-06-05T12:34:56.000Z');
+  // 首次接入并把水位线压到确定值 T0。
+  await repo.upsertAccount({
+    id: 'gmail:a@b',
+    provider: 'gmail',
+    email: 'a@b',
+    authJson: { refreshToken: 'r0', scopes: ['s'] },
+  });
+  await repo.setProcessFrom('gmail:a@b', T0);
+
+  // re-auth：同 id 再 upsert（走 update 分支），并**故意**在 input 携带一个不同的 processFrom，
+  // 断言 get-before-set 一律忽略 input、保留 existing.T0（决策 7：update 不重置水位线）。
+  await repo.upsertAccount({
+    id: 'gmail:a@b',
+    provider: 'gmail',
+    email: 'a@b',
+    authJson: { refreshToken: 'r1-rotated', scopes: ['s'] },
+    processFrom: new Date('2020-01-01T00:00:00.000Z'), // 应被忽略
+  });
+  const row = await repo.getAccountById('gmail:a@b');
+  assert.equal(row?.processFrom?.getTime(), T0.getTime(), 're-auth 保留 T0、忽略 input.processFrom');
+  // 凭据确已轮转（确认 update 分支真的跑了、不是 no-op）。
+  assert.deepEqual(row?.authJson, { refreshToken: 'r1-rotated', scopes: ['s'] });
+});
+
+test('InMemory IMAP --update(upsert update 分支)同样保留既有 processFrom', async () => {
+  const repo = new InMemoryMailRepo();
+  const T0 = new Date('2026-06-07T00:00:00.000Z');
+  // IMAP 默认 add 经 createAccount 建行，再压水位线到 T0。
+  await repo.createAccount({
+    id: 'imap:u@h',
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p0', tls: true },
+  });
+  await repo.setProcessFrom('imap:u@h', T0);
+  // IMAP --update 走 upsertAccount 的 update 分支（同 id 已存在）：保留 T0、忽略 input。
+  await repo.upsertAccount({
+    id: 'imap:u@h',
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p1', tls: true },
+    processFrom: new Date('2020-01-01T00:00:00.000Z'), // 应被忽略
+  });
+  const row = await repo.getAccountById('imap:u@h');
+  assert.equal(row?.processFrom?.getTime(), T0.getTime());
+});
+
+test('InMemory setProcessFrom 是唯一改既有行水位线的路径（无条件覆盖、可双向）', async () => {
+  const repo = new InMemoryMailRepo();
+  await repo.createAccount({
+    id: 'imap:u@h',
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+  });
+  const forward = new Date('2026-06-20T00:00:00.000Z');
+  await repo.setProcessFrom('imap:u@h', forward);
+  assert.equal((await repo.getAccountById('imap:u@h'))?.processFrom?.getTime(), forward.getTime());
+  // 双向：前移到更早日期（无单调守卫，spec「无条件覆盖」）。
+  const backward = new Date('2026-06-01T00:00:00.000Z');
+  await repo.setProcessFrom('imap:u@h', backward);
+  assert.equal((await repo.getAccountById('imap:u@h'))?.processFrom?.getTime(), backward.getTime());
+});
+
+// Prisma 行创建/更新分支离线断言（task 6.6 的「Prisma 两路径」）。本项目无 Prisma 集成测试 harness
+// （tsx --test 不连真库），且 tsx 的 ESM loader 不暴露 node:test 的 mock.module。改用「运行时替换共享
+// prisma 单例的 mailAccount delegate」捕获 create/upsert 的 args——PrismaMailRepo 经 `import { prisma }`
+// 持同一引用，替换后 lazy PrismaClient 永不发起真查询（无 DB、无网络、无新依赖）。断言：create 分支写
+// processFrom（Date）、upsert.create 写 processFrom（Date）、upsert.update **省略** processFrom（= 列不动 = re-auth 保留）。
+test('Prisma create/upsert 分支: create 含 processFrom、upsert.update 省略 processFrom（re-auth 保留）', async () => {
+  const calls: Array<{ op: 'create' | 'upsert' | 'update'; args: Record<string, unknown> }> = [];
+  const original = (prisma as { mailAccount: unknown }).mailAccount;
+  (prisma as { mailAccount: unknown }).mailAccount = {
+    create: async (args: Record<string, unknown>) => {
+      calls.push({ op: 'create', args });
+      return {};
+    },
+    upsert: async (args: Record<string, unknown>) => {
+      calls.push({ op: 'upsert', args });
+      return {};
+    },
+    update: async (args: Record<string, unknown>) => {
+      calls.push({ op: 'update', args });
+      return {};
+    },
+  };
+  try {
+    const repo = new PrismaMailRepo();
+    const explicit = new Date('2026-06-01T00:00:00.000Z');
+
+    // ① createAccount（IMAP 默认 add 的独立行创建）——默认 seed 精确瞬时。
+    const imapInput: AccountWriteInput = {
+      id: 'imap:u@h',
+      provider: 'imap',
+      email: 'u@h',
+      authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+    };
+    await repo.createAccount(imapInput);
+
+    // ② upsertAccount（Gmail 接入 / --update）——显式 processFrom 走 create 分支。
+    await repo.upsertAccount({
+      id: 'gmail:a@b',
+      provider: 'gmail',
+      email: 'a@b',
+      authJson: { refreshToken: 'r', scopes: ['s'] },
+      processFrom: explicit,
+    });
+
+    const createCall = calls.find((c) => c.op === 'create')!;
+    assert.ok(createCall, 'createAccount 路由到 prisma.mailAccount.create');
+    const createData = (createCall.args as { data: { processFrom: unknown } }).data;
+    assert.ok(createData.processFrom instanceof Date, 'createAccount 行写 processFrom（Date、非 NULL）');
+
+    const upsertCall = calls.find((c) => c.op === 'upsert')!;
+    assert.ok(upsertCall, 'upsertAccount 路由到 prisma.mailAccount.upsert');
+    const upsertArgs = upsertCall.args as {
+      create: { processFrom?: unknown };
+      update: Record<string, unknown>;
+    };
+    // create 分支写显式 processFrom。
+    assert.ok(upsertArgs.create.processFrom instanceof Date, 'upsert.create 写 processFrom（Date）');
+    assert.equal(
+      (upsertArgs.create.processFrom as Date).getTime(),
+      explicit.getTime(),
+      'upsert.create 用显式 processFrom 值',
+    );
+    // update 分支**一律不含** processFrom —— Prisma 语义 = 列不动 = re-auth 保留既有水位线。
+    assert.ok(
+      !('processFrom' in upsertArgs.update),
+      'upsert.update 省略 processFrom（re-auth 不重置水位线）',
+    );
+  } finally {
+    // 还原共享单例 delegate（隔离：不污染其余用例 / 其它测试文件的同进程 import）。
+    (prisma as { mailAccount: unknown }).mailAccount = original;
+  }
 });
