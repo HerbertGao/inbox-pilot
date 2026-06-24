@@ -207,7 +207,7 @@ const USAGE = [
   '      非交互口令来源（互斥）: --password-stdin（从管道读）| --password-file <path>（读文件）。',
   `      ${PASSWORD_STDIN_USAGE_HINT}`,
   '      同派生 id 已存在默认拒绝；--update 显式确认更新凭据。',
-  '      --process-from <YYYY-MM-DD>: 起算日期水位线（UTC 零点）；仅新建账号生效，既有账号请用 set-process-from。',
+  '      --process-from <YYYY-MM-DD>: 起算日期水位线（容器时区零点）；仅新建账号生效，既有账号请用 set-process-from。',
   '  add --gmail [--process-from <YYYY-MM-DD>]',
   '      跑 loopback OAuth 授权；同 id 已存在则 upsert 新 refresh token 并启用（re-auth/恢复）。',
   '      --process-from 仅首次接入生效；re-auth 不改既有水位线。',
@@ -218,7 +218,7 @@ const USAGE = [
   '  disable <id>',
   '      置 enabled=false（未重启不生效；撤销已泄露账号后应立即重启）。',
   '  set-process-from <id> <YYYY-MM-DD>',
-  '      把既有账号的起算日期水位线无条件设为给定 UTC 零点日期（可双向移动；改既有账号唯一入口）。',
+  '      把既有账号的起算日期水位线无条件设为给定容器时区零点日期（可双向移动；改既有账号唯一入口）。',
 ].join('\n');
 
 /**
@@ -331,7 +331,7 @@ function resolveTls(flags: ParsedFlags): { ok: true; tls: boolean } | { ok: fals
 }
 
 /**
- * 解析 `--process-from <ISO date>`（add 路径，可选）：经 3.1 共享 helper（UTC 零点 / 严格未来拒绝）。
+ * 解析 `--process-from <ISO date>`（add 路径，可选）：经 3.1 共享 helper（容器时区零点 / 严格未来拒绝）。
  * 未给该 flag → `{ ok:true, processFrom: undefined }`（默认 seed 归 repo 行创建分支、CLI 不抹零点）；
  * 给了非法 / 未来 → `{ ok:false }`，由调用方报参数错误（EXIT_USAGE）。错误信息经 errln（不回显原始值之外）。
  */
@@ -354,7 +354,7 @@ function resolveProcessFromFlag(
     deps.errln(
       parsed.kind === 'future'
         ? `--process-from 不能是未来日期: ${JSON.stringify(raw)}（会静默排除该日前所有邮件）。`
-        : `--process-from 非法: ${JSON.stringify(raw)}（需 YYYY-MM-DD 形式、解析为 UTC 零点）。`,
+        : `--process-from 非法: ${JSON.stringify(raw)}（需 YYYY-MM-DD 形式、解析为容器时区零点）。`,
     );
     return { ok: false };
   }
@@ -636,9 +636,9 @@ async function cmdDisable(args: string[], deps: CliDeps): Promise<number> {
 }
 
 /**
- * `account set-process-from <id> <YYYY-MM-DD>`：把既有账号的起算日期水位线**无条件**设为给定 UTC 零点
+ * `account set-process-from <id> <YYYY-MM-DD>`：把既有账号的起算日期水位线**无条件**设为给定容器时区零点
  * 日期（可双向移动、无单调守卫——见 spec「set-process-from 是无条件覆盖」）。`<date>` 经 3.1 共享 helper
- * 解析（UTC 零点 / 非法 → EXIT_USAGE / 严格未来 → EXIT_USAGE）。`<id>` 经 `JSON.stringify` 转义回显
+ * 解析（容器时区零点 / 非法 → EXIT_USAGE / 严格未来 → EXIT_USAGE）。`<id>` 经 `JSON.stringify` 转义回显
  * （防嵌入 id 的控制字符伪造 stderr/日志行，同 cmdDisable）。改既有行**唯一**入口（add 走 update 被忽略）。
  */
 async function cmdSetProcessFrom(args: string[], deps: CliDeps): Promise<number> {
@@ -657,14 +657,14 @@ async function cmdSetProcessFrom(args: string[], deps: CliDeps): Promise<number>
   }
   const id = flags.positionals[0]!;
   const dateRaw = flags.positionals[1]!;
-  // <date> 经 3.1 共享 helper：严格 YYYY-MM-DD → UTC 零点；非法 / 严格未来 → EXIT_USAGE（同 add）。
+  // <date> 经 3.1 共享 helper：严格 YYYY-MM-DD → 容器时区零点；非法 / 严格未来 → EXIT_USAGE（同 add）。
   const parsed = parseProcessFromDate(dateRaw);
   if (!parsed.ok) {
     // 非法值经 JSON.stringify 转义渲染（绝不原样回显）。未来 / 解析失败分别给精确提示。
     deps.errln(
       parsed.kind === 'future'
         ? `<date> 不能是未来日期: ${JSON.stringify(dateRaw)}（会静默排除该日前所有邮件）。`
-        : `<date> 非法: ${JSON.stringify(dateRaw)}（需 YYYY-MM-DD 形式、解析为 UTC 零点）。`,
+        : `<date> 非法: ${JSON.stringify(dateRaw)}（需 YYYY-MM-DD 形式、解析为容器时区零点）。`,
     );
     return EXIT_USAGE;
   }
@@ -677,7 +677,9 @@ async function cmdSetProcessFrom(args: string[], deps: CliDeps): Promise<number>
     return EXIT_FAILURE;
   }
   // id 经 JSON.stringify 转义渲染（同上）。
-  deps.println(`已设置账号 ${JSON.stringify(id)} 的起算日期水位线为 ${parsed.date.toISOString()}。`);
+  deps.println(
+    `已设置账号 ${JSON.stringify(id)} 的起算日期水位线为 ${dateRaw}（容器时区零点，存储瞬时 ${parsed.date.toISOString()}）。`,
+  );
   deps.println('注意: 未重启不生效（摄入下界在轮询路径上，重启后才按新水位线过滤）。');
   return EXIT_OK;
 }

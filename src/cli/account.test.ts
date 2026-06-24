@@ -887,12 +887,32 @@ test('F2：带值的 --password-stdin（如 --password-stdin=foo）→ 拒绝（
 // set-process-from <id> <YYYY-MM-DD>：成功 / 缺日期 / 带 flag / 非法日期 / 未来日期 / 未知 id
 // ——————————————————————————————————————————————————————————
 
-/** 未来日期串（相对 now 的下一年元旦，UTC 零点；用于「未来日期 → EXIT_USAGE」断言）。 */
+/**
+ * 未来日期串（下一年元旦，用**本地年** `getFullYear()`——与解析器 `new Date(y,m-1,d)` 同一本地 frame）。
+ * **不**用 `getUTCFullYear()`：东于 UTC 的时区在本地 1/1 早晨（UTC 仍为去年）会让 `getUTCFullYear()+1`
+ * 退化为本地今年元旦 = 本地今天，被解析器判为非未来而放行、令「未来应拒」用例在该 8h 窗口误红。
+ */
 function futureDateStr(): string {
-  return `${new Date().getUTCFullYear() + 1}-01-01`;
+  return `${new Date().getFullYear() + 1}-01-01`;
 }
 
-test('set-process-from <id> <YYYY-MM-DD>：成功 → EXIT_OK，setProcessFrom 入参为 (id, UTC 零点 Date)，成功行经 JSON.stringify 转义回显', async () => {
+/**
+ * 断言 `date` 在**进程本地 TZ** 下为给定年月日的当日零点（TZ-robust：本地字段 + 时分秒毫秒全 0）。
+ * 不硬编码 `.toISOString()` 绝对瞬时——那只在某一 TZ 成立、会与 `test:tz`/`test:tz-utc` 互拆
+ * （watermark-date-container-tz 2.2）。本文件在 `test:tz`（Asia/Shanghai）下跑。
+ */
+function assertLocalMidnight(date: Date | undefined, year: number, month1to12: number, day: number): void {
+  assert.ok(date, 'date 存在');
+  assert.equal(date.getFullYear(), year, '本地年份');
+  assert.equal(date.getMonth(), month1to12 - 1, '本地月份');
+  assert.equal(date.getDate(), day, '本地日');
+  assert.equal(date.getHours(), 0, '本地时为 0');
+  assert.equal(date.getMinutes(), 0, '本地分为 0');
+  assert.equal(date.getSeconds(), 0, '本地秒为 0');
+  assert.equal(date.getMilliseconds(), 0, '本地毫秒为 0');
+}
+
+test('set-process-from <id> <YYYY-MM-DD>：成功 → EXIT_OK，setProcessFrom 入参为 (id, 容器时区零点 Date)，成功行经 JSON.stringify 转义回显', async () => {
   const repo = new InMemoryMailRepo();
   await repo.upsertAccount({
     id: 'gmail:user@gmail.com',
@@ -916,14 +936,11 @@ test('set-process-from <id> <YYYY-MM-DD>：成功 → EXIT_OK，setProcessFrom �
   assert.equal(code, EXIT_OK);
   assert.equal(calls.length, 1, 'setProcessFrom 被调一次');
   assert.equal(calls[0]!.id, 'gmail:user@gmail.com', 'id 入参原样');
-  assert.equal(
-    calls[0]!.date.toISOString(),
-    '2026-03-15T00:00:00.000Z',
-    'date 入参为该日 UTC 零点',
-  );
-  // 既有行水位线被更新为该 UTC 零点。
+  // date 入参为该日**容器时区**零点（TZ-robust：本地字段 + 时分秒毫秒全 0；不硬编码绝对瞬时）。
+  assertLocalMidnight(calls[0]!.date, 2026, 3, 15);
+  // 既有行水位线被更新为该容器时区零点。
   const row = await repo.getAccountById('gmail:user@gmail.com');
-  assert.equal(row?.processFrom?.toISOString(), '2026-03-15T00:00:00.000Z');
+  assertLocalMidnight(row?.processFrom, 2026, 3, 15);
   // 成功行经 JSON.stringify(id) 转义回显。
   assert.ok(
     out.join('\n').includes(JSON.stringify('gmail:user@gmail.com')),
@@ -1011,7 +1028,7 @@ test('set-process-from <未知 id> <合法日期> → EXIT_FAILURE（setProcessF
 // add --process-from <date>：合法播种 processFrom / 非法拒绝 / value-less（FIX2 回归）
 // ——————————————————————————————————————————————————————————
 
-test('add --imap ... --process-from <合法日期> → createAccount 入参含 processFrom = 该 UTC 零点 Date', async () => {
+test('add --imap ... --process-from <合法日期> → createAccount 入参含 processFrom = 该容器时区零点 Date', async () => {
   const repo = new InMemoryMailRepo();
   const calls: Array<{ id: string; processFrom: Date | undefined }> = [];
   const orig = repo.createAccount.bind(repo);
@@ -1026,14 +1043,11 @@ test('add --imap ... --process-from <合法日期> → createAccount 入参含 p
   );
   assert.equal(code, EXIT_OK);
   assert.equal(calls.length, 1, 'createAccount 被调一次');
-  assert.equal(
-    calls[0]!.processFrom?.toISOString(),
-    '2026-03-15T00:00:00.000Z',
-    'createAccount 入参 processFrom 为该日 UTC 零点',
-  );
+  // createAccount 入参 processFrom 为该日**容器时区**零点（TZ-robust：本地字段；不硬编码绝对瞬时）。
+  assertLocalMidnight(calls[0]!.processFrom, 2026, 3, 15);
 });
 
-test('add --imap --update ... --process-from <合法日期> → upsertAccount 入参含 processFrom = 该 UTC 零点 Date', async () => {
+test('add --imap --update ... --process-from <合法日期> → upsertAccount 入参含 processFrom = 该容器时区零点 Date', async () => {
   const repo = new InMemoryMailRepo();
   const calls: Array<{ id: string; processFrom: Date | undefined }> = [];
   const orig = repo.upsertAccount.bind(repo);
@@ -1048,11 +1062,8 @@ test('add --imap --update ... --process-from <合法日期> → upsertAccount �
   );
   assert.equal(code, EXIT_OK);
   assert.equal(calls.length, 1, 'upsertAccount 被调一次');
-  assert.equal(
-    calls[0]!.processFrom?.toISOString(),
-    '2026-03-15T00:00:00.000Z',
-    'upsertAccount 入参 processFrom 为该日 UTC 零点',
-  );
+  // upsertAccount 入参 processFrom 为该日**容器时区**零点（TZ-robust：本地字段；不硬编码绝对瞬时）。
+  assertLocalMidnight(calls[0]!.processFrom, 2026, 3, 15);
 });
 
 test('add --imap ... --process-from <非法日期> → EXIT_USAGE、不触达 repo 写', async () => {
@@ -1069,6 +1080,22 @@ test('add --imap ... --process-from <非法日期> → EXIT_USAGE、不触达 re
   assert.equal(code, EXIT_USAGE, '非法 --process-from → 参数错误');
   assert.equal(createCalled, false, '非法日期不触达 repo 写');
   assert.ok(err.join('\n').includes('--process-from 非法'), '提示 --process-from 非法');
+});
+
+test('add --imap ... --process-from <非法日期> 的 errln 文案含「容器时区零点」（守住 1.3 文案）', async () => {
+  // 守护组 A 把「UTC 零点」改「容器时区零点」的运维文案——非法日期 errln 须含此口径。
+  const repo = new InMemoryMailRepo();
+  repo.createAccount = async () => {};
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--process-from', '2026-13-99'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '非法 --process-from → 参数错误');
+  assert.ok(
+    err.join('\n').includes('容器时区零点'),
+    'errln 文案须含「容器时区零点」（不再是「UTC 零点」）',
+  );
 });
 
 test('FIX2 回归：add --gmail --process-from（value-less、无日期）→ EXIT_USAGE，在跑 OAuth 前即拒、不建行', async () => {
