@@ -55,6 +55,12 @@ export type GmailPollDeps = {
   readonly repo: MailRepo;
   /** executeActions 持有的动作 sink（Gmail markRead/reflectPriority；测试可注入 Fake 或真 gmailActions）。 */
   readonly provider: ProviderActions;
+  /**
+   * 起算日期水位线（UTC 语义）；NULL/缺省 = 不设日期下界（保持全量 `is:unread`）。
+   * 关键最后一跳（design 决策 6）：非空时给查询附加 `after:<floor(epoch 秒)>`（4.4）；漏此跳则水位线
+   * 静默 no-op。由 createGmailPoller 接收、main.ts 接线从 `account.processFrom` 放进 deps。
+   */
+  readonly processFrom?: Date | null;
   /** 每轮 get 预算（默认 200）。 */
   readonly getBudget?: number;
   /** processEmail 注入点。默认真身；测试注入闭包传 InMemoryMailRepo + provider + 假 classify。 */
@@ -90,8 +96,11 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
   const getBudget = deps.getBudget ?? DEFAULT_GET_BUDGET;
   const runProcessEmail = deps.processEmail ?? defaultProcessEmail;
   const notifier = deps.notifier ?? defaultNotifier;
+  // processFrom 非空 → 附加 `after:<floor(epoch 秒)>`（Gmail 内部收到时间下界，design 决策 5）；
+  // NULL/缺省 → 全量 `is:unread`（不附 after:）。dedup 仍兜底重复（Gmail 无游标、每轮全量）。
+  const q = buildUnreadQuery(deps.processFrom ?? undefined);
 
-  // —— 1. 穷尽翻页 list(q='is:unread')（纯 id、轻）。429/配额绕过 → 结束本轮并隔离 ——
+  // —— 1. 穷尽翻页 list(q)（纯 id、轻）。429/配额绕过 → 结束本轮并隔离 ——
   const allUnreadIds: string[] = [];
   let pageToken: string | undefined;
   do {
@@ -99,7 +108,7 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
     try {
       res = await gmail.users.messages.list({
         userId: 'me',
-        q: 'is:unread',
+        q,
         pageToken,
       });
     } catch (err) {
@@ -208,6 +217,19 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
     budgetMs: DRAIN_TIME_BUDGET_MS,
   };
   await drainAccountRetries(accountId, { provider, notifier, repo, clock, deadline });
+}
+
+/**
+ * 构造 Gmail list 查询：`is:unread`；`processFrom` 非空时合取 `after:<floor(processFrom 的 epoch 秒)>`
+ * （Gmail `after:` 按内部收到时间、秒粒度；epoch 秒经 `Math.floor(ms/1000)`）。NULL/缺省 → 全量
+ * `is:unread`（不附 after:，保持现状）。4.4 / design 决策 5。
+ */
+function buildUnreadQuery(processFrom: Date | undefined): string {
+  if (processFrom === undefined) {
+    return 'is:unread';
+  }
+  const epochSeconds = Math.floor(processFrom.getTime() / 1000);
+  return `is:unread after:${epochSeconds}`;
 }
 
 /**

@@ -21,6 +21,7 @@ import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import { ActionStatus } from '../actions/actionTypes.js';
 import type { ActionType } from '../actions/actionTypes.js';
+import { passesWatermark } from './watermark.js';
 
 /** Gmail authJson 的默认 scope（scopes 缺省回落，避免写 scopes:undefined）。与 oauth.ts 同值、不耦合其重量级依赖。 */
 const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
@@ -115,6 +116,12 @@ export type StoredAccount = {
   /** 凭据子树（绝不整体入日志）。形状校验由 accountRegistry 落地。 */
   authJson: unknown;
   enabled: boolean;
+  /**
+   * per-account 起算日期水位线（onboarding-watermark 能力，UTC 语义）。NULL = 不设日期下界（保持现状）。
+   * 从 DB 行穿透到 poller 内部决策点（摄入下界）与摘要层 `receivedAt` 下界。**禁止**泄进 `account list`
+   * 输出白名单（CLI 仅打印 `{id,provider,email,enabled}`，由 account.ts 守）。
+   */
+  processFrom: Date | null;
 };
 
 /**
@@ -133,6 +140,13 @@ export type AccountWriteInput = {
   authJson: unknown;
   /** 默认 enabled=true（恢复/re-auth 路径显式置 true 以解除 reauth-suspend）。 */
   enabled?: boolean;
+  /**
+   * 起算日期水位线的**播种载体**（onboarding-watermark）。仅在 repo 的**行创建分支**生效：
+   * create 写 `input.processFrom ?? new Date()`（默认精确瞬时）；`upsertAccount` 的 `update` 分支
+   * 一律**不含**此字段（列不动 = 保留既有水位线）。CLI 一律透传 `--process-from` 值或 `undefined`、
+   * 不分辨首次/re-auth——对既有账号 `add --process-from` 走 update 被忽略，改既有只能 `setProcessFrom`。
+   */
+  processFrom?: Date;
 };
 
 /**
@@ -199,6 +213,13 @@ export type MailRepo = {
    * 无 schema 迁移。`setAccountEnabled(id, false)` 使下次启动不再加载该账号。
    */
   setAccountEnabled(id: string, enabled: boolean): Promise<void>;
+
+  /**
+   * 无条件覆盖账号的 `processFrom` 水位线（onboarding-watermark 运维命令 `set-process-from`）。
+   * 可双向移动（无单调守卫）；把存量账号盖到指定 UTC 日期、使此前收到的历史积压从摄入与摘要排除。
+   * **唯一**能改既有行 `processFrom` 的路径（行创建走 seed、update 一律不动该列）。
+   */
+  setProcessFrom(id: string, date: Date): Promise<void>;
 
   /**
    * 运行期 refresh 后**只更新 Gmail 账号 authJson 的 token 字段**（refreshToken + scopes），
@@ -501,7 +522,15 @@ export class PrismaMailRepo implements MailRepo {
   async listEnabledAccounts(): Promise<StoredAccount[]> {
     const rows = await prisma.mailAccount.findMany({
       where: { enabled: true },
-      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+      select: {
+        id: true,
+        provider: true,
+        email: true,
+        authJson: true,
+        enabled: true,
+        // 摄入水位线穿透（onboarding-watermark）：注册表加载读 enabled 行、经此带到 poller 内部决策点。
+        processFrom: true,
+      },
     });
     return rows.map((r) => ({
       id: r.id,
@@ -509,12 +538,22 @@ export class PrismaMailRepo implements MailRepo {
       email: r.email,
       authJson: r.authJson,
       enabled: r.enabled,
+      processFrom: r.processFrom,
     }));
   }
 
   async listAccounts(): Promise<StoredAccount[]> {
+    // select 含 processFrom 以满足 StoredAccount 形状；CLI list 输出白名单（{id,provider,email,enabled}）
+    // 由 account.ts 单独构造、**不**从 StoredAccount 透传，故此字段不泄进 list 输出。
     const rows = await prisma.mailAccount.findMany({
-      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+      select: {
+        id: true,
+        provider: true,
+        email: true,
+        authJson: true,
+        enabled: true,
+        processFrom: true,
+      },
     });
     return rows.map((r) => ({
       id: r.id,
@@ -522,18 +561,33 @@ export class PrismaMailRepo implements MailRepo {
       email: r.email,
       authJson: r.authJson,
       enabled: r.enabled,
+      processFrom: r.processFrom,
     }));
   }
 
   async getAccountById(id: string): Promise<StoredAccount | null> {
     const r = await prisma.mailAccount.findUnique({
       where: { id },
-      select: { id: true, provider: true, email: true, authJson: true, enabled: true },
+      select: {
+        id: true,
+        provider: true,
+        email: true,
+        authJson: true,
+        enabled: true,
+        processFrom: true,
+      },
     });
     if (r === null) {
       return null;
     }
-    return { id: r.id, provider: r.provider, email: r.email, authJson: r.authJson, enabled: r.enabled };
+    return {
+      id: r.id,
+      provider: r.provider,
+      email: r.email,
+      authJson: r.authJson,
+      enabled: r.enabled,
+      processFrom: r.processFrom,
+    };
   }
 
   async upsertAccount(input: AccountWriteInput): Promise<void> {
@@ -548,8 +602,13 @@ export class PrismaMailRepo implements MailRepo {
         email: input.email,
         authJson,
         enabled,
+        // 行创建分支播种水位线：显式 --process-from（UTC 零点）优先，否则默认**精确瞬时** new Date()
+        // （onboarding-watermark；UTC 零点仅用于 date-string，避免默认 seed 凭空提前 ≤24h）。
+        processFrom: input.processFrom ?? new Date(),
       },
       // 同邮箱重加 / re-auth：更新凭据/email/enabled（命中同一行、不分裂）。
+      // **一律不含 processFrom**（Prisma 语义 = 列不动 = 保留既有水位线；re-auth/既有账号 add --process-from
+      // 不改水位线，改既有只能 setProcessFrom）。
       update: { provider: input.provider, email: input.email, authJson, enabled },
     });
   }
@@ -563,12 +622,19 @@ export class PrismaMailRepo implements MailRepo {
         email: input.email,
         authJson: input.authJson as object,
         enabled: input.enabled ?? true,
+        // IMAP 默认 add 的独立行创建路径同样播种水位线（onboarding-watermark）：显式优先，否则精确瞬时。
+        processFrom: input.processFrom ?? new Date(),
       },
     });
   }
 
   async setAccountEnabled(id: string, enabled: boolean): Promise<void> {
     await prisma.mailAccount.update({ where: { id }, data: { enabled } });
+  }
+
+  async setProcessFrom(id: string, date: Date): Promise<void> {
+    // 无条件覆盖既有水位线（onboarding-watermark：唯一改既有行 processFrom 的路径）。
+    await prisma.mailAccount.update({ where: { id }, data: { processFrom: date } });
   }
 
   async updateGmailTokens(
@@ -856,6 +922,8 @@ export class PrismaMailRepo implements MailRepo {
       },
       select: {
         id: true,
+        // 水位线下界的 join key（onboarding-watermark 决策 9）：现 select 缺 accountId、无法对账 processFrom。
+        accountId: true,
         subject: true,
         fromEmail: true,
         fromName: true,
@@ -869,9 +937,24 @@ export class PrismaMailRepo implements MailRepo {
       orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
     });
 
+    // 一次 findMany 取**全部账号**（**非**仅 enabled，否则 disabled 账号的已处理邮件其 accountId 缺 map
+    // → passesWatermark 收到 undefined 仍放行，但 disabled 账号若设了 processFrom 本应受下界约束、会被误放；
+    // 取全量即正确）的 processFrom 建 map（~3 账号、非 N+1）。
+    const accounts = await prisma.mailAccount.findMany({
+      select: { id: true, processFrom: true },
+    });
+    const processFromByAccount = new Map<string, Date | null>(
+      accounts.map((a) => [a.id, a.processFrom]),
+    );
+
     // JS 取最新分类、过滤、附 receivedAt/id 供确定性排序（优先级档不能在 SQL 表达，故在此排）。
     const enriched: Array<DigestCandidate & { receivedAt: Date; id: string }> = [];
     for (const row of rows) {
+      // 水位线下界（onboarding-watermark）：排除 receivedAt < 该账号 processFrom 的接入前历史积压；
+      // NULL（账号未设）或缺失 accountId（map 无此账号）⇒ passesWatermark 放行（不设下界）。
+      if (!passesWatermark(row.receivedAt, processFromByAccount.get(row.accountId))) {
+        continue;
+      }
       const latest = row.classifications[0];
       if (latest === undefined) {
         // 缺分类行的已处理邮件：排除，记 debug（非 error、非每轮 error 刷屏）。

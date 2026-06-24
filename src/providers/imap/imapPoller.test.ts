@@ -38,6 +38,7 @@ import type {
   MailboxStatus,
 } from './imapClient.js';
 import { InMemoryMailRepo } from '../../repo/inMemoryMailRepo.js';
+import type { StoredEmail } from '../../repo/mailRepo.js';
 import { FakeProviderActions, type ProviderActions } from '../../actions/providerActions.js';
 import { ProviderReauthRequired } from '../provider.js';
 import { processEmail, type ClassifyFn } from '../../pipeline/processEmail.js';
@@ -289,13 +290,14 @@ test('单封 normalize 抛出被跳过、其余照常（游标停在失败封前
   const classify = makeClassifySpy(makeClassification());
   const provider = new FakeProviderActions();
   const notifier = createNotifier({ channel: noopChannel() });
-  // 注入的 processEmail：对带 POISON 主题者抛（模拟 normalize 失败的单封隔离）；其余走真身。
+  // 注入的 processEmail：第一轮对带 POISON 主题者抛（模拟 normalize 失败的单封隔离）；其余走真身。
+  let failOn9 = true;
   const deps: PollDeps = {
     connection: conn,
     repo,
     makeProvider: () => provider,
     processEmail: async (email, d) => {
-      if (email.subject === 'POISON_NORMALIZE') {
+      if (email.subject === 'POISON_NORMALIZE' && failOn9) {
         throw new Error('normalize/process boom for 9');
       }
       await processEmail(email, { repo: d.repo, provider: d.provider, classify, notifier });
@@ -307,9 +309,26 @@ test('单封 normalize 抛出被跳过、其余照常（游标停在失败封前
   // UID 9 失败被跳过；UID 11 照常处理（classify 仅 11 一次）。
   assert.equal(classify.calls.length, 1);
   assert.equal(classify.calls[0]!.uid, 11);
-  // 游标停在首个失败封（UID 9）前：无连续高水位（9 首封即失败）→ 退化轮 floor ④ 写 :0
-  // （下轮 UID 1:* 重取 9）。失败封下轮必被重取（游标 <= 9）。
-  assert.equal(await getCursor(repo), '5:0', '首封即失败 + 无连续高水位 → 退化 floor ④ 写 :0');
+  // 游标锚到首个失败封 UID 前一位（退化轮首封即失败、无连续高水位、firstFailedUid=9）→ computeCursorToWrite
+  // 返 `uidValidity:firstFailedUid-1` = 5:8（**不**落 ④ 哨兵越过失败封、**非** null），使下轮转**增量** `UID 9:*`
+  // 重取失败封 9（守单封失败重取契约 :245「不推进游标过它、下轮重取」，且受 UID 下界约束、非 :0 无界重扫）。
+  assert.equal(await getCursor(repo), '5:8', '退化轮首封即失败 → 锚到 firstFailedUid-1（不越过失败封）');
+
+  // 第二轮：失败封 UID 9 这次正常处理。游标 5:8、uidValidity 匹配 → 增量轮 SEARCH `UID 9:*`，UID 9 仍在搜索范围内。
+  failOn9 = false;
+  conn.searchCalls.length = 0;
+  conn.fetchCalls.length = 0;
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 转增量轮 SEARCH `UID 9:*`（游标已锚到 5:8、uidValidity 匹配）→ 失败封 9 在本轮搜索范围内、被重取。
+  assert.deepEqual(conn.searchCalls[0], { uid: '9:*' }, '游标锚到 firstFailedUid-1 → 转增量、失败封在搜索范围内');
+  assert.ok(conn.fetchCalls.includes(9), '失败封 UID 9 下轮被重取（:245 重取契约）');
+  // UID 9 这次成功处理（新进流水线）；UID 11 已处理 → dedup 早退（不新增 classify）。
+  assert.ok(
+    classify.calls.some((c) => c.uid === 9),
+    '失败封 UID 9 下轮被重取并成功处理（不漏收）',
+  );
 });
 
 test('全空白 Message-ID → 回退 UID 合成键 imap-uid:<uidValidity>-<uid>、不丢弃', async () => {
@@ -477,17 +496,19 @@ test('mailboxOpen 缺 UIDNEXT + 退化轮有取回 → 游标=取回连续高水
   assert.ok(!cursor!.includes('NaN'), '禁写 NaN');
 });
 
-test('mailboxOpen 缺 UIDNEXT + 退化轮空集 → 游标 uidValidity:0（不写 NaN）', async () => {
-  const conn = new FakeConnection({ uidValidity: 5 }); // 无 uidNext、无消息。
+test('mailboxOpen 缺 UIDNEXT + 退化轮空集 + 邮箱本就空 → 不写游标（保持退化轮、不写 :0/NaN）', async () => {
+  const conn = new FakeConnection({ uidValidity: 5 }); // 无 uidNext、无消息（邮箱本就空）。
   const repo = await makeRepo();
   const classify = makeClassifySpy(makeClassification());
   const { deps } = makeDeps(conn, repo, classify);
 
   await pollOnce(ACCOUNT_ID, deps);
-  const cursor = await getCursor(repo);
-  // floor ④：空集 + 无 UIDNEXT → :0。
-  assert.equal(cursor, '5:0');
-  assert.ok(!cursor!.includes('NaN'), '禁写 NaN');
+  // floor ④ 哨兵 need-max-uid：空集 + 无 UIDNEXT → pollOnce 经 search({uid:'1:*'}) 兑现；
+  // 邮箱本就空（`1:*` 也空）→ **不写**游标、保持退化轮（下轮仍空、无害、无进度需求）。
+  // tasks 4.3 / spec「空退化轮、UIDNEXT 缺失、邮箱本就空 → 保持退化轮」。
+  assert.equal(await getCursor(repo), null, '邮箱本就空 → 不写游标（保持退化轮）');
+  // 该轮做了两次 search：退化轮 {seen:false}（空集）+ 哨兵兑现 {uid:'1:*'}（也空）。
+  assert.deepEqual(conn.searchCalls, [{ seen: false }, { uid: '1:*' }]);
 });
 
 // ——————————————————————————————————————————————————————————
@@ -582,15 +603,28 @@ test('poison 邮件（某 UID 持续失败）→ 游标钉在其前、每轮重�
 // ——————————————————————————————————————————————————————————
 
 test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取重跑、无孤儿行', async () => {
+  // UID 14 先成功（建立连续高水位 14）、UID 15 崩溃。如此退化轮落 floor ②（有高水位、非全成功）→
+  // 游标停在高水位 14（崩溃封 15 仍在游标之上、下轮增量 `UID 15:*` 重取）；**不**走 floor ④ 哨兵
+  // need-max-uid（那会经 search({uid:'1:*'}) 取 maxUid=15 纳入游标、令崩溃封落入游标下不再被增量重取——
+  // 即 design 决策 8 显式接受的退化轮空集竞态。此处用前置成功封确保走崩溃重取路径、保住本测试原意）。
   const conn = new FakeConnection({ uidValidity: 5, uidNext: 16 });
+  conn.setMessage(fetched(14));
   conn.setMessage(fetched(15));
   const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
 
   // 第一轮：模拟标已读后、markProcessed 前崩溃——用一个在 markProcessed 抛的 repo 包装。
+  // 仅对 UID 15 那封（dedup 键 <mid-15@…>）崩溃；UID 14 那封正常落地（建立连续高水位 14）。
+  // 经 saveEmail 记录 rowId→providerMessageId 映射以在 markProcessed 时判别是哪封（emailsById 私有）。
   class CrashAfterMarkReadRepo extends InMemoryMailRepo {
     crash = true;
-    async markProcessed(id: string): Promise<void> {
-      if (this.crash) {
+    private pmidByRowId = new Map<string, string>();
+    override async saveEmail(email: NormalizedEmail): Promise<StoredEmail> {
+      const stored = await super.saveEmail(email);
+      this.pmidByRowId.set(stored.id, email.providerMessageId);
+      return stored;
+    }
+    override async markProcessed(id: string): Promise<void> {
+      if (this.crash && this.pmidByRowId.get(id) === '<mid-15@example.com>') {
         throw new Error('crash before markProcessed commit');
       }
       return super.markProcessed(id);
@@ -612,27 +646,98 @@ test('P2 标已读后崩溃（markProcessed 未跑）→ 下轮经游标重取�
     processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify, notifier }),
   };
 
-  // 崩溃发生在单封 processEmail 内（markProcessed 抛）→ poller 单封 catch 跳过、游标不越过它。
+  // 崩溃发生在单封 processEmail 内（UID 15 markProcessed 抛）→ poller 单封 catch 跳过、游标不越过它。
   await pollOnce(ACCOUNT_ID, deps1);
-  // 标已读确实发生了（崩在 markProcessed 之前、动作之后）。
-  assert.equal(provider.markReadCalls.length, 1);
-  // markProcessed 抛 → 单封视为失败 → 无连续高水位（首封即失败）→ 退化 floor ④ 写 5:0。
-  assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:0');
-  // 无孤儿行：邮件行存在但 processedAt 仍 null（未 markProcessed）。
+  // 两封都标了已读（14 成功 + 15 崩在 markProcessed 之前、动作之后）。
+  assert.equal(provider.markReadCalls.length, 2);
+  // UID 14 成功 → 连续高水位 14；UID 15 失败即停 → 退化 floor ②（有高水位、非全成功）写 5:14
+  // （崩溃封 15 仍在游标之上、下轮增量重取；**不**走哨兵 need-max-uid 把 15 纳入游标）。
+  assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:14');
+  // 无孤儿行：UID 15 行存在但 processedAt 仍 null（未 markProcessed）。
   const stored1 = await crashRepo.findByDedupKey(ACCOUNT_ID, '<mid-15@example.com>');
   assert.ok(stored1 !== null && stored1.processedAt === null, '崩溃后该行 processedAt 仍 null（待重跑）');
 
-  // 第二轮：修复（不再崩）。游标 5:0 → 增量 SEARCH `UID 1:*` 重取 15 → dedup 见 processedAt=null → 重跑。
+  // 第二轮：修复（不再崩）。游标 5:14 → 增量 SEARCH `UID 15:*` 重取 15 → dedup 见 processedAt=null → 重跑。
   crashRepo.crash = false;
   conn.searchCalls.length = 0;
   await pollOnce(ACCOUNT_ID, deps1);
-  assert.deepEqual(conn.searchCalls[0], { uid: '1:*' });
+  assert.deepEqual(conn.searchCalls[0], { uid: '15:*' });
   const stored2 = await crashRepo.findByDedupKey(ACCOUNT_ID, '<mid-15@example.com>');
   assert.ok(stored2 !== null && stored2.processedAt !== null, '重跑后 markProcessed 完成（无孤儿行）');
-  // 标已读幂等：重跑又标了一次（FakeProvider 记 2 次），安全。
-  assert.equal(provider.markReadCalls.length, 2);
+  // 标已读幂等：UID 15 重跑又标了一次（FakeProvider 累计 3 次：首轮 14+15、二轮 15）。
+  assert.equal(provider.markReadCalls.length, 3);
   // 游标推进过 15 → 5:15。
   assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:15');
+});
+
+test('P2-crash 退化轮首封孤儿（无前置成功封、markRead 成功后 markProcessed 抛）→ 游标锚 firstFailedUid-1、下轮增量重取已 read 封', async () => {
+  // 本 FIX 核心回归：退化轮**首封**（无前置成功封）markRead 成功、markProcessed 抛 → 该封已变 **read**。
+  // 生产语义：旧 Option-A（`if (!allSucceeded) return null`）下游标不写、保持退化轮，**真 IMAP** 下轮 SEARCH UNSEEN
+  // **不再返回**这封已 read 封 → processedAt=null **永久孤儿**；本 FIX 锚 `firstFailedUid-1` 转**增量** `UID 5:*`
+  // （不带 UNSEEN 过滤）仍重取它、dedup 兜回。
+  // **测试保真度说明**：本测试的 FakeConnection `{seen:false}` 搜索返回全部 key、**不**建模 read 态剔除（markRead 为
+  // no-op），故本测试**不**靠「UNSEEN 不返回已 read 封」复现孤儿，而是经**游标形状 + 轮类型**断言守住回归——旧
+  // Option-A 下游标会是 null（非 `5:4`）、第二轮会是退化轮 `{seen:false}`（非增量 `{uid:'5:*'}`），两断言在旧实现下即 FAIL。
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 6 });
+  conn.setMessage(fetched(5)); // 退化轮唯一一封、首封（无前置成功封）。
+  const classify = makeClassifySpy(makeClassification({ priority: 'P2' }));
+
+  // markRead 成功、markProcessed 抛——仅对 UID 5 那封（dedup 键 <mid-5@…>）崩溃。
+  class CrashAfterMarkReadRepo extends InMemoryMailRepo {
+    crash = true;
+    private pmidByRowId = new Map<string, string>();
+    override async saveEmail(email: NormalizedEmail): Promise<StoredEmail> {
+      const stored = await super.saveEmail(email);
+      this.pmidByRowId.set(stored.id, email.providerMessageId);
+      return stored;
+    }
+    override async markProcessed(id: string): Promise<void> {
+      if (this.crash && this.pmidByRowId.get(id) === '<mid-5@example.com>') {
+        throw new Error('crash before markProcessed commit');
+      }
+      return super.markProcessed(id);
+    }
+  }
+  const crashRepo = new CrashAfterMarkReadRepo();
+  await crashRepo.upsertAccount({
+    id: ACCOUNT_ID,
+    provider: 'imap',
+    email: 'u@h',
+    authJson: { host: 'h', port: 993, user: 'u', password: 'p', tls: true },
+  });
+  const provider = new FakeProviderActions();
+  const notifier = createNotifier({ channel: noopChannel() });
+  const deps: PollDeps = {
+    connection: conn,
+    repo: crashRepo,
+    makeProvider: () => provider,
+    processEmail: (email, d) => processEmail(email, { repo: d.repo, provider: d.provider, classify, notifier }),
+  };
+
+  // 第一轮：退化轮 SEARCH UNSEEN → 取 UID 5，markRead 成功、markProcessed 抛 → 单封 catch 跳过。
+  await pollOnce(ACCOUNT_ID, deps);
+  assert.deepEqual(conn.searchCalls[0], { seen: false }, '首轮退化轮 SEARCH UNSEEN');
+  // 该封已标已读（markRead 成功、markProcessed 前崩）。
+  assert.equal(provider.markReadCalls.length, 1, '失败封 markRead 已成功（变 read）');
+  // 游标锚到 firstFailedUid-1 = 5:4（**非** null、**非** maxUid 越过它）。
+  assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:4', '退化轮首封孤儿 → 锚 firstFailedUid-1（非 null、非越过）');
+  // 无孤儿行：UID 5 行存在但 processedAt 仍 null（待重跑）。
+  const stored1 = await crashRepo.findByDedupKey(ACCOUNT_ID, '<mid-5@example.com>');
+  assert.ok(stored1 !== null && stored1.processedAt === null, '崩溃后该行 processedAt 仍 null（待重跑）');
+
+  // 第二轮：修复（不再崩）。游标 5:4、uidValidity 匹配 → 增量 SEARCH `UID 5:*`（不带 UNSEEN 过滤）重取 UID 5。
+  // 旧 Option-A null 下游标停 null → 此轮仍退化轮 `{seen:false}`（非增量 `{uid:'5:*'}`）→ 下方断言在旧实现下 FAIL。
+  crashRepo.crash = false;
+  conn.searchCalls.length = 0;
+  conn.fetchCalls.length = 0;
+  await pollOnce(ACCOUNT_ID, deps);
+  assert.deepEqual(conn.searchCalls[0], { uid: '5:*' }, '转增量重取（生产中已 read 封仍被 `UID 5:*` 返回、UNSEEN 不会；此处断言的是增量轮类型）');
+  assert.ok(conn.fetchCalls.includes(5), '已 read 的失败封 UID 5 被增量重取（孤儿兜回）');
+  // dedup 见 processedAt=null → 重跑成功。
+  const stored2 = await crashRepo.findByDedupKey(ACCOUNT_ID, '<mid-5@example.com>');
+  assert.ok(stored2 !== null && stored2.processedAt !== null, '重跑后 markProcessed 完成（无孤儿行）');
+  // 游标推进过 5 → 5:5。
+  assert.equal(await crashRepo.getCursor(ACCOUNT_ID), '5:5', '重跑后游标推进过失败封');
 });
 
 // ——————————————————————————————————————————————————————————
@@ -858,4 +963,173 @@ test('drain：三动作 sink 不读 to/headers（合成空值投影对 notify/ma
     const rows = repo.getActions(stored.id);
     assert.ok(rows.every((a) => a.status === 'done'), `${pmid} 动作落 done（合成空值不影响 sink）`);
   }
+});
+
+// ——————————————————————————————————————————————————————————
+// 组 E 6.1：摄入 IMAP 退化轮日期下界（processFrom）
+//
+// 经 pollOnce 的 deps.processFrom（pollAccount 从 account.processFrom 转入此处的决策点——
+// 见 imapPoller.ts:421-427）驱动。**接线说明**：真实入口 pollAccount 内部 createRealImapConnection(account)
+// 无离线注入 seam（会建真 IMAP 连接），故无法离线驱动 pollAccount 全路径；此处在 pollOnce 层用 fake
+// connection 覆盖退化轮搜索条件 / 旧邮件排除 / 游标行为（pollAccount→pollOnce 的 processFrom 转发
+// 是单行 deps 透传、imapPoller.ts:426 已落地，连接 seam 缺口记进组报告 issues）。
+// ——————————————————————————————————————————————————————————
+
+const PROCESS_FROM = new Date('2026-06-15T00:00:00.000Z');
+
+/**
+ * 模拟服务器 SEARCH `UNSEEN [SINCE]` 语义的 fake search：
+ *  - 退化轮 {seen:false[, since]}：返回所有未读 UID，且当传 since 时**排除 INTERNALDATE < since 的旧邮件**
+ *    （以 messages 的 fetched.date 作 INTERNALDATE 近似）。since 与 UNSEEN 合取（这里 fixture 都视为未读）。
+ *  - 增量 {uid:'<lo>:*'} / {uid:'1:*'}：返回 >= lo 的 UID（同 defaultSearch）。
+ * 记录每次退化轮收到的 criteria 供「{seen:false, since} 合取」断言。
+ */
+function sinceAwareSearch(conn: FakeConnection): (criteria: ImapSearchCriteria) => number[] {
+  return (criteria) => {
+    const keys = [...conn.messages.keys()];
+    if ('seen' in criteria) {
+      const since = criteria.since;
+      if (since === undefined) {
+        return keys; // 全量 UNSEEN（NULL processFrom）。
+      }
+      // 合取 SINCE：排除 INTERNALDATE（fetched.date）严格早于 since 的旧邮件（服务器日期粒度，这里用瞬时近似）。
+      return keys.filter((uid) => {
+        const d = conn.messages.get(uid)!.date;
+        return d !== undefined && d.getTime() >= since.getTime();
+      });
+    }
+    const lo = Number(criteria.uid.split(':')[0]);
+    return keys.filter((k) => k >= lo);
+  };
+}
+
+test('6.1 退化轮 processFrom 非空 → 搜索条件 {seen:false, since} 合取、旧邮件（INTERNALDATE<processFrom）被排除', async () => {
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 13 });
+  // UID 8 旧（6-10 < processFrom 6-15）→ 应被退化轮 SINCE 排除；UID 12 新（6-20 ≥ 6-15）→ 命中。
+  conn.setMessage(fetched(8, { date: new Date('2026-06-10T00:00:00.000Z') }));
+  conn.setMessage(fetched(12, { date: new Date('2026-06-20T00:00:00.000Z') }));
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps: baseDeps } = makeDeps(conn, repo, classify);
+  const deps: PollDeps = { ...baseDeps, processFrom: PROCESS_FROM };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 退化轮搜索条件 = {seen:false, since} 合取（**不**替换 seen，否则会摄入已读旧邮件）。
+  assert.deepEqual(conn.searchCalls[0], { seen: false, since: PROCESS_FROM });
+  // 旧邮件 UID 8（INTERNALDATE < processFrom）被退化轮排除：仅 UID 12 进流水线、被 FETCH。
+  assert.equal(classify.calls.length, 1, '仅新邮件进流水线（旧邮件被 SINCE 排除）');
+  assert.equal(classify.calls[0]!.uid, 12);
+  assert.deepEqual(conn.fetchCalls, [12], '旧 UID 8 未被 FETCH（不在 SINCE 命中集）');
+});
+
+test('6.1 退化轮 processFrom = NULL → 全量 UNSEEN（{seen:false}、不附 since）', async () => {
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 13 });
+  // 同样的旧+新两封；NULL 下界 → 两封都应进流水线（全量 UNSEEN）。
+  conn.setMessage(fetched(8, { date: new Date('2026-06-10T00:00:00.000Z') }));
+  conn.setMessage(fetched(12, { date: new Date('2026-06-20T00:00:00.000Z') }));
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps } = makeDeps(conn, repo, classify); // 不设 processFrom（= NULL/缺省）。
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 全量 UNSEEN：criteria 恰为 {seen:false}、**无** since 键。
+  assert.deepEqual(conn.searchCalls[0], { seen: false });
+  assert.ok(!('since' in conn.searchCalls[0]!), 'NULL processFrom → 不附 since');
+  // 旧+新都进流水线（无日期下界）。
+  assert.equal(classify.calls.length, 2, 'NULL → 全量 UNSEEN，旧邮件也摄入');
+});
+
+test('6.1 增量轮不受 processFrom 约束：游标推进后 SEARCH `UID 游标+1:*` 不带 since', async () => {
+  // 退化轮已推进游标后，下一轮走增量轮——processFrom 仅约束退化轮（一次性），增量轮按 UID 游标、不带日期下界。
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 13 });
+  conn.setMessage(fetched(12, { date: new Date('2026-06-20T00:00:00.000Z') }));
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps: baseDeps } = makeDeps(conn, repo, classify);
+  const deps: PollDeps = { ...baseDeps, processFrom: PROCESS_FROM };
+
+  await pollOnce(ACCOUNT_ID, deps); // 退化轮：{seen:false, since}，处理 12，游标 5:12（UIDNEXT-1）。
+  assert.deepEqual(conn.searchCalls[0], { seen: false, since: PROCESS_FROM });
+  assert.equal(await getCursor(repo), '5:12');
+
+  conn.searchCalls.length = 0;
+  await pollOnce(ACCOUNT_ID, deps); // 第二轮增量：`UID 13:*`，**不**带 since（即便 processFrom 非空）。
+  assert.deepEqual(conn.searchCalls[0], { uid: '13:*' }, '增量轮按 UID 游标、不附日期下界');
+});
+
+// ——————————————————————————————————————————————————————————
+// 组 E 6.2：退化轮空集安全游标（SINCE 过滤后空集）
+// 必须驱动真实 pollOnce 异步路径（哨兵 need-max-uid 由 pollOnce await search({uid:'1:*'}) 兑现）。
+// ——————————————————————————————————————————————————————————
+
+test('6.2 退化轮 SINCE 空集 + UIDNEXT 有效 → 游标 UIDNEXT-1、下轮转增量（不重扫历史）', async () => {
+  // 所有未读都早于 processFrom → 退化轮 {seen:false, since} 返回空集；UIDNEXT=30 有效。
+  const conn = new FakeConnection({ uidValidity: 5, uidNext: 30 });
+  conn.setMessage(fetched(8, { date: new Date('2026-06-10T00:00:00.000Z') })); // 早于 processFrom → SINCE 排除。
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps: baseDeps } = makeDeps(conn, repo, classify);
+  const deps: PollDeps = { ...baseDeps, processFrom: PROCESS_FROM };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 退化轮 SINCE 命中空集（旧邮件被排除）。
+  assert.deepEqual(conn.searchCalls[0], { seen: false, since: PROCESS_FROM });
+  assert.equal(classify.calls.length, 0, 'SINCE 排除后无新邮件进流水线');
+  // floor ①：空集全成功 + UIDNEXT=30 → 5:29（**非** :0、非旧高水位、非无界）。
+  assert.equal(await getCursor(repo), '5:29', '空 SINCE + 有效 UIDNEXT → UIDNEXT-1（转增量、不重扫）');
+
+  // 下轮：uidValidity 匹配 → 增量分支 `UID 30:*`（不再重扫历史旧未读）。
+  conn.searchCalls.length = 0;
+  await pollOnce(ACCOUNT_ID, deps);
+  assert.deepEqual(conn.searchCalls[0], { uid: '30:*' }, '转增量、不重扫');
+});
+
+test('6.2 退化轮 SINCE 空集 + UIDNEXT 缺失 → 经 search({uid:1:*}) 写 maxUid、禁 :0、禁无界重扫', async () => {
+  // 关键：必须驱动真实 pollOnce 异步路径——哨兵 need-max-uid 由 pollOnce await search({uid:'1:*'}) 兑现。
+  // 退化轮 {seen:false, since} 返回空集；但邮箱里仍有早于 processFrom 的旧邮件（UID 25 是现有最大 UID）。
+  const conn = new FakeConnection({ uidValidity: 5 }); // **无 uidNext**。
+  conn.setMessage(fetched(20, { date: new Date('2026-06-01T00:00:00.000Z') }));
+  conn.setMessage(fetched(25, { date: new Date('2026-06-05T00:00:00.000Z') })); // 现有最大 UID（旧邮件）。
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps: baseDeps } = makeDeps(conn, repo, classify);
+  const deps: PollDeps = { ...baseDeps, processFrom: PROCESS_FROM };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  // 两次 search：退化轮 {seen:false, since}（SINCE 排除全部旧邮件→空集）+ 哨兵兑现 {uid:'1:*'}（取现有最大 UID）。
+  assert.deepEqual(conn.searchCalls, [{ seen: false, since: PROCESS_FROM }, { uid: '1:*' }]);
+  assert.equal(classify.calls.length, 0, 'SINCE 排除后无新邮件进流水线');
+  // 游标 = uidValidity:<现有最大 UID 25>，**非** :0（否则下轮 `UID 1:*` 无界重扫整箱历史）。
+  const cursor = await getCursor(repo);
+  assert.equal(cursor, '5:25', 'UIDNEXT 缺失 → search(1:*) 取 maxUid=25、写 5:25');
+  assert.ok(!cursor!.endsWith(':0'), '禁写 :0（无界重扫）');
+
+  // 下轮：游标 5:25、uidValidity 匹配 → 增量 `UID 26:*`（不重扫 1:* 整箱历史）。
+  conn.searchCalls.length = 0;
+  await pollOnce(ACCOUNT_ID, deps);
+  assert.deepEqual(conn.searchCalls[0], { uid: '26:*' }, '转增量、不无界重扫');
+});
+
+test('6.2 退化轮 SINCE 空集 + UIDNEXT 缺失 + 邮箱本就空 → 不写游标（保持退化轮，不写 :0）', async () => {
+  // 邮箱无任何邮件：退化轮 {seen:false, since} 空集，哨兵兑现 search({uid:'1:*'}) 也空 → 保持退化轮、不写游标。
+  const conn = new FakeConnection({ uidValidity: 5 }); // 无 uidNext、无消息。
+  conn.searchImpl = sinceAwareSearch(conn);
+  const repo = await makeRepo();
+  const classify = makeClassifySpy(makeClassification());
+  const { deps: baseDeps } = makeDeps(conn, repo, classify);
+  const deps: PollDeps = { ...baseDeps, processFrom: PROCESS_FROM };
+
+  await pollOnce(ACCOUNT_ID, deps);
+
+  assert.deepEqual(conn.searchCalls, [{ seen: false, since: PROCESS_FROM }, { uid: '1:*' }]);
+  assert.equal(await getCursor(repo), null, '邮箱本就空 → 不写游标（保持退化轮、不写 :0）');
 });

@@ -78,3 +78,47 @@ compose 的 `./rules:/app/rules:ro` bind-mount 是无条件的：**挂载存在�
 2. `docker compose up -d --force-recreate`（= `pnpm run reload`）
 3. 校验 `/health`：`curl localhost:${APP_HOST_PORT:-3000}/health` 返 `{"status":"ok"}`（200）。
 4. 校验摘要调度器：确认日志打印新的 `taskCount`（env 改动如 `DIGEST_TIMES` 生效的标志；`restart` 不会）。
+
+## 账号起算日期水位线（`processFrom`）
+
+每个账号有一个可空的「起算日期」水位线 `processFrom`：摄入与摘要都会排除 `receivedAt < processFrom` 的旧邮件（接入前的历史积压），`processFrom = NULL` 则不设下界、保持全量行为。
+
+`add_process_from` 迁移**只新增可空列 `processFrom`、默认 NULL**——存量账号**不**被自动盖戳，行为不变（不回溯改写历史）。**新接入**的账号（`account add`）默认在接入时刻种值，无需手动盖。
+
+### 存量账号止血（迁移部署后必做一次）
+
+迁移部署后，要让已存在的账号压住接入前的历史积压，运维**必须**对每个存量账号显式盖戳：
+
+1. 取账号 id（输出 `id` / `provider` / `email` / `enabled`）：
+
+   ```bash
+   account list           # 人类可读表格
+   account list --json    # 脚本化取 id（输出 JSON 数组，便于 jq 提取）
+   ```
+
+2. 对每个存量账号盖戳到**接入处理日之后**的日期（如「今天」）：
+
+   ```bash
+   account set-process-from <id> <YYYY-MM-DD>
+   ```
+
+3. **重启**服务使摄入下界生效（下界在轮询路径上，不重启不生效）：
+
+   ```bash
+   docker compose restart inbox-pilot
+   ```
+
+4. 校验：下一次摘要不再包含接入前的旧邮件。
+
+### 为何盖「接入处理日之后」（如今天）而非接入当日
+
+存量账号必须盖到**接入处理日之后**的日期（盖「今天」是稳妥默认），原因有二：
+
+- **UTC 零点前移问题**：`set-process-from` 把日期解析为 **UTC 零点**。对当日（如当天下午）接入的账号盖「当日」，水位线会被**前移**到当日 00:00，反而把当日上午收到的邮件重新纳入。盖到次日才能让水位线确实晚于接入处理时刻。
+- **缺 `Date:` 头的旧邮件**：历史旧邮件缺 `Date:` 头（或不可解析）时，其摘要 `receivedAt` 回落到**摄入时刻**（即接入当时倒入的时刻），而非真实收信时间。只有水位线**晚于**摄入时刻才能排除这类邮件——故须盖到接入处理日之后。
+
+### `set-process-from` vs `add --process-from`
+
+- `account set-process-from <id> <date>`：改**既有**账号的水位线（无条件覆盖、可双向移动）。改既有账号**只能**用它。
+- `account add … --process-from <date>`：**仅用于新接入**指定起算日；对**已存在**账号执行不改其水位线（被忽略）。
+- 两者的 `<date>` 都只接受 `YYYY-MM-DD`、解析为 UTC 零点；非法日期或未来日期以用法错误（退出码 2）拒绝。

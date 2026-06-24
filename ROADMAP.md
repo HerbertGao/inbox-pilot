@@ -86,6 +86,52 @@
 
 ---
 
+## 生产降噪与评级校准（post-MVP · 优先做）
+
+MVP 上线到 ts.mac-mini 后实际运行暴露的问题，经诊断 + Software Architect 决策拆成 **4 个 OpenSpec 提案**。
+**次序：先发提案 1 止血，2、3 可并行跟上（3 软排在 2 后），4 待前置就绪再做。** 每个开工起一个 change（`/opsx:propose`）。
+
+**背景实证**（live DB + Gmail，2026-06-23 接入当天）：1189 封旧邮件一次性处理、594 条进单次摘要、
+P0–P2 占 **93%**（仅 5.6% 进 P3 静默）；旧邮件为**真·未读**（故按**日期**排除，不纠结读未读）。
+
+| 提案 | 解决 | 风险 | 次序 / 依赖 |
+|---|---|---|---|
+| 1 `onboarding-date-watermark` | 旧邮件刷屏（摄入水位线 + 摘要年龄窗） | 中 | **先做**（活跃事故） |
+| 2 `notification-mailbox-clarity` | 通知不指明邮箱 + `#`分类 + 统一 P0/P4 模板 | 低 | 1 后，独立 |
+| 3 `rating-calibration` | 过度评级（prompt 收紧 + 手动降噪轴 B1） | 中高（**安全**回归） | 软排 2 后 |
+| 4 `recurrence-auto-downgrade` | 周期性噪音自动降级（B2） | 中 | **推迟**：依赖 bodyHash 写入 + 回填 + 索引 |
+
+### 提案 1 · onboarding-date-watermark（解决「旧邮件刷屏」）
+- **两层都做、缺一不可**：已入库的 1189 封旧货只能靠**摘要年龄窗**压住，**水位线**只挡未来摄入——两者解决不同集合。
+- 新列 `MailAccount.processFrom DateTime?`（**不复用** `lastSyncCursor`（归 IMAP UID 游标）/`createdAt`）；接入时种 `now()`（可加宽限期 / `--process-from <ISO>` 覆盖）。
+- 摄入：IMAP 退化轮加 `SEARCH SINCE`、Gmail 加 `q += after:<epoch>`（Gmail 原本**完全无界**，最大收益）；`processFrom=NULL` ⇒ 省略下界（现状）。
+- **存量 3 账号**：迁移设 `NULL`（保持现状，dedup 已护稳态）+ 新 CLI `account set-process-from <id> <date>` 把它们盖到今天；外加全局 `DIGEST_MAX_AGE≈7d` 给 `listDigestCandidates` 兜底，压住现有积压不再进摘要。
+- 锚点：`prisma/schema.prisma`、`imapPoller.ts:119`、`gmailPoller.ts:101`、`mailRepo.ts:847-870`、`cli/account.ts`。
+
+### 提案 2 · notification-mailbox-clarity（解决「不知哪个邮箱」+ 中文化）
+- `accountId` 加进 `NotificationPayload`（已在作用域）→ 渲染**人类可读邮箱标签**（剥 `gmail:`/`imap:` 前缀）。
+- **可选中文邮箱别名**（用户诉求：添加账号时想用中文标识）。关键取舍：**account-id 主键保持 ASCII 不放松**——它是主键 + 结构化日志字段，inbox-pilot-cli 已故意禁非 ASCII 防日志注入（F 系列评审的结论），放松即重新引入注入面。改为**另加**可选列 `MailAccount.label`（允许中文/Unicode，仅校验**拒控制字符/换行** + 限长，区别于 PK 的严格 ASCII）+ 账号 `add` 时 `--label <名>` 设置；通知**优先渲染 label**，未设则回落派生的 accountId 标签。
+- **分类统一中文标签**（用户诉求）：category 英文枚举 → 中文映射，渲染 `#系统告警` / `#交易` / `#安全` / `#营销` 等（Telegram 支持中文 hashtag，便于统一搜索）。映射表是唯一新增、单点维护。
+- **P0/P4 合并成一套模板**，`riskFlags` 非空才显示——消除现有字段不一致。
+- 不泄露正文（均为已白名单结构字段，`textBody`/`htmlBody` 仍结构性排除）。
+- 锚点：`notifier.ts:26-35,73-84`、`telegram.ts:29-49`、`prisma/schema.prisma`（新 `label` 列）、`cli/account.ts`（`--label` + label 校验）。
+- 范围注：因加了 `label` 列 + account-add 流程，比纯渲染略大（仍低风险：增列 + 可选 flag）。
+
+### 提案 3 · rating-calibration（③A prompt + ③B-手动 B1）
+- **③A 只改 prompt、不动规则引擎**：把「**任何疑似**钓鱼/异常登录/支付风险 → P4」改为「**P4 需内容层欺骗证据**（诱导按欺骗前提行动），表层信号（TLD `.xyz` / 截断 / 未渲染模板 / return-path 单独，尤其命中自有转发域）**不作数**」；P0 去掉「交易/告警」一刀切（收据 → P2）。
+- **强制双向回归语料**：4 个误报样例（网易登录 / PayPal 收据 / HKSS / 交易收据）+ 一组**真钓鱼**；CI 里真钓鱼掉出 P4 即失败——证明没削弱检测。
+- **③B-B1**：rules.yaml 新增第六轴 `noise_senders`（按发件人 / 域名 / 主题降级到 P2/P3），插在敏感守卫之后、`!sensitiveGuardFired` 门控——能压过度高评的 P0，**绝不**清「不自动已读」硬底线（被降级的 cloudflared 告警若来自敏感发件人仍保持未读）。NAS 每日 + HKSS 每周各一行规则即可。
+- 锚点：`classifier/prompt.ts:21,23,26-27`、`rules/applySafetyRules.ts:185-206`、`rules/rulesConfig.ts` + `specs/rules-config/spec.md`。
+- **全套最大风险**：③A 失败即**安全事故**（真钓鱼被降级 + 自动已读）。四重拆弹：① 引擎硬底线原封不动（prompt 只能误评、清不掉底线）；② 真钓鱼反向语料 CI 守门；③ 非对称收紧（只收表层触发，内容欺骗仍偏 P4）；④ 现有 `confidence<0.65→P1` 兜底犹豫。
+
+### 提案 4 · recurrence-auto-downgrade（③B-自动 B2 · 推迟）
+- **为何推迟（前置工作）**：`bodyHash` 是**死列**（`schema.prisma:38`，`src/` 无任何写入）→ 需补写入路径 + **回填历史行** + 加索引 `(accountId, fromEmail, receivedAt)`，是有状态新子系统，非加索引即可。
+- 设计已预解：指标用「**归一主题 + fromEmail** 复发计数 / 滚动窗」（exact `bodyHash` 因模板含时间戳/ID 会漏数，仅作二次确认）；归一主题 = 去数字/日期/UUID + 小写 + 折叠空白；阈值 ≈ 14 天内 ≥3 次 → 降级候选。
+- 同 B1 门控：`!sensitiveGuardFired`、**绝不**动验证码 / 敏感类。
+- **可观测**：每决策 `appliedRules:['auto-recurrence→P2']`（机器审计）+ **每日摘要里一行**「N 条按复发自动降噪：…」让人看见被静默了什么（防误降的项无声消失）。
+
+---
+
 ## 后续技术演进（非 MVP 阻塞，留作有计划迁移）
 
 - **Prisma 7 升级（可选与 Node 26 一并做）**：Prisma 7 是 breaking major（新客户端生成模型 / ESM、引擎走 wasm、会拖入

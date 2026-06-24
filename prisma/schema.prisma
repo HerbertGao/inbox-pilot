@@ -13,6 +13,10 @@ model MailAccount {
   email          String
   authJson       Json
   lastSyncCursor String?
+  // 起算日期水位线（onboarding-watermark 决策 1）：per-account UTC「起算时间」下界，
+  // 可空（NULL = 不设下界、保持全量）；存 Postgres TIMESTAMP、与 receivedAt 同类型可直接比较。
+  // 独立列，**不**复用 lastSyncCursor（归 IMAP UID 游标）/ createdAt（审计语义）。
+  processFrom    DateTime?
   enabled        Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt

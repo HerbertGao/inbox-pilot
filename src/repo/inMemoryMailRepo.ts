@@ -28,6 +28,7 @@ import {
   type StoredAccount,
   type StoredEmail,
 } from './mailRepo.js';
+import { passesWatermark } from './watermark.js';
 
 /** 内存邮件行（保留去重键以支持 findByDedupKey / saveEmail 幂等）。 */
 type EmailRow = {
@@ -79,7 +80,17 @@ type AccountRow = {
   email: string;
   authJson: unknown;
   enabled: boolean;
+  /** 起算日期水位线（onboarding-watermark；NULL = 不设下界）。镜像 StoredAccount.processFrom。 */
+  processFrom: Date | null;
 };
+
+/**
+ * 克隆水位线 Date：防外部经引用改内部状态，并与 PrismaMailRepo（每次读从 PG 反序列化出全新 Date）的
+ * 值语义对齐——本内存双件在存/取边界不外泄、不 retain 可变 Date 引用（避免双件与真实 repo 的值语义漂移）。
+ */
+function cloneProcessFrom(d: Date | null): Date | null {
+  return d === null ? null : new Date(d.getTime());
+}
 
 export class InMemoryMailRepo implements MailRepo {
   private readonly emailsById = new Map<string, EmailRow>();
@@ -101,7 +112,7 @@ export class InMemoryMailRepo implements MailRepo {
     const rows: StoredAccount[] = [];
     for (const row of this.accountsById.values()) {
       if (row.enabled) {
-        rows.push({ ...row });
+        rows.push({ ...row, processFrom: cloneProcessFrom(row.processFrom) });
       }
     }
     return rows;
@@ -111,14 +122,14 @@ export class InMemoryMailRepo implements MailRepo {
     // 所有行（不按 enabled 过滤）——account list 用，使被禁用/reauth-suspend 的行可见。
     const rows: StoredAccount[] = [];
     for (const row of this.accountsById.values()) {
-      rows.push({ ...row });
+      rows.push({ ...row, processFrom: cloneProcessFrom(row.processFrom) });
     }
     return rows;
   }
 
   async getAccountById(id: string): Promise<StoredAccount | null> {
     const row = this.accountsById.get(id);
-    return row === undefined ? null : { ...row };
+    return row === undefined ? null : { ...row, processFrom: cloneProcessFrom(row.processFrom) };
   }
 
   async updateGmailTokens(
@@ -137,6 +148,16 @@ export class InMemoryMailRepo implements MailRepo {
   }
 
   async upsertAccount(input: AccountWriteInput): Promise<void> {
+    // 水位线 get-before-set（onboarding-watermark 决策 7，顺序 load-bearing）：读必须先于下面的 .set，
+    // 因 .set 会整行替换、clobber 既有 processFrom。existing 存在（update/re-auth）⇒ 保留 existing.processFrom、
+    // **忽略 input**（Prisma 经省略字段达成相同语义）；不存在（create）⇒ input.processFrom ?? 精确瞬时。
+    const existing = this.accountsById.get(input.id);
+    // existing（update/re-auth）保留内部 Date 引用（已是本件私有）；create 分支克隆外部 input.processFrom
+    // （或种精确瞬时 new Date()），不 retain 调用方可变引用——与 Prisma 值语义对齐。
+    const processFrom =
+      existing !== undefined
+        ? existing.processFrom
+        : cloneProcessFrom(input.processFrom ?? null) ?? new Date();
     // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
     this.accountsById.set(input.id, {
       id: input.id,
@@ -144,6 +165,7 @@ export class InMemoryMailRepo implements MailRepo {
       email: input.email,
       authJson: input.authJson,
       enabled: input.enabled ?? true,
+      processFrom,
     });
     // 写入路径即「播种」游标命名空间（取代旧 ensureAccountAnchor）；幂等：已存不重置游标。
     if (!this.cursorsByAccountId.has(input.id)) {
@@ -165,6 +187,15 @@ export class InMemoryMailRepo implements MailRepo {
       throw new Error(`InMemoryMailRepo.setAccountEnabled: 未知 accountId ${id}`);
     }
     row.enabled = enabled;
+  }
+
+  async setProcessFrom(id: string, date: Date): Promise<void> {
+    // 无条件覆盖既有水位线（onboarding-watermark：唯一改既有行 processFrom 的路径，与 prisma 一致）。
+    const row = this.accountsById.get(id);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.setProcessFrom: 未知 accountId ${id}`);
+    }
+    row.processFrom = cloneProcessFrom(date); // 克隆外部 Date（不 retain 调用方可变引用）。
   }
 
   async getCursor(accountId: string): Promise<string | null> {
@@ -480,6 +511,13 @@ export class InMemoryMailRepo implements MailRepo {
       ) {
         continue;
       }
+      // 水位线下界（onboarding-watermark 决策 9，与 prisma 同一谓词）：排除 receivedAt < 该账号 processFrom
+      // 的接入前历史积压；NULL 或账号缺失（accountsById 无此行）⇒ undefined ⇒ passesWatermark 放行。
+      // prisma 用 MailMessage.receivedAt = new Date(email.date)；内存镜像同一映射。
+      const receivedAt = new Date(row.email.date);
+      if (!passesWatermark(receivedAt, this.accountsById.get(row.accountId)?.processFrom)) {
+        continue;
+      }
       const latest = this.getLatestClassification(row.id);
       if (latest === null) {
         logger.debug(
@@ -504,8 +542,8 @@ export class InMemoryMailRepo implements MailRepo {
         fromEmail: email.fromEmail,
         ...(email.fromName !== undefined ? { fromName: email.fromName } : {}),
         reason: latest.reason,
-        // prisma 用 MailMessage.receivedAt = new Date(email.date)；内存镜像同一映射。
-        receivedAt: new Date(email.date),
+        // 复用上面水位线判定算出的 receivedAt（= new Date(email.date)，与 prisma MailMessage.receivedAt 一致）。
+        receivedAt,
         id: row.id,
       });
     }

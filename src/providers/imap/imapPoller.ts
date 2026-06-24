@@ -61,6 +61,12 @@ export type PollDeps = {
   /** 落库 / 游标 seam（prod: PrismaMailRepo；测试: InMemoryMailRepo）。 */
   readonly repo: MailRepo;
   /**
+   * 起算日期水位线（UTC 语义）；NULL/缺省 = 不设日期下界（保持全量 UNSEEN）。
+   * 关键最后一跳（design 决策 6）：经此进 pollOnce 内部决策点，退化轮按它合取 SINCE（4.2）；
+   * 漏此跳则水位线静默 no-op。由 pollAccount 从 `account.processFrom` 转入（**非** accountId 位置参）。
+   */
+  readonly processFrom?: Date | null;
+  /**
    * 由连接构造 provider 的工厂（连接共享）。默认 createImapProvider；
    * 测试可注入 FakeProviderActions 工厂以离线断言标已读。
    */
@@ -116,7 +122,10 @@ export async function pollOnce(accountId: string, deps: PollDeps): Promise<void>
   let uids: number[];
   if (isDegraded) {
     // 退化轮：SEARCH UNSEEN（处理当前未读积压，禁 FETCH 整箱历史）。
-    uids = await connection.search({ seen: false });
+    // processFrom 非空 → 合取 SINCE（`UNSEEN AND SINCE`，粗粒度日期下界 design 决策 5）；
+    // NULL/缺省 → 全量 UNSEEN（不附 since）。仅退化轮受约束（增量轮按 UID 游标、不带日期下界）。
+    const since = deps.processFrom ?? undefined;
+    uids = await connection.search(since !== undefined ? { seen: false, since } : { seen: false });
   } else {
     // 增量轮：SEARCH `UID 游标+1:*`（不带 seen 过滤，保崩溃重取）。
     // 注：按 RFC 3501，`N:*` 即使无 UID ≥ N 也总返回最高 UID，故空增量轮可能重取最顶一封——
@@ -142,16 +151,31 @@ export async function pollOnce(accountId: string, deps: PollDeps): Promise<void>
   // —— 4 + 5. 算高水位、按轮类型 + floor 优先级算要写的游标、setCursor ——
   const highWater = advanceHighWater(outcomes);
   const allSucceeded = outcomes.every((o) => o.status === 'processed');
+  // outcomes 按 UID 升序（sortedUids）→ 首个 failed 即最低失败封 UID（退化轮首封即失败时锚点）。
+  const firstFailedUid = outcomes.find((o) => o.status === 'failed')?.uid ?? null;
   const toWrite = computeCursorToWrite({
     isDegraded,
     uidValidity,
     uidNext: status.uidNext,
     highWater,
     allSucceeded,
+    firstFailedUid,
     incrementalCursor: parsed,
   });
-  if (toWrite !== null) {
+  if (typeof toWrite === 'string') {
     await repo.setCursor(accountId, toWrite);
+  } else if (toWrite !== null) {
+    // 哨兵 need-max-uid（退化轮空集——无失败封——且 UIDNEXT 缺失）：禁写 `:0`（下轮 `UID 1:*` 无界重扫整箱历史）。
+    // 经既有 search seam 取邮箱现有最大 UID 写 `uidValidity:<maxUid>`、下轮转增量（design 决策 8）。
+    // **已知接受的竞态**：此 `1:*` 搜索在退化轮空 SINCE 搜索之后，二者之间到达的新邮件（UID maxUid+1）
+    // 会被纳入游标却未处理 → 下次 uidValidity 重置前漏收。窗口亚秒、仅一次性退化轮、换掉旧 `:0` 全量重扫，
+    // 显式接受（design 决策 8 / tasks 4.3 accepted-degraded）。
+    const allUids = await connection.search({ uid: '1:*' });
+    if (allUids.length > 0) {
+      const maxUid = Math.max(...allUids);
+      await repo.setCursor(accountId, `${uidValidity}:${maxUid}`);
+    }
+    // 邮箱本就空（`1:*` 也空）→ 不写、保持退化轮（下轮仍空、无害、无进度需求）。
   }
 
   // —— 6. 折叠进 poll 的 durable 重试 drain（durable-retry 决策 1，tasks 4.1/4.3）——
@@ -317,11 +341,24 @@ type ComputeCursorArgs = {
   uidNext?: number;
   highWater: number | null;
   allSucceeded: boolean;
+  /** 首个（最低 UID）失败封的 UID；无失败封则 null。退化轮首封即失败时锚定到其前一位转增量重取。 */
+  firstFailedUid: number | null;
   incrementalCursor: { uidValidity: number; uid: number } | null;
 };
 
 /**
- * 算轮末要写入的游标字符串；返回 null 表示**不写**（仅增量轮空集 no-op 时）。
+ * computeCursorToWrite 结果：
+ *   - `string`：直接要写入的游标字符串（含退化轮首封失败 → 锚到 `<uidValidity>:<firstFailedUid-1>`、下轮增量重取）。
+ *   - `null`：**不写**（仅增量轮空集 no-op / 增量轮首封即失败时——游标不变、下轮重取）。
+ *   - `{ kind: 'need-max-uid' }`：**退化轮空集（`allSucceeded`、无失败封）且 UIDNEXT 缺失**——不能写 `:0`（会令下轮 `UID 1:*`
+ *     无界重扫整箱历史，正是本提案要消除的刷屏）。须由 `pollOnce`（async）经 `search({uid:'1:*'})`
+ *     取邮箱现有最大 UID 写 `uidValidity:<maxUid>` 兑现（design 决策 8；本纯同步函数无 connection、
+ *     不能 await，故返哨兵）。邮箱本就空（`1:*` 也空）则保持退化轮、不写。
+ */
+type CursorToWrite = string | null | { kind: 'need-max-uid' };
+
+/**
+ * 算轮末要写入的游标；见 CursorToWrite。
  *
  * 增量轮（uidValidity 已匹配）：
  *   - 有连续高水位 → `<uidValidity>:<高水位>`。
@@ -334,11 +371,16 @@ type ComputeCursorArgs = {
  *   ① 全成功（含空集）且 UIDNEXT 为正整数 → `<uidValidity>:<UIDNEXT-1>`。
  *   ② 有取回封失败（!allSucceeded）→ `<uidValidity>:<取回连续高水位>`（失败封下轮重取）。
  *   ③ UIDNEXT 缺失/非正 → 退化为取回连续高水位（若有）。
- *   ④ 空集且无 UIDNEXT（连高水位也无）→ `<uidValidity>:0`。
+ *   首封即失败（!allSucceeded、无连续高水位、firstFailedUid=F）→ `<uidValidity>:<F-1>`、下轮转**增量**
+ *     `UID F:*` 重取失败封 F（无论它仍 unseen 还是 markRead 后才崩、已变 read——增量不带 UNSEEN 过滤都能兜回，
+ *     dedup 兜底不重复）。受 F 下界约束（**非** :0 无界重扫），收敛到既有增量 poison 钉扎语义。**不**落 ④
+ *     越过失败封 UID（守 :245 契约 + 修 P2-crash 首封孤儿：已 read 的失败封 SEARCH UNSEEN 不再返回它）。
+ *   ④ 空集（`allSucceeded`、**无失败封**）且无 UIDNEXT（连高水位也无）→ 哨兵 `need-max-uid`（**禁** `:0` 无界重扫，
+ *      由 pollOnce 经 `search({uid:'1:*'})` 取现有最大 UID 兑现，design 决策 8）。
  * **禁** NaN / prev-uid（旧命名空间）作 floor。
  */
-function computeCursorToWrite(args: ComputeCursorArgs): string | null {
-  const { isDegraded, uidValidity, uidNext, highWater, allSucceeded } = args;
+function computeCursorToWrite(args: ComputeCursorArgs): CursorToWrite {
+  const { isDegraded, uidValidity, uidNext, highWater, allSucceeded, firstFailedUid } = args;
 
   if (!isDegraded) {
     // —— 增量轮 ——
@@ -364,8 +406,19 @@ function computeCursorToWrite(args: ComputeCursorArgs): string | null {
   if (highWater !== null) {
     return `${uidValidity}:${highWater}`;
   }
-  // ④ 空集且无 UIDNEXT（连高水位也无）→ :0（下轮 UID 1:* 一次性重扫、dedup 兜底）。
-  return `${uidValidity}:0`;
+  // 退化轮首封即失败（无连续高水位）→ 把游标锚到**首个失败封 UID 前一位**，使下轮转**增量**
+  // `UID firstFailedUid:*`（增量不带 UNSEEN 过滤）重取该失败封：无论它仍 unseen（fetch/normalize 抛）
+  // 还是已 markRead 后才崩（markProcessed 抛、已变 read、SEARCH UNSEEN 不再返回它）都能经增量兜回，
+  // dedup（processedAt 命中早退）兜底不重复处理。受 firstFailedUid 下界约束（**非** :0 无界全箱重扫），
+  // 收敛到既有增量 poison 钉扎语义（每轮重取首个失败封、游标钉其前）。④ 哨兵仅退化轮**空集**触发。
+  // （`!allSucceeded` 必有失败 outcome ⇒ `firstFailedUid !== null`；该 `&& firstFailedUid !== null` 仅类型守卫。）
+  // 边界 firstFailedUid=1（最低 UID 那封失败）→ 锚 `uidValidity:0` → 下轮增量 `UID 1:*` 即单轮全箱重扫，
+  // 但 dedup 兜底、UID1 成功即自纠收敛——仅此一轮、且仅**最小** UID 失败才触发，严格窄于旧 ④「所有首封失败写 :0」。
+  if (!allSucceeded && firstFailedUid !== null) {
+    return `${uidValidity}:${firstFailedUid - 1}`;
+  }
+  // ④ 空集（allSucceeded、无失败封）且无 UIDNEXT（连高水位也无）→ 哨兵：禁写 `:0`（无界重扫），由 pollOnce 取现有最大 UID 兑现。
+  return { kind: 'need-max-uid' };
 }
 
 /**
@@ -384,7 +437,14 @@ export async function pollAccount(
 ): Promise<void> {
   const connection = await createRealImapConnection(account);
   try {
-    await pollOnce(account.accountId, { connection, repo, classify, notifier });
+    // processFrom 经 deps 转入 pollOnce 内部决策点（**不**改 accountId 位置参数；design 决策 6）。
+    await pollOnce(account.accountId, {
+      connection,
+      repo,
+      classify,
+      notifier,
+      processFrom: account.processFrom,
+    });
   } finally {
     // 用完即关；logout 失败不掩盖 pollOnce 的原始异常（仅记一条）。
     try {

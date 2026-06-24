@@ -178,6 +178,9 @@ function buildAccountPoll(account: Account, repo: PrismaMailRepo): (() => Promis
       repo,
       provider,
       notifier: defaultNotifier,
+      // 摄入日期下界（design 决策 5/6）：account.processFrom 经 deps 进 gmailPoll 内部决策点
+      // （createGmailPoller 当前仅传 id，必须在此补 processFrom，否则水位线静默 no-op）。
+      processFrom: account.processFrom,
     });
     return poller.poll();
   };

@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 import { beforeEach, test } from 'node:test';
 import http from 'node:http';
 
-import { gmailPoll, htmlToText, toRawEmail, type GmailPollDeps } from './gmailPoller.js';
+import { createGmailPoller, gmailPoll, htmlToText, toRawEmail, type GmailPollDeps } from './gmailPoller.js';
 import { resetRulesConfigForTest } from '../../rules/rulesConfig.js';
 import {
   createGmailProvider,
@@ -1486,4 +1486,93 @@ test('gmailPoll drain：三动作 sink 不读 to/headers（合成空值投影对
     const stored = (await repo.findByDedupKey(ACCOUNT_ID, pmid))!;
     assert.ok(repo.getActions(stored.id).every((a) => a.status === 'done'), `${pmid} 动作落 done`);
   }
+});
+
+// ——————————————————————————————————————————————————————————
+// 组 E 6.3：摄入 Gmail 日期下界（processFrom → q 含 after:<epoch>）
+//
+// 经**真实构造入口** createGmailPoller（main.ts buildAccountPoll 的 Gmail 构造路径）驱动，
+// 把 processFrom 放进 deps（main.ts:176-181 已接线）。捕获 list 收到的 q 断言下界。
+// ——————————————————————————————————————————————————————————
+
+/** 捕获 list 收到的 q 的 FakeGmail 子类（其余行为同 FakeGmail）。 */
+class QCapturingGmail extends FakeGmail {
+  listQs: string[] = [];
+  constructor() {
+    super();
+    const origList = this.users.messages.list;
+    this.users.messages.list = async (params: { pageToken?: string; q?: string }) => {
+      this.listQs.push(params.q ?? '');
+      return origList(params);
+    };
+  }
+}
+
+test('6.3 createGmailPoller + processFrom 非空 → q = `is:unread after:<floor(ms/1000)>`', async () => {
+  const gmail = new QCapturingGmail();
+  gmail.pages = [['m1']];
+  gmail.messages.set('m1', plainMessage('m1'));
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+  // processFrom 含非整秒毫秒分量，验证 epoch 秒经 Math.floor（向下取整、不四舍五入）。
+  const processFrom = new Date('2026-06-15T00:00:00.500Z');
+  const expectedEpoch = Math.floor(processFrom.getTime() / 1000);
+
+  // 经真实构造入口 createGmailPoller（main 构造路径），processFrom 进 deps。
+  const poller = createGmailPoller(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      processFrom,
+      processEmail: async () => {},
+    }),
+  );
+  await poller.poll();
+
+  assert.equal(gmail.listQs.length, 1, 'list 被调用一次（单页）');
+  assert.equal(
+    gmail.listQs[0],
+    `is:unread after:${expectedEpoch}`,
+    'processFrom 非空 → q 合取 after:<floor(epoch 秒)>',
+  );
+});
+
+test('6.3 createGmailPoller + processFrom = NULL → q = `is:unread`（无 after:）', async () => {
+  const gmail = new QCapturingGmail();
+  gmail.pages = [['m1']];
+  gmail.messages.set('m1', plainMessage('m1'));
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+
+  // 不设 processFrom（= NULL/缺省）。
+  const poller = createGmailPoller(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      processEmail: async () => {},
+    }),
+  );
+  await poller.poll();
+
+  assert.equal(gmail.listQs.length, 1);
+  assert.equal(gmail.listQs[0], 'is:unread', 'NULL processFrom → 全量 is:unread、不附 after:');
+  assert.ok(!gmail.listQs[0].includes('after:'), 'NULL → 无 after: 下界');
+});
+
+test('6.3 createGmailPoller + processFrom = null（显式）→ q = `is:unread`（与 NULL 等价）', async () => {
+  // 显式传 processFrom: null（DB 列为 NULL 时 account.processFrom 即 null）→ 同样不附 after:。
+  const gmail = new QCapturingGmail();
+  gmail.pages = [['m1']];
+  gmail.messages.set('m1', plainMessage('m1'));
+  const repo = await makeRepo();
+  const provider = new FakeProviderActions();
+
+  const poller = createGmailPoller(
+    ACCOUNT_ID,
+    pollDeps(gmail, repo, provider, makeClassify(makeClassification()), {
+      processFrom: null,
+      processEmail: async () => {},
+    }),
+  );
+  await poller.poll();
+
+  assert.equal(gmail.listQs[0], 'is:unread', 'processFrom=null（显式）→ 全量 is:unread');
 });

@@ -28,6 +28,7 @@ import {
 } from '../providers/gmail/oauth.js';
 import { config, isGmailOnboardingAvailable } from '../config/config.js';
 import { isValidAccountId } from './accountId.js';
+import { parseProcessFromDate } from './processFromDate.js';
 import {
   resolveImapPassword,
   PASSWORD_STDIN_USAGE_HINT,
@@ -201,19 +202,23 @@ function findForbiddenSecretFlag(flags: ParsedFlags): string | null {
 const USAGE = [
   '用法: account <command> [--json]',
   '',
-  '  add --imap -e|--email <addr> -H|--host <h> [-p|--port <n>] [--tls <true|false>] [--no-tls] [--account-id <id>] [--update]',
+  '  add --imap -e|--email <addr> -H|--host <h> [-p|--port <n>] [--tls <true|false>] [--no-tls] [--account-id <id>] [--update] [--process-from <YYYY-MM-DD>]',
   '      口令默认经交互 prompt 读取（echo off）——禁经 argv 传入。',
   '      非交互口令来源（互斥）: --password-stdin（从管道读）| --password-file <path>（读文件）。',
   `      ${PASSWORD_STDIN_USAGE_HINT}`,
   '      同派生 id 已存在默认拒绝；--update 显式确认更新凭据。',
-  '  add --gmail',
+  '      --process-from <YYYY-MM-DD>: 起算日期水位线（UTC 零点）；仅新建账号生效，既有账号请用 set-process-from。',
+  '  add --gmail [--process-from <YYYY-MM-DD>]',
   '      跑 loopback OAuth 授权；同 id 已存在则 upsert 新 refresh token 并启用（re-auth/恢复）。',
+  '      --process-from 仅首次接入生效；re-auth 不改既有水位线。',
   '  add（不带 --imap/--gmail）',
   '      打开交互式 provider 选择菜单。',
   '  list [--json]',
   '      列出账号 id/provider/email/enabled（不显示任何凭据）；--json 输出 JSON 数组。',
   '  disable <id>',
   '      置 enabled=false（未重启不生效；撤销已泄露账号后应立即重启）。',
+  '  set-process-from <id> <YYYY-MM-DD>',
+  '      把既有账号的起算日期水位线无条件设为给定 UTC 零点日期（可双向移动；改既有账号唯一入口）。',
 ].join('\n');
 
 /**
@@ -239,6 +244,8 @@ export async function runAccountCli(argv: string[], deps: CliDeps): Promise<numb
         return await cmdList(rest, deps);
       case 'disable':
         return await cmdDisable(rest, deps);
+      case 'set-process-from':
+        return await cmdSetProcessFrom(rest, deps);
       case undefined:
       case 'help':
       case '--help':
@@ -323,6 +330,37 @@ function resolveTls(flags: ParsedFlags): { ok: true; tls: boolean } | { ok: fals
   return { ok: true, tls: tlsValue?.toLowerCase() !== 'false' };
 }
 
+/**
+ * 解析 `--process-from <ISO date>`（add 路径，可选）：经 3.1 共享 helper（UTC 零点 / 严格未来拒绝）。
+ * 未给该 flag → `{ ok:true, processFrom: undefined }`（默认 seed 归 repo 行创建分支、CLI 不抹零点）；
+ * 给了非法 / 未来 → `{ ok:false }`，由调用方报参数错误（EXIT_USAGE）。错误信息经 errln（不回显原始值之外）。
+ */
+function resolveProcessFromFlag(
+  flags: ParsedFlags,
+  deps: CliDeps,
+): { ok: true; processFrom: Date | undefined } | { ok: false } {
+  // 值缺位的 `--process-from`（落 bools、非 values）：flag 在场但无日期 → 不静默回落默认 seed，
+  // 显式报参数错误（usage 要求 `<YYYY-MM-DD>`）。
+  if (flags.bools.has('process-from')) {
+    deps.errln('--process-from 需要日期参数 <YYYY-MM-DD>');
+    return { ok: false };
+  }
+  const raw = flags.values.get('process-from');
+  if (raw === undefined) {
+    return { ok: true, processFrom: undefined };
+  }
+  const parsed = parseProcessFromDate(raw);
+  if (!parsed.ok) {
+    deps.errln(
+      parsed.kind === 'future'
+        ? `--process-from 不能是未来日期: ${JSON.stringify(raw)}（会静默排除该日前所有邮件）。`
+        : `--process-from 非法: ${JSON.stringify(raw)}（需 YYYY-MM-DD 形式、解析为 UTC 零点）。`,
+    );
+    return { ok: false };
+  }
+  return { ok: true, processFrom: parsed.date };
+}
+
 /** `account add --imap`：口令经互斥来源（stdin/file/交互提示）读 → createAccount（同 id 默认拒绝）。 */
 async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   const json = flags.bools.has('json');
@@ -377,6 +415,16 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     return EXIT_USAGE;
   }
 
+  // `--process-from`（可选）先于口令 prompt 校验：日期 typo/未来在交互输入口令**之前**即 EXIT_USAGE
+  // （fail-fast，避免先敲口令再报日期错；与 Gmail 路径先校验再跑 OAuth 一致）。CLI **不**区分首次/re-auth：
+  // 对既有账号走 update 分支会被 repo 忽略（决策 7），改既有水位线只能 set-process-from；未给则 undefined、
+  // 默认 seed 归 repo 行创建分支（精确瞬时、不抹零点）。
+  const pfRes = resolveProcessFromFlag(flags, deps);
+  if (!pfRes.ok) {
+    return EXIT_USAGE;
+  }
+  const processFrom = pfRes.processFrom;
+
   // **口令绝不从 argv** → 互斥来源 --password-stdin / --password-file / 交互隐藏提示（默认）。
   const pwResult = await resolveImapPassword(
     {
@@ -403,14 +451,14 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
 
   if (wantUpdate) {
     // 显式确认 → upsert（同 id 更新凭据，不分裂；同邮箱重加自然命中同一行）。
-    await deps.repo.upsertAccount({ id, provider: 'imap', email, authJson, enabled: true });
+    await deps.repo.upsertAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom });
     emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已更新 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
     return EXIT_OK;
   }
 
   try {
     // 默认 reject-on-exists（createAccount 命中已存 id 即抛）——不静默覆盖。
-    await deps.repo.createAccount({ id, provider: 'imap', email, authJson, enabled: true });
+    await deps.repo.createAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom });
   } catch {
     // 区分「id 已存在」与「存储/网络/运行期写失败」——一律报「已存在」会给错指引。
     // getAccountById 自身也可能抛（DB 不可达）→ 再包一层、抛则按通用写失败处理（凭据纪律：不记原始 error）。
@@ -454,6 +502,12 @@ function emitAccountAddOutcome(
 /** `account add --gmail`：跑 loopback OAuth → upsert（re-auth/恢复路径，不拒绝）。 */
 async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   const json = flags.bools.has('json');
+  // `--process-from`（可选）先校验：非法/未来在跑 OAuth 前即 EXIT_USAGE，避免授权后才报参数错误。
+  const pfRes = resolveProcessFromFlag(flags, deps);
+  if (!pfRes.ok) {
+    return EXIT_USAGE;
+  }
+  const processFrom = pfRes.processFrom;
   const app = deps.gmailApp();
   if (!app.available || app.clientId === undefined || app.clientSecret === undefined) {
     // 沿用「缺 app 凭据 / redirect_uri 非法 → onboarding 显式失败」（config.isGmailOnboardingAvailable）。
@@ -487,12 +541,14 @@ async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   const reEnabled = await willReEnable(deps.repo, id);
 
   // **upsert**（不拒绝）：覆盖（可能轮换的）refresh token + 置 enabled=true（解除 reauth-suspend）。
+  // `processFrom` 作播种载体：仅 create 分支生效（首次接入种值）；既有行走 update 被 repo 忽略（决策 7）。
   await deps.repo.upsertAccount({
     id,
     provider: 'gmail',
     email: result.email,
     authJson: { refreshToken: result.refreshToken, scopes: result.scopes },
     enabled: true,
+    processFrom,
   });
   if (reEnabled) {
     // 「正在重新启用」提示（人类/日志行）：--json 时走 stderr 以保 stdout 纯 JSON，否则走 stdout（既有契约）。
@@ -576,6 +632,53 @@ async function cmdDisable(args: string[], deps: CliDeps): Promise<number> {
   deps.println(
     '注意: 未重启不生效（该账号仍会被轮询到下次重启）。撤销/禁用一个凭据已泄露的账号后，应立即重启以停止轮询。',
   );
+  return EXIT_OK;
+}
+
+/**
+ * `account set-process-from <id> <YYYY-MM-DD>`：把既有账号的起算日期水位线**无条件**设为给定 UTC 零点
+ * 日期（可双向移动、无单调守卫——见 spec「set-process-from 是无条件覆盖」）。`<date>` 经 3.1 共享 helper
+ * 解析（UTC 零点 / 非法 → EXIT_USAGE / 严格未来 → EXIT_USAGE）。`<id>` 经 `JSON.stringify` 转义回显
+ * （防嵌入 id 的控制字符伪造 stderr/日志行，同 cmdDisable）。改既有行**唯一**入口（add 走 update 被忽略）。
+ */
+async function cmdSetProcessFrom(args: string[], deps: CliDeps): Promise<number> {
+  const flags = parseFlags(args);
+  // set-process-from 不接受任何 flag：只需两个位置参数 <id> <date>（防 flag 吞掉位置参数）。
+  if (flags.values.size > 0 || flags.bools.size > 0) {
+    deps.errln('set-process-from 不接受任何 flag，仅需 <id> <YYYY-MM-DD> 两个位置参数');
+    deps.errln('用法: account set-process-from <id> <YYYY-MM-DD>');
+    return EXIT_USAGE;
+  }
+  // 恰好两个位置参数（防 `set-process-from id` 缺日期 / `set-process-from id d1 d2` 静默丢弃多余）。
+  if (flags.positionals.length !== 2) {
+    deps.errln('set-process-from 需要且仅需要 <id> 与 <YYYY-MM-DD> 两个参数');
+    deps.errln('用法: account set-process-from <id> <YYYY-MM-DD>');
+    return EXIT_USAGE;
+  }
+  const id = flags.positionals[0]!;
+  const dateRaw = flags.positionals[1]!;
+  // <date> 经 3.1 共享 helper：严格 YYYY-MM-DD → UTC 零点；非法 / 严格未来 → EXIT_USAGE（同 add）。
+  const parsed = parseProcessFromDate(dateRaw);
+  if (!parsed.ok) {
+    // 非法值经 JSON.stringify 转义渲染（绝不原样回显）。未来 / 解析失败分别给精确提示。
+    deps.errln(
+      parsed.kind === 'future'
+        ? `<date> 不能是未来日期: ${JSON.stringify(dateRaw)}（会静默排除该日前所有邮件）。`
+        : `<date> 非法: ${JSON.stringify(dateRaw)}（需 YYYY-MM-DD 形式、解析为 UTC 零点）。`,
+    );
+    return EXIT_USAGE;
+  }
+  try {
+    // 无条件覆盖（可双向移动水位线）；id 不校验形态——读既有行、须能命中任意历史 id（同 cmdDisable）。
+    await deps.repo.setProcessFrom(id, parsed.date);
+  } catch {
+    // id 经 JSON.stringify 转义渲染——绝不原样回显（防嵌入 id 的控制字符伪造 stderr/日志行）。
+    deps.errln(`设置失败: 未找到账号 ${JSON.stringify(id)}（或写入失败）。`);
+    return EXIT_FAILURE;
+  }
+  // id 经 JSON.stringify 转义渲染（同上）。
+  deps.println(`已设置账号 ${JSON.stringify(id)} 的起算日期水位线为 ${parsed.date.toISOString()}。`);
+  deps.println('注意: 未重启不生效（摄入下界在轮询路径上，重启后才按新水位线过滤）。');
   return EXIT_OK;
 }
 

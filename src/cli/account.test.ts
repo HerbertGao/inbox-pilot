@@ -882,3 +882,223 @@ test('F2：带值的 --password-stdin（如 --password-stdin=foo）→ 拒绝（
   assert.equal((await repo.listEnabledAccounts()).length, 0, '未建行');
   assert.ok(err.join('\n').includes('--password-stdin'), '提示指明 --password-stdin 不接受值');
 });
+
+// ——————————————————————————————————————————————————————————
+// set-process-from <id> <YYYY-MM-DD>：成功 / 缺日期 / 带 flag / 非法日期 / 未来日期 / 未知 id
+// ——————————————————————————————————————————————————————————
+
+/** 未来日期串（相对 now 的下一年元旦，UTC 零点；用于「未来日期 → EXIT_USAGE」断言）。 */
+function futureDateStr(): string {
+  return `${new Date().getUTCFullYear() + 1}-01-01`;
+}
+
+test('set-process-from <id> <YYYY-MM-DD>：成功 → EXIT_OK，setProcessFrom 入参为 (id, UTC 零点 Date)，成功行经 JSON.stringify 转义回显', async () => {
+  const repo = new InMemoryMailRepo();
+  await repo.upsertAccount({
+    id: 'gmail:user@gmail.com',
+    provider: 'gmail',
+    email: 'user@gmail.com',
+    authJson: { refreshToken: GMAIL_RT, scopes: [] },
+  });
+  // 包裹 setProcessFrom 捕获入参（仍委托真身使行被更新）。
+  const calls: Array<{ id: string; date: Date }> = [];
+  const orig = repo.setProcessFrom.bind(repo);
+  repo.setProcessFrom = async (id: string, date: Date) => {
+    calls.push({ id, date });
+    return orig(id, date);
+  };
+
+  const { deps, out } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['set-process-from', 'gmail:user@gmail.com', '2026-03-15'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  assert.equal(calls.length, 1, 'setProcessFrom 被调一次');
+  assert.equal(calls[0]!.id, 'gmail:user@gmail.com', 'id 入参原样');
+  assert.equal(
+    calls[0]!.date.toISOString(),
+    '2026-03-15T00:00:00.000Z',
+    'date 入参为该日 UTC 零点',
+  );
+  // 既有行水位线被更新为该 UTC 零点。
+  const row = await repo.getAccountById('gmail:user@gmail.com');
+  assert.equal(row?.processFrom?.toISOString(), '2026-03-15T00:00:00.000Z');
+  // 成功行经 JSON.stringify(id) 转义回显。
+  assert.ok(
+    out.join('\n').includes(JSON.stringify('gmail:user@gmail.com')),
+    'id 经 JSON.stringify 转义回显',
+  );
+});
+
+test('set-process-from <id>（缺日期、仅 1 位置参）→ EXIT_USAGE、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let called = false;
+  repo.setProcessFrom = async () => {
+    called = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(['set-process-from', 'some-id'], deps);
+  assert.equal(code, EXIT_USAGE, '缺日期 → 参数错误');
+  assert.equal(called, false, '未触达 setProcessFrom');
+  assert.ok(err.join('\n').includes('两个参数'), '提示需两个位置参数');
+});
+
+test('set-process-from <id> <date> --json（带任意 flag）→ EXIT_USAGE（set-process-from 拒所有 flag）', async () => {
+  const repo = new InMemoryMailRepo();
+  let called = false;
+  repo.setProcessFrom = async () => {
+    called = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['set-process-from', 'some-id', '2026-03-15', '--json'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '带 flag → 参数错误');
+  assert.equal(called, false, '未触达 setProcessFrom');
+  assert.ok(err.join('\n').includes('不接受任何 flag'), '精确报「不接受任何 flag」');
+});
+
+test('set-process-from <id> <非法日期 2026-13-99> → EXIT_USAGE、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let called = false;
+  repo.setProcessFrom = async () => {
+    called = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['set-process-from', 'some-id', '2026-13-99'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '非法日期 → 参数错误');
+  assert.equal(called, false, '未触达 setProcessFrom');
+  assert.ok(err.join('\n').includes('非法'), '提示日期非法');
+});
+
+test('set-process-from <id> <未来日期> → EXIT_USAGE、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let called = false;
+  repo.setProcessFrom = async () => {
+    called = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['set-process-from', 'some-id', futureDateStr()],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '未来日期 → 参数错误');
+  assert.equal(called, false, '未触达 setProcessFrom');
+  assert.ok(err.join('\n').includes('未来'), '提示不能是未来日期');
+});
+
+test('set-process-from <未知 id> <合法日期> → EXIT_FAILURE（setProcessFrom 抛、脱敏不泄露）', async () => {
+  const repo = new InMemoryMailRepo();
+  // 未知 id：真身 setProcessFrom 抛（未知 accountId）。
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['set-process-from', 'no-such-id', '2026-03-15'],
+    deps,
+  );
+  assert.equal(code, EXIT_FAILURE, '未知 id → 业务失败');
+  const text = err.join('\n');
+  assert.ok(text.includes('设置失败'), '报「设置失败」');
+  // id 经 JSON.stringify 转义回显。
+  assert.ok(text.includes(JSON.stringify('no-such-id')), 'id 经 JSON.stringify 转义回显');
+});
+
+// ——————————————————————————————————————————————————————————
+// add --process-from <date>：合法播种 processFrom / 非法拒绝 / value-less（FIX2 回归）
+// ——————————————————————————————————————————————————————————
+
+test('add --imap ... --process-from <合法日期> → createAccount 入参含 processFrom = 该 UTC 零点 Date', async () => {
+  const repo = new InMemoryMailRepo();
+  const calls: Array<{ id: string; processFrom: Date | undefined }> = [];
+  const orig = repo.createAccount.bind(repo);
+  repo.createAccount = async (input) => {
+    calls.push({ id: input.id, processFrom: input.processFrom });
+    return orig(input);
+  };
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--process-from', '2026-03-15'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  assert.equal(calls.length, 1, 'createAccount 被调一次');
+  assert.equal(
+    calls[0]!.processFrom?.toISOString(),
+    '2026-03-15T00:00:00.000Z',
+    'createAccount 入参 processFrom 为该日 UTC 零点',
+  );
+});
+
+test('add --imap --update ... --process-from <合法日期> → upsertAccount 入参含 processFrom = 该 UTC 零点 Date', async () => {
+  const repo = new InMemoryMailRepo();
+  const calls: Array<{ id: string; processFrom: Date | undefined }> = [];
+  const orig = repo.upsertAccount.bind(repo);
+  repo.upsertAccount = async (input) => {
+    calls.push({ id: input.id, processFrom: input.processFrom });
+    return orig(input);
+  };
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '--update', '-e', 'me@ex.com', '-H', 'h', '--process-from', '2026-03-15'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  assert.equal(calls.length, 1, 'upsertAccount 被调一次');
+  assert.equal(
+    calls[0]!.processFrom?.toISOString(),
+    '2026-03-15T00:00:00.000Z',
+    'upsertAccount 入参 processFrom 为该日 UTC 零点',
+  );
+});
+
+test('add --imap ... --process-from <非法日期> → EXIT_USAGE、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let createCalled = false;
+  repo.createAccount = async () => {
+    createCalled = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--process-from', '2026-13-99'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '非法 --process-from → 参数错误');
+  assert.equal(createCalled, false, '非法日期不触达 repo 写');
+  assert.ok(err.join('\n').includes('--process-from 非法'), '提示 --process-from 非法');
+});
+
+test('FIX2 回归：add --gmail --process-from（value-less、无日期）→ EXIT_USAGE，在跑 OAuth 前即拒、不建行', async () => {
+  const repo = new InMemoryMailRepo();
+  let oauthCalled = false;
+  const { deps, err } = makeDeps(repo, {
+    runOAuth: async () => {
+      oauthCalled = true;
+      throw new Error('should-not-run');
+    },
+  });
+  const code = await runAccountCli(['add', '--gmail', '--process-from'], deps);
+  assert.equal(code, EXIT_USAGE, 'value-less --process-from → 参数错误（不再静默忽略）');
+  assert.equal(oauthCalled, false, '在跑 OAuth 前即拒');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '未建任何行');
+  assert.ok(err.join('\n').includes('--process-from 需要日期参数'), '提示 --process-from 需要日期参数');
+});
+
+test('FIX2 回归：add --imap ... --process-from（value-less、无日期）→ EXIT_USAGE、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let createCalled = false;
+  repo.createAccount = async () => {
+    createCalled = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--process-from'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, 'value-less --process-from → 参数错误（不再静默忽略）');
+  assert.equal(createCalled, false, '未触达 repo 写');
+  assert.ok(err.join('\n').includes('--process-from 需要日期参数'), '提示 --process-from 需要日期参数');
+});
