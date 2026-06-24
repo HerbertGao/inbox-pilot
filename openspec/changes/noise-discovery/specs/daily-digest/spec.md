@@ -1,7 +1,7 @@
 ## 新增需求
 
 ### 需求:摘要列出高频发件人辅助降噪
-每日摘要**必须**在末尾附一个**只读**的「最近高频发件人 TOP-N」区块：按 `receivedAt` 时间窗聚合**全部已处理邮件**的 `fromEmail` 计数、降序取前 N（如 5），列出发件人与计数，并提示「可加入 `noise_senders` 降噪」。
+每日摘要**必须**在末尾附一个**只读**的「最近高频发件人 TOP-N」区块：按 `receivedAt` 时间窗聚合**全部已处理邮件**的 `fromEmail` 计数（**计数前必须对发件人归一**——解析裸地址 + 转小写 + 丢空/非法，复用既有 `normalizeFromAddress` 同款纪律，否则同一发件人会裂成 `Name <a@x.com>`/`a@x.com` 等多变体、稀释计数、削弱发现）、降序取前 N（如 5），列出发件人与计数，并提示「可加入 `noise_senders` 降噪」。
 
 **数据源硬约束（消除窗口语义漂移）**：该聚合**禁止**复用 `listDigestCandidates`——后者经 `digestItems:{none}` 去重已摘要邮件、且**只保留 P1/P2/P3（丢弃 P0/P4）**，若复用会**系统性漏掉最吵的告警类（P0/P4）并因去重低估高频**，使发现通路失效。**必须**经一个独立 repo 读取（如 `countRecentSenders(since)`）：按 `receivedAt` **最近滚动窗**（一个**独立命名常量**、如近 7 天——这是**频率快照**，与既有「摘要候选不得带固定年龄上限」规则**正交**；**禁止**引用不存在的 `DIGEST_MAX_AGE`、**禁止**声称与 onboarding-watermark 的 `processFrom` 一致）、**含所有优先级（P0–P4）**、**不经 `digestItems` 去重**、**显式 select 白名单（仅 `fromEmail` + 计数、不含 `bodyText`/`htmlBody`）**。该区块**禁止**触发任何动作（纯展示、**零入站面**），**禁止**泄露正文；**不**自动改动任何名单、**不**自动降级（降级由 `safety-rules` 的 noise 轴在 operator 显式配置后确定性落地）。
 

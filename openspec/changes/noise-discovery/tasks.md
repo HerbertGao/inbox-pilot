@@ -3,6 +3,7 @@
 - [ ] 1.1 `src/rules/rulesConfig.ts`：`KNOWN_KEYS` 加 `'noise_senders'`；`ActiveRules`/`LastValid`/`builtinLastValid`/`assembleActive`/`buildAndPublish` 的 candidate 同步加项（复刻 `marketing_keywords` 的 zod 逐项校验 + carry-forward + freeze）
 - [ ] 1.2 `rules/rules.yaml`：加 `noise_senders: []` 示例 + 注释（空默认 = 全 no-op、行为与现状一致）
 - [ ] 1.3 `src/rules/rulesConfig.test.ts`：加载/ingest 归一/某项非法仅该项回落 noise_senders 的单测
+- [ ] 1.4 回归确认（动 `KNOWN_KEYS`/`buildAndPublish` 不破既有安全契约）：加 `noise_senders` 后，未知/凭据形态键仍被静默丢弃、且**键名绝不入日志**（至多记数量）——既有 rules-config 安全契约，`rulesConfig.test.ts` 覆盖
 
 ## 2. safety-rules noise 轴
 

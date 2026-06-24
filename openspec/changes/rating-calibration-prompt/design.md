@@ -67,7 +67,7 @@ spec 因此用「真钓鱼**禁止**掉出 P4（MUST，逐样本）」+「误报
 
 4. **真脱敏 vs 合成 = 混合**：**象限B 必须真脱敏**（合成/LLM 生成会**系统性偏到象限A**、写不出隐晦内容欺骗）；象限A/C/D 可合成。脱敏只动 PII、**保语用结构**（话术/紧迫感/欺骗前提逻辑链）、链接断活性（`hxxp://placeholder.example`）、**存文本投影不存 `.eml`**（同解隐私 + 仓库不存活恶意内容）。
 
-5. **CI key + 成本**：**配 `OPENROUTER_API_KEY` secret**；成本 **< $0.5/月**（安全线每轮 ~10×5=50 次 flash-lite 调用 <1¢；nightly 30 次×~$0.012）= 可忽略、**不建任何成本治理机制**（YAGNI）。用 **`pull_request`（非 `pull_request_target`）**：fork 拿不到 secret → eval 检测无 key → **skip 标绿**（复用 `classifyEmail` 缺 key 安全默认、不抛异常），零 secret 泄露面。
+5. **CI key + 成本**：**配 `OPENROUTER_API_KEY` secret**；成本 **< $0.5/月**（安全线每轮 ~10×5=50 次 flash-lite 调用 <1¢；nightly 30 次×~$0.012）= 可忽略、**不建任何成本治理机制**（YAGNI）。用 **`pull_request`（非 `pull_request_target`）**：fork 拿不到 secret → eval 检测无 key → **skip 标绿**（复用 `classifyEmail` 缺 key 安全默认、不抛异常），零 secret 泄露面。**fork 旁路诚实边界**：skip 标绿意味着 fork 发起的 prompt-affecting PR **不经**安全线 eval——这是为「不向 fork 暴露 secret」付的代价，对**单维护者仓**可接受（无不可信 fork 贡献者；dependabot 走同仓分支且被 paths 过滤）。故「PR 阻塞」保证**严格成立的范围 = 维护者自仓分支**；**不**对 fork 的 prompt 改动作绝对保证。若将来接外部贡献者，prompt-affecting 的 fork PR **须**由维护者在自仓分支重跑 eval（或对 prompt paths 加必需人工审查 / 受保护分支规则）后才合并，**不可** skip-green 直接合入。
 
 6. **基建分离**：eval 落 `src/classifier/eval/`、文件**不带 `.test.ts`**（天然不被 `node:test` glob 收集）、独立 `pnpm eval` runner（自印通过率表 + 退出码，不用 `node:test` 断言模型）、新增 `.github/workflows/eval.yml`（安全线 PR 阻塞 + 噪音线 `schedule:` nightly）；`ci.yml` 与 `pnpm test` 零改动。flaky 控制：复用 `openrouterClient` 既有 20s 超时 + `classifyEmail` 内置「单次重试+fallback」状态机，**外层不再加重试**；语料小，串行/≤5 并发、无并发框架。nightly 失败 → `if: failure()` 一行 `\gh issue`（按固定 label 去重）→ GitHub 默认 issue 通知邮件落 operator 收件箱（零额外告警通道、用自带 `GITHUB_TOKEN` 无需配 secret）。
 

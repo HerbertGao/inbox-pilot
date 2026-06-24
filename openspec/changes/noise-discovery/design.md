@@ -35,7 +35,7 @@
 
 **决策 4：Telegram 交互按钮——已评估·暂缓（分阶段触发器）。**
 
-```
+```text
 Stage 0 ── 现在（单用户 · 本 change 覆盖）
   治本 prompt 校准（并列 change）+ 摘要 Top-N 只读发现 → operator 编辑 rules.yaml 录入 noise_senders
   入站面：无
