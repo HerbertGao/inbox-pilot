@@ -67,6 +67,11 @@ export type ImapAccount = {
    * 退化轮摄入按此合取 `SINCE`（粗粒度日期下界，design 决策 5/8）。
    */
   processFrom: Date | null;
+  /**
+   * 通知用显示名 = `label ?? email`（注册表解析，design 决策 1）；缺省 = 不携（下游渲染回落裸 accountId）。
+   * 镜像既有 `processFrom` 的 5 跳穿透链：经此承载到 poller deps → toRawEmail → NormalizedEmail.accountLabel。
+   */
+  accountLabel?: string;
 };
 
 /**
@@ -85,6 +90,11 @@ export type GmailAccount = {
    * 摄入按此给查询附加 `after:<epoch>`（design 决策 5/8）。
    */
   processFrom: Date | null;
+  /**
+   * 通知用显示名 = `label ?? email`（注册表解析，design 决策 1）；缺省 = 不携（下游渲染回落裸 accountId）。
+   * 镜像既有 `processFrom` 的 5 跳穿透链：经此承载到 poller deps → toRawEmail → NormalizedEmail.accountLabel。
+   */
+  accountLabel?: string;
 };
 
 /**

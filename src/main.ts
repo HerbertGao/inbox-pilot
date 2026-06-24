@@ -181,6 +181,9 @@ function buildAccountPoll(account: Account, repo: PrismaMailRepo): (() => Promis
       // 摄入日期下界（design 决策 5/6）：account.processFrom 经 deps 进 gmailPoll 内部决策点
       // （createGmailPoller 当前仅传 id，必须在此补 processFrom，否则水位线静默 no-op）。
       processFrom: account.processFrom,
+      // 通知显示名（design 决策 1）：account.accountLabel 经 deps 进 toRawEmail（漏此跳别名静默丢、
+      // 同 processFrom 接线坑）。IMAP 侧由 pollAccount 从 account 自取、无需在此显式接线。
+      accountLabel: account.accountLabel,
     });
     return poller.poll();
   };

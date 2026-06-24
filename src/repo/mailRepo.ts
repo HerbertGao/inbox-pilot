@@ -122,6 +122,12 @@ export type StoredAccount = {
    * 输出白名单（CLI 仅打印 `{id,provider,email,enabled}`，由 account.ts 守）。
    */
   processFrom: Date | null;
+  /**
+   * per-account 展示别名（notification-mailbox-clarity）：面向运维渲染的可空显示名（允许中文/可见 Unicode）。
+   * NULL（默认、存量不回填）→ 下游渲染回落账号 `email`。注册表/poller 处解析为「显示名 = label ?? email」
+   * 穿透到通知。**绝不**进结构化日志字段（仅入通知 payload 白名单结构字段）。仅行创建写、update 保留（同 processFrom）。
+   */
+  label: string | null;
 };
 
 /**
@@ -147,6 +153,12 @@ export type AccountWriteInput = {
    * 不分辨首次/re-auth——对既有账号 `add --process-from` 走 update 被忽略，改既有只能 `setProcessFrom`。
    */
   processFrom?: Date;
+  /**
+   * 展示别名的**播种载体**（notification-mailbox-clarity）。仅在 repo 的**行创建分支**生效：
+   * create 写 `input.label ?? null`；`upsertAccount` 的 `update` 分支一律**不含**此字段（列不动 = 保留既有 label）。
+   * CLI 在 add 处经 `validateLabel` 校验（拒控制/格式/bidi + trim + 限长）后透传；既有账号无改 label 入口（同 processFrom）。
+   */
+  label?: string;
 };
 
 /**
@@ -461,6 +473,7 @@ export function rebuildNormalizedEmail(
   accountId: string,
   provider: 'gmail' | 'imap',
   msg: MessageRebuildInput,
+  accountLabel: string | undefined,
 ): NormalizedEmail {
   const email: NormalizedEmail = {
     accountId,
@@ -473,6 +486,11 @@ export function rebuildNormalizedEmail(
     hasAttachments: msg.hasAttachments,
     headers: {}, // 合成（库中无；三动作 sink 不读）。
   };
+  // accountLabel（显示名 label??email，由调用方传入；不折进 MessageRebuildInput/msg）：缺省不设、
+  // 下游渲染回落裸 accountId。使重试通知与首发一致指明邮箱（tasks 2.6）。
+  if (accountLabel !== undefined) {
+    email.accountLabel = accountLabel;
+  }
   if (msg.threadId !== null) {
     email.providerThreadId = msg.threadId;
   }
@@ -530,6 +548,8 @@ export class PrismaMailRepo implements MailRepo {
         enabled: true,
         // 摄入水位线穿透（onboarding-watermark）：注册表加载读 enabled 行、经此带到 poller 内部决策点。
         processFrom: true,
+        // 展示别名穿透（notification-mailbox-clarity）：注册表解析「显示名 = label ?? email」、经此带到通知。
+        label: true,
       },
     });
     return rows.map((r) => ({
@@ -539,6 +559,7 @@ export class PrismaMailRepo implements MailRepo {
       authJson: r.authJson,
       enabled: r.enabled,
       processFrom: r.processFrom,
+      label: r.label,
     }));
   }
 
@@ -553,6 +574,7 @@ export class PrismaMailRepo implements MailRepo {
         authJson: true,
         enabled: true,
         processFrom: true,
+        label: true,
       },
     });
     return rows.map((r) => ({
@@ -562,6 +584,7 @@ export class PrismaMailRepo implements MailRepo {
       authJson: r.authJson,
       enabled: r.enabled,
       processFrom: r.processFrom,
+      label: r.label,
     }));
   }
 
@@ -575,6 +598,7 @@ export class PrismaMailRepo implements MailRepo {
         authJson: true,
         enabled: true,
         processFrom: true,
+        label: true,
       },
     });
     if (r === null) {
@@ -587,6 +611,7 @@ export class PrismaMailRepo implements MailRepo {
       authJson: r.authJson,
       enabled: r.enabled,
       processFrom: r.processFrom,
+      label: r.label,
     };
   }
 
@@ -605,10 +630,13 @@ export class PrismaMailRepo implements MailRepo {
         // 行创建分支播种水位线：显式 --process-from（容器时区零点）优先，否则默认**精确瞬时** new Date()
         // （onboarding-watermark；容器时区零点仅用于 date-string，避免默认 seed 凭空提前 ≤24h）。
         processFrom: input.processFrom ?? new Date(),
+        // 行创建分支写展示别名（notification-mailbox-clarity）：未给（undefined）→ NULL，下游渲染回落 email。
+        label: input.label ?? null,
       },
       // 同邮箱重加 / re-auth：更新凭据/email/enabled（命中同一行、不分裂）。
       // **一律不含 processFrom**（Prisma 语义 = 列不动 = 保留既有水位线；re-auth/既有账号 add --process-from
-      // 不改水位线，改既有只能 setProcessFrom）。
+      // 不改水位线，改既有只能 setProcessFrom）。**亦一律不含 label**（notification-mailbox-clarity 决策 5：
+      // label 仅行创建写，update/re-auth 保留既有 label；既有账号无改 label 入口）。
       update: { provider: input.provider, email: input.email, authJson, enabled },
     });
   }
@@ -624,6 +652,8 @@ export class PrismaMailRepo implements MailRepo {
         enabled: input.enabled ?? true,
         // IMAP 默认 add 的独立行创建路径同样播种水位线（onboarding-watermark）：显式优先，否则精确瞬时。
         processFrom: input.processFrom ?? new Date(),
+        // 行创建分支写展示别名（notification-mailbox-clarity）：未给（undefined）→ NULL，下游渲染回落 email。
+        label: input.label ?? null,
       },
     });
   }
@@ -836,7 +866,9 @@ export class PrismaMailRepo implements MailRepo {
             receivedAt: true,
             hasAttachments: true,
             // 派生 provider（'gmail'|'imap'）；mail_messages 不存 provider，取自账号行。
-            account: { select: { provider: true } },
+            // label+email 同取：重建 NormalizedEmail.accountLabel = label?.trim() || email（显示名，design 决策 1），
+            // 使重试通知与首发一致指明邮箱（漏取则 accountLabel 掉出 select → 重试通知回落裸 accountId）。
+            account: { select: { provider: true, label: true, email: true } },
             // 最新分类行（LEFT 语义：无分类行 → classifications=[] → 永久重建失败，不丢动作行）。
             classifications: {
               select: {
@@ -867,19 +899,25 @@ export class PrismaMailRepo implements MailRepo {
         rebuild = { ok: false };
       } else {
         try {
-          const email = rebuildNormalizedEmail(msg.accountId, provider, {
-            providerMessageId: msg.providerMessageId,
-            messageId: msg.messageId,
-            threadId: msg.threadId,
-            uid: msg.uid,
-            subject: msg.subject,
-            fromEmail: msg.fromEmail,
-            fromName: msg.fromName,
-            snippet: msg.snippet,
-            bodyText: msg.bodyText,
-            receivedAt: msg.receivedAt,
-            hasAttachments: msg.hasAttachments,
-          });
+          const email = rebuildNormalizedEmail(
+            msg.accountId,
+            provider,
+            {
+              providerMessageId: msg.providerMessageId,
+              messageId: msg.messageId,
+              threadId: msg.threadId,
+              uid: msg.uid,
+              subject: msg.subject,
+              fromEmail: msg.fromEmail,
+              fromName: msg.fromName,
+              snippet: msg.snippet,
+              bodyText: msg.bodyText,
+              receivedAt: msg.receivedAt,
+              hasAttachments: msg.hasAttachments,
+            },
+            // 显示名 label??email（design 决策 1）：使重试通知与首发一致指明邮箱（tasks 2.6）。
+            msg.account.label?.trim() || msg.account.email,
+          );
           const decision = rebuildFinalDecision({
             priority: latest.priority,
             category: latest.category,

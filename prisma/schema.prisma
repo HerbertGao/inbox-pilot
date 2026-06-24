@@ -17,6 +17,10 @@ model MailAccount {
   // 可空（NULL = 不设下界、保持全量）；存 Postgres TIMESTAMP、与 receivedAt 同类型可直接比较。
   // 独立列，**不**复用 lastSyncCursor（归 IMAP UID 游标）/ createdAt（审计语义）。
   processFrom    DateTime?
+  // 展示别名（notification-mailbox-clarity）：面向运维渲染的可空显示名，允许中文/可见 Unicode 字形。
+  // 区别于严格-ASCII 主键 `id`（防日志注入、确定性生成、不放松）——label 是独立列、校验拒控制/格式/bidi。
+  // NULL（默认、存量账号不回填）→ 下游渲染回落账号 `email`（稳定必有）。仅行创建分支写、update 保留（同 processFrom）。
+  label          String?
   enabled        Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt

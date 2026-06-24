@@ -32,6 +32,10 @@ export type NotificationPayload = {
   readonly fromEmail: string;
   readonly reason: string;
   readonly riskFlags: readonly string[];
+  /** 来源账号主键（严格 ASCII）；渲染来源标签的末位兜底——绝不渲染空来源。 */
+  readonly accountId: string;
+  /** 来源显示名 = `label ?? email`（design 决策 1）；缺省 = 渲染回落裸 accountId。 */
+  readonly accountLabel?: string;
 };
 
 /** 渠道 seam：notifier 把白名单 payload 交给渠道，渠道返回 sent/failed（不抛）。 */
@@ -80,6 +84,8 @@ function projectPayload(decision: FinalDecision, email: NormalizedEmail): Notifi
     fromEmail: email.fromEmail,
     reason: decision.reason,
     riskFlags: decision.riskFlags,
+    accountId: email.accountId,
+    accountLabel: email.accountLabel,
   };
 }
 

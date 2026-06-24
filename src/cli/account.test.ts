@@ -11,6 +11,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 import {
   runAccountCli,
@@ -1128,4 +1130,260 @@ test('FIX2 回归：add --imap ... --process-from（value-less、无日期）→
   assert.equal(code, EXIT_USAGE, 'value-less --process-from → 参数错误（不再静默忽略）');
   assert.equal(createCalled, false, '未触达 repo 写');
   assert.ok(err.join('\n').includes('--process-from 需要日期参数'), '提示 --process-from 需要日期参数');
+});
+
+// ——————————————————————————————————————————————————————————
+// notification-mailbox-clarity 5.3 / 5.5：add --label（展示别名）
+// IMAP 与 Gmail 两子命令；合法值入 create 入参、非法/缺位 → EXIT_USAGE 不触达 repo 写；
+// update 不改 label；中文 label 下 account-id 仍 ASCII；回显经 JSON.stringify；
+// 结构化日志不含 label/accountLabel；--json 白名单不含 label。
+// ——————————————————————————————————————————————————————————
+
+// 危险码点（用 String.fromCharCode 构造，保源码为纯 ASCII 文本——**禁**在源里写裸
+// U+2028/NUL 字面字符）：NUL(Cc) / U+202E RTL-override(Cf) / U+200B 零宽(Cf) / U+2028 行分隔(Zl)。
+const NUL = String.fromCharCode(0x0000);
+const RLO = String.fromCharCode(0x202e);
+const ZWSP = String.fromCharCode(0x200b);
+const LS = String.fromCharCode(0x2028);
+
+/** 包裹 createAccount 捕获 input.label（委托真身使行被建）。 */
+function captureCreateLabel(repo: InMemoryMailRepo): Array<string | null | undefined> {
+  const labels: Array<string | null | undefined> = [];
+  const orig = repo.createAccount.bind(repo);
+  repo.createAccount = async (input) => {
+    labels.push(input.label);
+    return orig(input);
+  };
+  return labels;
+}
+
+/** 包裹 upsertAccount 捕获 input.label（委托真身）。 */
+function captureUpsertLabel(repo: InMemoryMailRepo): Array<string | null | undefined> {
+  const labels: Array<string | null | undefined> = [];
+  const orig = repo.upsertAccount.bind(repo);
+  repo.upsertAccount = async (input) => {
+    labels.push(input.label);
+    return orig(input);
+  };
+  return labels;
+}
+
+test('5.3 add --imap --label 公司邮箱 → createAccount 入参 label="公司邮箱"、行 label 落库', async () => {
+  const repo = new InMemoryMailRepo();
+  const labels = captureCreateLabel(repo);
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--label', '公司邮箱'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  assert.deepEqual(labels, ['公司邮箱'], 'createAccount 入参 label=公司邮箱');
+  const row = await repo.getAccountById('imap:me@ex.com@h');
+  assert.equal(row?.label, '公司邮箱', '行 label 落库');
+});
+
+test('5.3 add --gmail --label 公司邮箱 → upsertAccount 入参 label="公司邮箱"（两子命令均生效）', async () => {
+  const repo = new InMemoryMailRepo();
+  const labels = captureUpsertLabel(repo);
+  const { deps } = makeDeps(repo);
+  const code = await runAccountCli(['add', '--gmail', '--label', '公司邮箱'], deps);
+  assert.equal(code, EXIT_OK);
+  assert.deepEqual(labels, ['公司邮箱'], 'Gmail 子命令 upsertAccount 入参 label=公司邮箱');
+  const row = await repo.getAccountById('gmail:user@gmail.com');
+  assert.equal(row?.label, '公司邮箱', 'Gmail 行 label 落库（首次 create 分支）');
+});
+
+test('5.3 值缺位 --label --gmail（下一 token 以 - 开头）→ EXIT_USAGE、不建账号', async () => {
+  const repo = new InMemoryMailRepo();
+  let oauthCalled = false;
+  const { deps, err } = makeDeps(repo, {
+    runOAuth: async () => {
+      oauthCalled = true;
+      throw new Error('should-not-run');
+    },
+  });
+  // `--label --gmail`：--gmail 以 - 开头 → --label 落 bools（值缺位）。
+  const code = await runAccountCli(['add', '--label', '--gmail'], deps);
+  assert.equal(code, EXIT_USAGE, '值缺位 --label → 参数错误');
+  assert.equal(oauthCalled, false, '在跑 OAuth 前即拒');
+  assert.equal((await repo.listEnabledAccounts()).length, 0, '不建账号');
+  assert.ok(err.join('\n').includes('--label 需要值参数'), '提示 --label 需要值参数');
+});
+
+test('5.3 非法 label（\\n/\\t/NUL/U+202E/U+200B/U+2028/超长）→ EXIT_USAGE、不触达 repo 写', async () => {
+  // 各非法值逐一跑；断言均 EXIT_USAGE 且 createAccount 从未被调用（不触达 repo 写）。
+  const illegal: Array<{ label: string; note: string }> = [
+    { label: 'a\nb', note: '\\n (Cc)' },
+    { label: 'a\tb', note: '\\t (Cc)' },
+    { label: `a${NUL}b`, note: 'NUL (Cc)' },
+    { label: `a${RLO}b`, note: 'U+202E RTL-override (Cf)' },
+    { label: `a${ZWSP}b`, note: 'U+200B 零宽 (Cf)' },
+    { label: `a${LS}b`, note: 'U+2028 行分隔' },
+    { label: `${LS}foo`, note: '前导 U+2028 + 文本（trim 会先剥掉 → 须 denylist 跑在 raw 上才拒；Codex review 回归）' },
+    { label: '\tfoo', note: '前导 \\t + 文本（同上：\\t 既是 denylist 又是 trim-whitespace、不可先 trim）' },
+    { label: '超'.repeat(65), note: '65 码元 > 64 超长' },
+  ];
+  for (const { label, note } of illegal) {
+    const repo = new InMemoryMailRepo();
+    let createCalled = false;
+    repo.createAccount = async () => {
+      createCalled = true;
+    };
+    const { deps } = makeDeps(repo);
+    const code = await runAccountCli(
+      ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--label', label],
+      deps,
+    );
+    assert.equal(code, EXIT_USAGE, `非法 label（${note}）→ EXIT_USAGE`);
+    assert.equal(createCalled, false, `非法 label（${note}）不触达 repo 写`);
+  }
+});
+
+test('5.3 空白 label "   " → 拒（trim 后空）、不触达 repo 写', async () => {
+  const repo = new InMemoryMailRepo();
+  let createCalled = false;
+  repo.createAccount = async () => {
+    createCalled = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--label', '   '],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '纯空白 label → EXIT_USAGE');
+  assert.equal(createCalled, false, '不触达 repo 写');
+  assert.ok(err.join('\n').includes('不能为空白'), '提示 label 不能为空白');
+});
+
+test('5.3 既有账号 add --label（update 分支）不改既有 label', async () => {
+  const repo = new InMemoryMailRepo();
+  // 既有账号已带 label「旧别名」。
+  await repo.createAccount({
+    id: 'imap:me@ex.com@h',
+    provider: 'imap',
+    email: 'me@ex.com',
+    authJson: { host: 'h', port: 993, user: 'me@ex.com', password: 'OLD', tls: true },
+    label: '旧别名',
+  });
+  const { deps } = makeDeps(repo, { promptValue: 'NEW' });
+  // --update 走 upsert 的 update 分支；新给 --label 应被 repo 忽略（仅 create 写 label）。
+  const code = await runAccountCli(
+    ['add', '--imap', '--update', '-e', 'me@ex.com', '-H', 'h', '--label', '新别名'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  const row = await repo.getAccountById('imap:me@ex.com@h');
+  assert.equal(row?.label, '旧别名', 'update 分支不改既有 label（保留旧别名）');
+});
+
+test('5.3 中文 --label 下 account-id 仍经 ASCII 校验（非法派生 id 仍被拒）', async () => {
+  const repo = new InMemoryMailRepo();
+  let createCalled = false;
+  repo.createAccount = async () => {
+    createCalled = true;
+  };
+  const { deps, err } = makeDeps(repo);
+  // --host 含控制字符 → 派生 id 非法（ASCII 校验）；中文 --label 合法但不放松主键校验。
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h\nINJ', '--label', '公司邮箱'],
+    deps,
+  );
+  assert.equal(code, EXIT_USAGE, '中文 label 不放松 account-id ASCII 校验');
+  assert.equal(createCalled, false, '非法 id 不触达 repo 写');
+  assert.ok(err.join('\n').includes('account-id 含非法字符'), '报 account-id 非法');
+});
+
+test('5.3 成功行回显 label 经 JSON.stringify 转义（imap）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--label', '公司"邮箱'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  const text = err.join('\n'); // 人类成功行走 errln
+  // 含引号的 label 经 JSON.stringify 转义（内嵌 " → \"，整体带外层引号）。
+  assert.ok(text.includes(JSON.stringify('公司"邮箱')), 'label 经 JSON.stringify 转义回显');
+});
+
+test('5.3 成功行回显 label 经 JSON.stringify 转义（gmail）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, err } = makeDeps(repo); // gmail 人类成功行走 errln（非 --json 时，同 imap）
+  const code = await runAccountCli(['add', '--gmail', '--label', '公司"邮箱'], deps);
+  assert.equal(code, EXIT_OK);
+  const text = err.join('\n');
+  assert.ok(text.includes(JSON.stringify('公司"邮箱')), 'Gmail label 经 JSON.stringify 转义回显');
+});
+
+test('5.3 CLI 结构化日志不含 label/accountLabel（label 仅人类可读行、不进日志字段）', () => {
+  // CLI 不经 logger 记录 label（人类行走 stdout/stderr；结构化日志字段无 label/accountLabel）。
+  // 子进程跑 add --imap --label，捕获 stdout/stderr，断言其中没有任何 pino JSON 行携带 label 字段。
+  // 注：用 --password-stdin 喂口令（无 TTY 子进程），--json 使数据走 stdout、人类行走 stderr。
+  const accountHref = new URL('./account.js', import.meta.url).href;
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
+  const script = `
+    import(${JSON.stringify(accountHref)}).then(async (m) => {
+      const { runAccountCli } = m;
+      const { InMemoryMailRepo } = await import(${JSON.stringify(new URL('../repo/inMemoryMailRepo.js', import.meta.url).href)});
+      const repo = new InMemoryMailRepo();
+      const out = [], err = [];
+      const deps = {
+        repo,
+        println: (l) => out.push(l),
+        errln: (l) => err.push(l),
+        promptHidden: async () => 'PW',
+        runOAuth: async () => ({ email: 'user@gmail.com', refreshToken: 'RT', scopes: [] }),
+        gmailApp: () => ({ available: true, clientId: 'CID', clientSecret: 'CSEC' }),
+        stdin: { isTTY: false, read: async () => 'PW\\n' },
+      };
+      const code = await runAccountCli(['add','--imap','-e','me@ex.com','-H','h','--label','公司邮箱','--password-stdin'], deps);
+      process.stdout.write('CODE:' + code + '\\n');
+    });
+  `;
+  const out = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  });
+  // 任何 pino JSON 行（含 "level":）都不得携带 label/accountLabel 字段。
+  const jsonLines = out
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith('{') && l.includes('"level"'));
+  for (const line of jsonLines) {
+    const record = JSON.parse(line) as Record<string, unknown>;
+    assert.ok(!('label' in record), `结构化日志行不含 label 字段：${line}`);
+    assert.ok(!('accountLabel' in record), `结构化日志行不含 accountLabel 字段：${line}`);
+  }
+});
+
+test('5.5 add --imap --json --label → --json 输出白名单仍 {id,provider,email,enabled}（不含 label）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, out } = makeDeps(repo);
+  const code = await runAccountCli(
+    ['add', '--imap', '-e', 'me@ex.com', '-H', 'h', '--json', '--label', '公司邮箱'],
+    deps,
+  );
+  assert.equal(code, EXIT_OK);
+  const stdout = out.join('\n');
+  const parsed = JSON.parse(stdout) as Record<string, unknown>;
+  // 白名单字段集合不变——label 不进 --json。
+  assert.deepEqual(Object.keys(parsed).sort(), ['email', 'enabled', 'id', 'provider'], '--json 白名单不含 label');
+  assert.ok(!('label' in parsed), '--json 输出无 label 键');
+  assert.ok(!stdout.includes('公司邮箱'), '--json 输出不含 label 值');
+  // 行 label 仍落库（只是不进 --json 机器输出）。
+  assert.equal((await repo.getAccountById('imap:me@ex.com@h'))?.label, '公司邮箱', 'label 仍落库');
+});
+
+test('5.5 add --gmail --json --label → --json 输出白名单仍 {id,provider,email,enabled}（不含 label）', async () => {
+  const repo = new InMemoryMailRepo();
+  const { deps, out } = makeDeps(repo);
+  const code = await runAccountCli(['add', '--gmail', '--json', '--label', '公司邮箱'], deps);
+  assert.equal(code, EXIT_OK);
+  const stdout = out.join('\n');
+  // --json 时 stdout 应只含一行可解析 JSON（reEnable 提示走 stderr）。
+  const jsonLine = stdout.split('\n').find((l) => l.trim().startsWith('{'));
+  assert.ok(jsonLine !== undefined, 'stdout 含 JSON 行');
+  const parsed = JSON.parse(jsonLine) as Record<string, unknown>;
+  assert.deepEqual(Object.keys(parsed).sort(), ['email', 'enabled', 'id', 'provider'], 'Gmail --json 白名单不含 label');
+  assert.ok(!stdout.includes('公司邮箱'), 'Gmail --json 输出不含 label 值');
 });
