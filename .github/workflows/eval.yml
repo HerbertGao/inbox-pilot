@@ -1,0 +1,68 @@
+name: Eval
+
+# ③A 双向回归守门（rating-calibration-prompt / design「守门机制」）。
+# 与 ci.yml（build-only、无 key、每 PR 跑）物理分离；只在动 prompt/classifier/eval 时（PR）或定时（nightly）真调模型。
+on:
+  pull_request:
+    # 真钓鱼安全线只在可能引入「真钓鱼掉出 P4」回归的改动上触发；日常无关 PR 不跑 = 零成本零 flaky。
+    paths:
+      - 'src/classifier/prompt.ts'
+      - 'src/classifier/classifyEmail.ts'
+      - 'src/classifier/schema.ts'
+      - 'src/classifier/eval/**'
+  schedule:
+    - cron: '17 22 * * *' # 误报噪音线：每日一次（UTC，约北京 06:17）
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # 真钓鱼安全线 = PR 阻塞（逐样本 k=5 多数表决）。fork PR 拿不到 secret → run.ts 检测无 key → skip 标绿。
+  phishing-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm eval:phishing
+        env:
+          # eval 经 classifyEmail 间接 import config（import 期校验 DATABASE_URL）；eval 不连 DB，占位即可。
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+
+  # 误报噪音线 = nightly 非阻塞（k=1、阈值 70%）。失败 → 开/更新固定 issue，靠 GitHub 默认通知邮件让 operator 看见。
+  false-positive-nightly:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - id: eval
+        run: pnpm eval:false-positive
+        env:
+          DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      - name: 失败则开/更新降噪回归 issue（按 label 去重）
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(gh issue list --label eval-regression --state open --json number --jq '.[0].number' || echo '')
+          body="误报集（噪音线）通过率低于阈值——过度评级可能回潮。见运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "误报回归：过度评级回潮（eval nightly）" --label eval-regression --body "$body"
+          fi
