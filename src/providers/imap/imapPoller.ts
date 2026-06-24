@@ -67,6 +67,12 @@ export type PollDeps = {
    */
   readonly processFrom?: Date | null;
   /**
+   * 通知用显示名 = `label ?? email`（design 决策 1）；缺省 = 不携（下游渲染回落裸 accountId）。
+   * 镜像 processFrom 经 deps 转入（pollOnce 只收 accountId + deps），再**位置参**串 processOne → toRawEmail
+   * （非闭包捕获）；由 pollAccount 从 `account.accountLabel` 转入。漏此跳则别名静默丢。
+   */
+  readonly accountLabel?: string;
+  /**
    * 由连接构造 provider 的工厂（连接共享）。默认 createImapProvider；
    * 测试可注入 FakeProviderActions 工厂以离线断言标已读。
    */
@@ -138,7 +144,7 @@ export async function pollOnce(accountId: string, deps: PollDeps): Promise<void>
   const outcomes: FetchOutcome[] = [];
   for (const uid of sortedUids) {
     outcomes.push(
-      await processOne(uid, uidValidity, accountId, {
+      await processOne(uid, uidValidity, accountId, deps.accountLabel, {
         connection,
         repo,
         provider,
@@ -214,6 +220,7 @@ async function processOne(
   uid: number,
   uidValidity: number,
   accountId: string,
+  accountLabel: string | undefined,
   deps: ProcessOneDeps,
 ): Promise<FetchOutcome> {
   try {
@@ -225,7 +232,7 @@ async function processOne(
       );
       return { uid, status: 'failed' };
     }
-    const raw = toRawEmail(fetched, uidValidity, accountId);
+    const raw = toRawEmail(fetched, uidValidity, accountId, accountLabel);
     const normalized = normalizeEmail(raw);
     const processDeps: ProcessEmailDeps = {
       repo: deps.repo,
@@ -262,12 +269,15 @@ function toRawEmail(
   fetched: FetchedMessage,
   uidValidity: number,
   accountId: string,
+  accountLabel: string | undefined,
 ): RawEmail {
   const normalizedMessageId = normalizeMessageId(fetched.messageId);
   const providerMessageId =
     normalizedMessageId ?? `imap-uid:${uidValidity}-${fetched.uid}`;
   return {
     accountId,
+    // accountLabel（显示名 label??email）：穿透链承载，缺省 undefined（normalize 后下游回落裸 accountId）。
+    accountLabel,
     provider: 'imap',
     providerMessageId,
     uid: fetched.uid,
@@ -437,13 +447,15 @@ export async function pollAccount(
 ): Promise<void> {
   const connection = await createRealImapConnection(account);
   try {
-    // processFrom 经 deps 转入 pollOnce 内部决策点（**不**改 accountId 位置参数；design 决策 6）。
+    // processFrom / accountLabel 经 deps 转入 pollOnce（**不**改 accountId 位置参数；design 决策 1/6）。
+    // accountLabel 再由 pollOnce 位置参串 processOne → toRawEmail（非闭包捕获）；漏此跳则别名静默丢。
     await pollOnce(account.accountId, {
       connection,
       repo,
       classify,
       notifier,
       processFrom: account.processFrom,
+      accountLabel: account.accountLabel,
     });
   } finally {
     // 用完即关；logout 失败不掩盖 pollOnce 的原始异常（仅记一条）。

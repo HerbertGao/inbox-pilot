@@ -10,6 +10,11 @@
  */
 export type NormalizedEmail = {
   accountId: string;
+  /**
+   * 通知用显示名 = `label ?? email`（design 决策 1）；缺省 = 不携（渲染回落裸 accountId）。
+   * 注册表/poller 解析、经 RawEmail.accountLabel 透传至此、再投影进通知 payload（穿透链末跳前）。
+   */
+  accountLabel?: string;
   provider: 'gmail' | 'imap';
 
   providerMessageId: string;
@@ -41,6 +46,8 @@ export type NormalizedEmail = {
  */
 export type RawEmail = {
   accountId?: unknown;
+  /** 通知用显示名 = `label ?? email`（design 决策 1）；poller 由账号穿透填入、normalize 原样透传。 */
+  accountLabel?: unknown;
   provider?: unknown;
 
   providerMessageId?: unknown;
@@ -192,6 +199,10 @@ export function normalizeEmail(raw: RawEmail): NormalizedEmail {
   };
 
   // —— 可选字段：仅在有合法值时设置，缺失时保持未设置 ——
+  // accountLabel：注册表/poller 解析的显示名（label ?? email），原样透传（不改既有字段）。
+  if (isNonEmptyString(raw.accountLabel)) {
+    normalized.accountLabel = raw.accountLabel;
+  }
   if (isNonEmptyString(raw.providerThreadId)) {
     normalized.providerThreadId = raw.providerThreadId;
   }

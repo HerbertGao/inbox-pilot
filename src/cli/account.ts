@@ -40,6 +40,21 @@ export const EXIT_FAILURE = 1;
 export const EXIT_USAGE = 2;
 
 /**
+ * `--label` 展示别名硬上限（UTF-16 码元）。固定常量、规范层钉死（notification-mailbox-clarity 决策 4）。
+ */
+const LABEL_MAX_CODE_UNITS = 64;
+
+/**
+ * label denylist（notification-mailbox-clarity 决策 4 规范层钉死）：拒 `\p{Cc}`（C0/C1 控制,含
+ * `\n`/`\r`/`\t`/NUL/DEL/U+0085）+ `\p{Cf}`（格式,含零宽 U+200B / BOM U+FEFF / bidi 嵌入·覆盖
+ * U+202A–U+202E）+ 行分隔 U+2028/U+2029（属 `\p{Zl}/\p{Zp}`、**不**在 `\p{Cf}` 内,必须显式补）+
+ * bidi 隔离符 U+2066–U+2069（本属 `\p{Cf}`、显式列仅为清晰）。理由:仅拒 `\n`/`\r` 会放过
+ * RTL-override（U+202E）等 → 在 Telegram 客户端**视觉重排/伪装来源邮箱**,击穿「可辨来源」目标。
+ * 用 `new RegExp` + `\u` 转义构造（**禁**在正则字面量内写 U+2028/U+2029 字面字符——会断行 source）。
+ */
+const LABEL_DENYLIST = new RegExp('[\\p{Cc}\\p{Cf}\\u2028\\u2029\\u2066-\\u2069]', 'u');
+
+/**
  * 可注入依赖（6.3 离线测试用；prod 用真身默认）。
  * 凭据从不经此处回显：promptHidden 读口令、绝不 println 它。
  */
@@ -202,15 +217,17 @@ function findForbiddenSecretFlag(flags: ParsedFlags): string | null {
 const USAGE = [
   '用法: account <command> [--json]',
   '',
-  '  add --imap -e|--email <addr> -H|--host <h> [-p|--port <n>] [--tls <true|false>] [--no-tls] [--account-id <id>] [--update] [--process-from <YYYY-MM-DD>]',
+  '  add --imap -e|--email <addr> -H|--host <h> [-p|--port <n>] [--tls <true|false>] [--no-tls] [--account-id <id>] [--update] [--process-from <YYYY-MM-DD>] [--label <名>]',
   '      口令默认经交互 prompt 读取（echo off）——禁经 argv 传入。',
   '      非交互口令来源（互斥）: --password-stdin（从管道读）| --password-file <path>（读文件）。',
   `      ${PASSWORD_STDIN_USAGE_HINT}`,
   '      同派生 id 已存在默认拒绝；--update 显式确认更新凭据。',
   '      --process-from <YYYY-MM-DD>: 起算日期水位线（容器时区零点）；仅新建账号生效，既有账号请用 set-process-from。',
-  '  add --gmail [--process-from <YYYY-MM-DD>]',
+  '      --label <名>: 通知展示别名（允许中文/可见 Unicode，≤64 码元）；仅新建账号生效，既有账号通知回落 email。',
+  '  add --gmail [--process-from <YYYY-MM-DD>] [--label <名>]',
   '      跑 loopback OAuth 授权；同 id 已存在则 upsert 新 refresh token 并启用（re-auth/恢复）。',
   '      --process-from 仅首次接入生效；re-auth 不改既有水位线。',
+  '      --label 仅首次接入生效；re-auth 不改既有别名。',
   '  add（不带 --imap/--gmail）',
   '      打开交互式 provider 选择菜单。',
   '  list [--json]',
@@ -361,6 +378,59 @@ function resolveProcessFromFlag(
   return { ok: true, processFrom: parsed.date };
 }
 
+/**
+ * 解析并校验可选 `--label <名>`（add 路径，IMAP 与 Gmail 两子命令共用；notification-mailbox-clarity
+ * 决策 4）。规则（规范层钉死）:
+ * ① **值缺位守卫**:`--label` 后续 token 以 `-` 开头（落 `bools`、同 `--process-from` 坑）→ 报
+ *    `--label 需要值参数 <名>` + 用法错误（**禁**静默落 NULL）；
+ * ② `.trim()` 后非空（纯空白 → 拒，否则存空白、渲染回落 email、`list` 显示空）；
+ * ③ 拒 denylist（`\p{Cc}`/`\p{Cf}`/U+2028/U+2029/U+2066–U+2069；见 `LABEL_DENYLIST`）；
+ * ④ ≤ 64 码元（`.length` = UTF-16 code units）。
+ * 未给该 flag → `{ ok:true, label: undefined }`（repo 写 `label=NULL`、渲染回落 email）。
+ * 校验**对 trim 后的值**判定（denylist/限长），合法返回 trim 后的值经 `AccountWriteInput.label` 透传
+ * （仅 create 生效）。失败 → `{ ok:false }`，调用方报 EXIT_USAGE、**不**触达 repo 写。
+ * 注:`label` **不**进任何结构化日志字段；CLI 回显由调用方经 `JSON.stringify` 转义（双层防注入）。
+ */
+function validateLabel(
+  flags: ParsedFlags,
+  deps: CliDeps,
+): { ok: true; label: string | undefined } | { ok: false } {
+  // 值缺位的 `--label`（落 bools、非 values）：flag 在场但无值 → 不静默回落 NULL，显式报参数错误。
+  if (flags.bools.has('label')) {
+    deps.errln('--label 需要值参数 <名>');
+    return { ok: false };
+  }
+  const raw = flags.values.get('label');
+  if (raw === undefined) {
+    return { ok: true, label: undefined };
+  }
+  // denylist 跑在 **raw**（trim 之前）:`\t`/`\n`/`\r`/U+2028/U+2029/U+FEFF 等既是 denylist 字符、又是
+  // `String.trim()` 的 whitespace/line-terminator——若先 trim 再查,前导/后缀的此类字符会被剥掉、denylist 看不到、
+  // 被静默接受为 trim 后的值（Codex review）。故先在**原始值**上拒控制 / 格式 / 行分隔 / bidi 隔离符
+  //（防 RTL-override 等伪装来源邮箱）;普通空格不在 denylist、仍由下方 trim 清理。
+  // 违规值经 JSON.stringify 转义渲染——绝不原样回显（防嵌入控制字符经错误信息再注入 stderr/日志）。
+  if (LABEL_DENYLIST.test(raw)) {
+    deps.errln(
+      `--label 含非法字符（控制 / 格式 / 行分隔 / bidi）: ${JSON.stringify(raw)}`,
+    );
+    return { ok: false };
+  }
+  const trimmed = raw.trim();
+  // trim 后判空（纯空白）→ 拒。
+  if (trimmed.length === 0) {
+    deps.errln(`--label 不能为空白: ${JSON.stringify(raw)}`);
+    return { ok: false };
+  }
+  // 限长 ≤ 64 码元（UTF-16 code units = `.length`）。
+  if (trimmed.length > LABEL_MAX_CODE_UNITS) {
+    deps.errln(
+      `--label 超长（${trimmed.length} 码元 > ${LABEL_MAX_CODE_UNITS}）: ${JSON.stringify(raw)}`,
+    );
+    return { ok: false };
+  }
+  return { ok: true, label: trimmed };
+}
+
 /** `account add --imap`：口令经互斥来源（stdin/file/交互提示）读 → createAccount（同 id 默认拒绝）。 */
 async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   const json = flags.bools.has('json');
@@ -425,6 +495,14 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
   }
   const processFrom = pfRes.processFrom;
 
+  // `--label`（可选）先于口令 prompt 校验（fail-fast、同 --process-from）：值缺位 / 非法 / 超长 →
+  // EXIT_USAGE、**不**触达 repo 写。合法值经 AccountWriteInput.label 透传（仅 create 生效，决策 5）。
+  const labelRes = validateLabel(flags, deps);
+  if (!labelRes.ok) {
+    return EXIT_USAGE;
+  }
+  const label = labelRes.label;
+
   // **口令绝不从 argv** → 互斥来源 --password-stdin / --password-file / 交互隐藏提示（默认）。
   const pwResult = await resolveImapPassword(
     {
@@ -451,14 +529,16 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
 
   if (wantUpdate) {
     // 显式确认 → upsert（同 id 更新凭据，不分裂；同邮箱重加自然命中同一行）。
-    await deps.repo.upsertAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom });
-    emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已更新 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
+    // `label` 作播种载体:仅 create 分支生效（决策 5）；既有行走 update 被 repo 忽略（保留既有 label）。
+    await deps.repo.upsertAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom, label });
+    // 回显成功行（label 经 JSON.stringify 转义，双层防注入，同 id；label 不进结构化日志字段）。
+    emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已更新 IMAP 账号: ${id}（email=${email}${label === undefined ? '' : `, label=${JSON.stringify(label)}`}）。重启后生效。`);
     return EXIT_OK;
   }
 
   try {
     // 默认 reject-on-exists（createAccount 命中已存 id 即抛）——不静默覆盖。
-    await deps.repo.createAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom });
+    await deps.repo.createAccount({ id, provider: 'imap', email, authJson, enabled: true, processFrom, label });
   } catch {
     // 区分「id 已存在」与「存储/网络/运行期写失败」——一律报「已存在」会给错指引。
     // getAccountById 自身也可能抛（DB 不可达）→ 再包一层、抛则按通用写失败处理（凭据纪律：不记原始 error）。
@@ -477,7 +557,8 @@ async function cmdAddImap(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     }
     return EXIT_FAILURE;
   }
-  emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已新增 IMAP 账号: ${id}（email=${email}）。重启后生效。`);
+  // 回显成功行（label 经 JSON.stringify 转义，双层防注入，同 id；label 不进结构化日志字段）。
+  emitAccountAddOutcome(deps, json, { id, provider: 'imap', email, enabled: true }, `已新增 IMAP 账号: ${id}（email=${email}${label === undefined ? '' : `, label=${JSON.stringify(label)}`}）。重启后生效。`);
   return EXIT_OK;
 }
 
@@ -508,6 +589,13 @@ async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     return EXIT_USAGE;
   }
   const processFrom = pfRes.processFrom;
+  // `--label`（可选）同样在跑 OAuth 前校验（fail-fast）：值缺位 / 非法 / 超长 → EXIT_USAGE、不跑 OAuth、
+  // 不触达 repo 写。合法值经 AccountWriteInput.label 透传（Gmail 恒走 upsert，仅首次 create 分支生效，决策 5）。
+  const labelRes = validateLabel(flags, deps);
+  if (!labelRes.ok) {
+    return EXIT_USAGE;
+  }
+  const label = labelRes.label;
   const app = deps.gmailApp();
   if (!app.available || app.clientId === undefined || app.clientSecret === undefined) {
     // 沿用「缺 app 凭据 / redirect_uri 非法 → onboarding 显式失败」（config.isGmailOnboardingAvailable）。
@@ -549,6 +637,7 @@ async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
     authJson: { refreshToken: result.refreshToken, scopes: result.scopes },
     enabled: true,
     processFrom,
+    label,
   });
   if (reEnabled) {
     // 「正在重新启用」提示（人类/日志行）：--json 时走 stderr 以保 stdout 纯 JSON，否则走 stdout（既有契约）。
@@ -559,7 +648,9 @@ async function cmdAddGmail(flags: ParsedFlags, deps: CliDeps): Promise<number> {
       deps.println(hint);
     }
   }
-  emitAccountAddOutcome(deps, json, { id, provider: 'gmail', email: result.email, enabled: true }, `已接入 Gmail 账号: ${id}。重启后生效。`);
+  // 回显成功行（label 经 JSON.stringify 转义，双层防注入，同 id；label 不进结构化日志字段）。
+  const gmailLabelSuffix = label === undefined ? '' : `（label=${JSON.stringify(label)}）`;
+  emitAccountAddOutcome(deps, json, { id, provider: 'gmail', email: result.email, enabled: true }, `已接入 Gmail 账号: ${id}${gmailLabelSuffix}。重启后生效。`);
   return EXIT_OK;
 }
 

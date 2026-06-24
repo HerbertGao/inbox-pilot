@@ -6,6 +6,7 @@
 //   3. 渠道入参只接 NotificationPayload（白名单字段），textBody/htmlBody 结构上无法进入。
 
 import { config } from '../config/config.js';
+import { CATEGORY_LABELS } from './categoryLabels.js';
 import type { NotificationChannel, NotificationPayload } from './notifier.js';
 
 // 推送结果：sent 成功；failed 携带可记录的 error 摘要（不含凭据/正文）。
@@ -20,32 +21,58 @@ const TELEGRAM_API_BASE = 'https://api.telegram.org';
 const TELEGRAM_TIMEOUT_MS = 10_000;
 
 /**
- * 把白名单 payload 渲染为 §13 文案。
- *   P0 → [P0 邮件] subject / 发件人 / 原因 / 分类 / 置信度
- *   P4 → [P4 风险邮件] subject / 发件人 / 风险 / 原因 + 「不要点链接，请进官网核验」
- *   其余优先级（理论上不会进即时推送，shouldNotifyNow 只对 P0/P4 为真）回落到通用模板。
+ * 把白名单 payload 渲染为 §13 文案（design 决策 1/2/3、spec notifications「单一模板」）。
+ *
+ * P0/P4 **单一模板**、统一字段序：
+ *   [优先级] 主题 / 邮箱:<mailboxLabel> / 发件人 / 原因 / 分类:#中文 / 置信度
+ *   + `riskFlags` **非空才**加风险行（P0 此前不显示、合并后非空时会显示——字段统一带来的行为变更）
+ *   + **仅** P4 附「不要点链接、请进官网核验」安全提示
+ *
+ * 邮箱来源标签 **sanitize-then-fallback**（决策 1）：先净化 label 候选、净化后为空才回落
+ * 裸 accountId（ASCII、净化 no-op、必非空）→ **绝不渲染空**「邮箱:」。绝不写成
+ * `sanitizeField(accountLabel || accountId)`——全危险字符候选 pre-sanitize 非空被 `||`
+ * 选中、再净化成空 → 空来源。
+ *
  * 只引用 payload 的白名单字段——textBody/htmlBody 不在 payload 中，从结构上杜绝正文泄露。
  */
 export function renderTelegramText(payload: NotificationPayload): string {
-  const sender = formatSender(payload.fromName, payload.fromEmail);
-  if (payload.priority === 'P4') {
-    const risk = payload.riskFlags.length > 0 ? payload.riskFlags.join('、') : '（无）';
-    return [
-      `[P4 风险邮件] ${payload.subject}`,
-      `发件人：${sender}`,
-      `风险：${risk}`,
-      `原因：${payload.reason}`,
-      '不要点击链接，请直接进入官网或邮箱客户端核验。',
-    ].join('\n');
-  }
-  // P0（及任何其它即时推送优先级）：subject / 发件人 / 原因 / 分类 / 置信度。
-  return [
-    `[${payload.priority} 邮件] ${payload.subject}`,
+  // **所有攻击者可影响的自由文本字段**（主题 / 原因 / 发件人 / 风险标记 / 来源标签）在渲染前一律净化:
+  // 仅净化 mailboxLabel 不够——subject 等含换行（`\r`/`\n`/U+2028/U+2029）会在多行消息里**伪造结构行**
+  // （如假「邮箱：…」行），绕过来源可辨保证（CodeRabbit review）。sanitizeField 同时剥控制/格式/bidi。
+  const subject = sanitizeField(payload.subject);
+  const reason = sanitizeField(payload.reason);
+  const sender = sanitizeField(formatSender(payload.fromName, payload.fromEmail));
+  // sanitize-then-fallback：先净化 label 候选，净化后为空才回落裸 accountId（绝不空）。
+  const fromLabel = sanitizeField(payload.accountLabel ?? '').trim();
+  const mailboxLabel = fromLabel || payload.accountId;
+  const lines = [
+    `[${payload.priority} 邮件] ${subject}`,
+    `邮箱：${mailboxLabel}`,
     `发件人：${sender}`,
-    `原因：${payload.reason}`,
-    `分类：${payload.category}`,
+    `原因：${reason}`,
+    `分类：#${CATEGORY_LABELS[payload.category]}`,
     `置信度：${formatConfidence(payload.confidence)}`,
-  ].join('\n');
+  ];
+  // riskFlags 非空才加风险行（空则不渲染）；join 后净化（防风险标记里的换行伪造行）。
+  if (payload.riskFlags.length > 0) {
+    lines.push(`风险：${sanitizeField(payload.riskFlags.join('、'))}`);
+  }
+  // 仅 P4 附安全核验提示。
+  if (payload.priority === 'P4') {
+    lines.push('不要点击链接，请直接进入官网或邮箱客户端核验。');
+  }
+  return lines.join('\n');
+}
+
+/**
+ * 来源标签渲染净化（单点防御 choke point，design 决策 1/4、spec notifications「来源标签渲染前净化」）。
+ * 剥除 `s` 中**所有**出现的 `\p{Cc}`（C0/C1 控制）/ `\p{Cf}`（格式字符，含零宽/BOM/bidi 嵌入覆盖）
+ * / U+2028 / U+2029（行分隔）/ U+2066–U+2069（bidi 隔离符）——带 `u`+`g` flag。
+ * 账号 `email` 是 IMAP `--email` 未按 denylist 校验的自由文本，统一在此净化、防经 email
+ * 重开 RTL-override 等来源伪装面；`label` 已 add 校验、`accountId` 已 ASCII，对其为 no-op。
+ */
+function sanitizeField(s: string): string {
+  return s.replace(/[\p{Cc}\p{Cf}\u2028\u2029\u2066-\u2069]/gu, '');
 }
 
 function formatSender(fromName: string | undefined, fromEmail: string): string {

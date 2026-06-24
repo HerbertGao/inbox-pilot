@@ -93,8 +93,18 @@ function parseImap(row: StoredAccount, authJson: Record<string, unknown>): Accou
   }
   const port = typeof authJson.port === 'number' && Number.isFinite(authJson.port) ? authJson.port : 993;
   const tls = typeof authJson.tls === 'boolean' ? authJson.tls : true;
-  // processFrom 显式枚举进字面量（本字面量非 `...row` 展开，不写则下游 spread 凭空丢失水位线）。
-  const imap: ImapAccount = { accountId: row.id, host, port, user, password, tls, processFrom: row.processFrom };
+  // processFrom / accountLabel 显式枚举进字面量（本字面量非 `...row` 展开，不写则下游 spread 凭空丢失）。
+  // accountLabel = 显示名「label ?? email」（design 决策 1）：label.trim() 非空则用之、否则回落账号 email。
+  const imap: ImapAccount = {
+    accountId: row.id,
+    host,
+    port,
+    user,
+    password,
+    tls,
+    processFrom: row.processFrom,
+    accountLabel: row.label?.trim() || row.email,
+  };
   return { provider: 'imap', ...imap };
 }
 
@@ -104,8 +114,14 @@ function parseGmail(row: StoredAccount, authJson: Record<string, unknown>): Acco
     skip(row, 'gmail-incomplete-credentials');
     return null;
   }
-  // processFrom 显式枚举进字面量（同 parseImap：本字面量非 `...row` 展开）。
-  const gmail: GmailAccount = { accountId: row.id, refreshToken, processFrom: row.processFrom };
+  // processFrom / accountLabel 显式枚举进字面量（同 parseImap：本字面量非 `...row` 展开）。
+  // accountLabel = 显示名「label ?? email」（design 决策 1）：label.trim() 非空则用之、否则回落账号 email。
+  const gmail: GmailAccount = {
+    accountId: row.id,
+    refreshToken,
+    processFrom: row.processFrom,
+    accountLabel: row.label?.trim() || row.email,
+  };
   const scopes = authJson.scopes;
   if (Array.isArray(scopes) && scopes.every((s) => typeof s === 'string')) {
     gmail.scopes = scopes as string[];

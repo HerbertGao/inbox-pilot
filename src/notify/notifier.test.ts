@@ -14,8 +14,14 @@ import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 
 import { createNotifier } from './notifier.js';
-import type { NotificationChannel } from './notifier.js';
+import type { NotificationChannel, NotificationPayload } from './notifier.js';
 import type { ChannelSendResult } from './telegram.js';
+import type { FinalDecision } from '../rules/finalDecision.js';
+import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
+import { normalizeEmail } from '../normalizer/normalizeEmail.js';
+import { toRawEmail } from '../providers/gmail/gmailPoller.js';
+import { InMemoryMailRepo } from '../repo/inMemoryMailRepo.js';
+import type { Classification } from '../classifier/schema.js';
 
 /** 记录型假渠道：记下 sendText 收到的文本，便于断言透传；不触达真实 telegram。 */
 function makeRecordingChannel(
@@ -83,4 +89,204 @@ test('notifyDigest：无渠道（无 TELEGRAM_* 配置）→ skipped 降级', ()
   assert.ok(line !== undefined, `子进程未输出 RESULT 行：${out}`);
   const result = JSON.parse(line.slice('RESULT:'.length));
   assert.deepEqual(result, { outcome: 'skipped', reason: 'no-channel' });
+});
+
+// ——————————————————————————————————————————————————————————
+// notification-mailbox-clarity 5.4：projectPayload 投影 + poller 填 accountLabel +
+// retry/drain rebuild accountLabel==label + notify 日志字段（不含 label/accountLabel）
+// ——————————————————————————————————————————————————————————
+
+/** 捕获 send 收到的 payload 的假渠道（不触达真实 telegram）；驱动 projectPayload 真实入口。 */
+function makePayloadCapturingChannel(
+  result: ChannelSendResult = { outcome: 'sent' },
+): NotificationChannel & { payloads: NotificationPayload[] } {
+  const payloads: NotificationPayload[] = [];
+  return {
+    name: 'capturing',
+    payloads,
+    async send(payload: NotificationPayload): Promise<ChannelSendResult> {
+      payloads.push(payload);
+      return result;
+    },
+    async sendText(): Promise<ChannelSendResult> {
+      return result;
+    },
+  };
+}
+
+function makeDecision(overrides: Partial<FinalDecision> = {}): FinalDecision {
+  return {
+    priority: 'P0',
+    category: 'work',
+    confidence: 0.9,
+    shouldNotifyNow: true,
+    shouldMarkRead: false,
+    shouldIncludeDigest: false,
+    reason: '裁定原因',
+    riskFlags: [],
+    appliedRules: [],
+    ...overrides,
+  };
+}
+
+test('projectPayload：notify 经真实入口投影 payload 含 accountId/accountLabel、不含正文（textBody/htmlBody）', async () => {
+  const channel = makePayloadCapturingChannel({ outcome: 'sent' });
+  const notifier = createNotifier({ channel });
+
+  const email: NormalizedEmail = {
+    accountId: 'gmail:me@example.com',
+    accountLabel: '公司邮箱',
+    provider: 'gmail',
+    providerMessageId: 'm1',
+    subject: '主题',
+    fromEmail: 'a@b.com',
+    to: ['me@example.com'],
+    date: '2026-06-20T00:00:00.000Z',
+    textBody: '机密正文，不应进 payload',
+    htmlBody: '<p>机密正文</p>',
+    hasAttachments: false,
+    headers: {},
+  };
+
+  const result = await notifier.notify(makeDecision(), email);
+  assert.deepEqual(result, { outcome: 'sent', channel: 'capturing' });
+
+  assert.equal(channel.payloads.length, 1, 'notify 投影一次 payload');
+  const payload = channel.payloads[0]!;
+  // accountId / accountLabel 被投影进 payload。
+  assert.equal(payload.accountId, 'gmail:me@example.com', 'payload 含 accountId');
+  assert.equal(payload.accountLabel, '公司邮箱', 'payload 含 accountLabel');
+  // payload 结构层杜绝正文：键不存在、值不出现。
+  assert.ok(!('textBody' in payload), 'payload 无 textBody 键');
+  assert.ok(!('htmlBody' in payload), 'payload 无 htmlBody 键');
+  const serialized = JSON.stringify(payload);
+  assert.ok(!serialized.includes('机密正文'), 'payload 不含正文内容');
+});
+
+test('poller 填 accountLabel：gmail toRawEmail(message, accountId, accountLabel) → normalize → notify 投影该 accountLabel', async () => {
+  // 驱动真实 poller 入口（toRawEmail）填 accountLabel，经 normalizeEmail 收敛，再经 notify 投影。
+  const raw = toRawEmail(
+    {
+      id: 'g1',
+      payload: {
+        headers: [
+          { name: 'Subject', value: '主题' },
+          { name: 'From', value: '发件人 <a@b.com>' },
+        ],
+      },
+    },
+    'gmail:me@example.com',
+    '公司邮箱', // accountLabel = label??email（穿透链由 main.ts 接线填）
+  );
+  const email = normalizeEmail(raw);
+  assert.equal(email.accountLabel, '公司邮箱', 'normalize 透传 poller 填入的 accountLabel');
+
+  const channel = makePayloadCapturingChannel();
+  const notifier = createNotifier({ channel });
+  await notifier.notify(makeDecision(), email);
+  assert.equal(channel.payloads[0]!.accountLabel, '公司邮箱', 'poller→normalize→notify 链路保住 accountLabel');
+});
+
+test('retry/drain：rebuildNormalizedEmail 经 selectDueRetries——account.label 非空且≠email → 重建 accountLabel == label（非 email 回落）', async () => {
+  const repo = new InMemoryMailRepo();
+  const accountId = 'gmail:me@example.com';
+  const accountEmail = 'me@example.com';
+  const accountLabel = '公司邮箱'; // **非空且 ≠ email**（守 label 掉出 rebuild select 经 email 回落空过）
+
+  // seed 账号行（label ≠ email）。
+  await repo.upsertAccount({
+    id: accountId,
+    provider: 'gmail',
+    email: accountEmail,
+    authJson: { refreshToken: 'RT', scopes: [] },
+    label: accountLabel,
+  });
+
+  // 落一封邮件 + 一条分类行（rebuild 需最新分类，否则 {ok:false} 永久）。
+  const { id: messageRowId } = await repo.saveEmail({
+    accountId,
+    provider: 'gmail',
+    providerMessageId: 'm1',
+    subject: '主题',
+    fromEmail: 'sender@example.com',
+    to: [],
+    date: '2026-06-20T00:00:00.000Z',
+    hasAttachments: false,
+    headers: {},
+  });
+  const classification: Classification = {
+    priority: 'P0',
+    category: 'security',
+    should_notify_now: true,
+    should_mark_read: false,
+    should_include_digest: false,
+    confidence: 0.9,
+    reason: '裁定原因',
+    risk_flags: [],
+  };
+  await repo.saveClassification(messageRowId, classification, makeDecision({ category: 'security' }));
+
+  // 入队一条到期重试动作（nextRetryAt 在过去 → due）。
+  const { actionRowId } = await repo.recordAction(messageRowId, 'notify');
+  await repo.enqueueRetry(actionRowId, 0, new Date(Date.now() - 60_000));
+
+  const due = await repo.selectDueRetries(accountId, new Date(), 10);
+  assert.equal(due.length, 1, '选出一条到期重试');
+  const rebuild = due[0]!.rebuild;
+  assert.ok(rebuild.ok, '重建成功（有分类行）');
+  // 关键：重建 email 的 accountLabel == 账号 label（非 email 回落）。
+  assert.equal(
+    rebuild.email.accountLabel,
+    accountLabel,
+    '重试重建的 accountLabel 是账号 label（非 email；label 未掉出 rebuild select）',
+  );
+  assert.notEqual(rebuild.email.accountLabel, accountEmail, 'accountLabel 不是 email 回落');
+});
+
+test('notify 日志字段：失败日志仅 {kind,priority,channel,error}、不含 label/accountLabel（子进程捕获 pino 行）', () => {
+  // pino 同步写 fd 1（非 process.stdout.write），故在子进程跑 notify 失败路径、捕获其 stdout 的
+  // notify-failed JSON 行，断言 payload 字段集合 + 不含 label/accountLabel/正文（守「label 不进结构化日志」）。
+  const notifierHref = new URL('./notifier.js', import.meta.url).href;
+  const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
+  const script = `
+    import(${JSON.stringify(notifierHref)}).then(async ({ createNotifier }) => {
+      const channel = {
+        name: 'failing',
+        async send() { return { outcome: 'failed', error: 'telegram-http-500' }; },
+        async sendText() { return { outcome: 'failed', error: 'telegram-http-500' }; },
+      };
+      const notifier = createNotifier({ channel });
+      const decision = { priority: 'P0', category: 'work', confidence: 0.9, shouldNotifyNow: true, shouldMarkRead: false, shouldIncludeDigest: false, reason: 'r', riskFlags: [], appliedRules: [] };
+      const email = { accountId: 'gmail:me@example.com', accountLabel: '公司邮箱', provider: 'gmail', providerMessageId: 'm1', subject: 's', fromEmail: 'a@b.com', to: [], date: new Date().toISOString(), hasAttachments: false, headers: {}, textBody: 'BODY', htmlBody: '<p>BODY</p>' };
+      await notifier.notify(decision, email);
+    });
+  `;
+  const out = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+    cwd: repoRoot,
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: 'x', TELEGRAM_CHAT_ID: 'y' },
+    encoding: 'utf8',
+  });
+
+  const logLine = out
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l.includes('"kind":"notify-failed"'));
+  assert.ok(logLine !== undefined, `子进程未输出 notify-failed 日志行：${out}`);
+  const record = JSON.parse(logLine) as Record<string, unknown>;
+  // 业务字段（剔除 pino 信封 level/time/pid/hostname/msg）= {kind,priority,channel,error}。
+  const { level: _l, time: _t, pid: _p, hostname: _h, msg: _m, ...biz } = record;
+  assert.deepEqual(
+    Object.keys(biz).sort(),
+    ['channel', 'error', 'kind', 'priority'],
+    'notify 失败日志业务字段恰为 {kind,priority,channel,error}',
+  );
+  assert.equal(biz.kind, 'notify-failed');
+  assert.equal(biz.priority, 'P0');
+  assert.equal(biz.channel, 'failing');
+  assert.equal(biz.error, 'telegram-http-500');
+  // 守「label 不进结构化日志」+ 正文不入日志。
+  assert.ok(!('label' in record), '日志不含 label 字段');
+  assert.ok(!('accountLabel' in record), '日志不含 accountLabel 字段');
+  assert.ok(!out.includes('公司邮箱'), '日志整体不含 label 值');
+  assert.ok(!out.includes('BODY'), '日志整体不含正文');
 });

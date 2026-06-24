@@ -82,6 +82,8 @@ type AccountRow = {
   enabled: boolean;
   /** 起算日期水位线（onboarding-watermark；NULL = 不设下界）。镜像 StoredAccount.processFrom。 */
   processFrom: Date | null;
+  /** 展示别名（notification-mailbox-clarity；NULL → 下游渲染回落 email）。镜像 StoredAccount.label；仅 create 写、update 保留。 */
+  label: string | null;
 };
 
 /**
@@ -158,6 +160,10 @@ export class InMemoryMailRepo implements MailRepo {
       existing !== undefined
         ? existing.processFrom
         : cloneProcessFrom(input.processFrom ?? null) ?? new Date();
+    // 展示别名 get-before-set（notification-mailbox-clarity 决策 5，与 processFrom 同一 preserve 路径）：
+    // existing（update/re-auth）⇒ 保留 existing.label、**忽略 input**（Prisma 经省略字段达成相同语义）；
+    // 不存在（create）⇒ input.label ?? null。
+    const label = existing !== undefined ? existing.label : input.label ?? null;
     // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
     this.accountsById.set(input.id, {
       id: input.id,
@@ -166,6 +172,7 @@ export class InMemoryMailRepo implements MailRepo {
       authJson: input.authJson,
       enabled: input.enabled ?? true,
       processFrom,
+      label,
     });
     // 写入路径即「播种」游标命名空间（取代旧 ensureAccountAnchor）；幂等：已存不重置游标。
     if (!this.cursorsByAccountId.has(input.id)) {
@@ -454,20 +461,28 @@ export class InMemoryMailRepo implements MailRepo {
       account?.provider === 'gmail' || account?.provider === 'imap'
         ? account.provider
         : msg.email.provider;
+    // 显示名 label??email（design 决策 1）：锁步 prisma 同传，使重试通知与首发一致指明邮箱（tasks 2.6）。
+    // 账号行缺失（accountsById 无此行）→ undefined（下游回落裸 accountId）。
+    const accountLabel = account ? account.label?.trim() || account.email : undefined;
     try {
-      const email = rebuildNormalizedEmail(msg.accountId, provider, {
-        providerMessageId: msg.email.providerMessageId,
-        messageId: msg.email.messageId ?? null,
-        threadId: msg.email.providerThreadId ?? null,
-        uid: msg.email.uid ?? null,
-        subject: msg.email.subject,
-        fromEmail: msg.email.fromEmail,
-        fromName: msg.email.fromName ?? null,
-        snippet: msg.email.snippet ?? null,
-        bodyText: msg.email.textBody ?? null,
-        receivedAt: new Date(msg.email.date),
-        hasAttachments: msg.email.hasAttachments,
-      });
+      const email = rebuildNormalizedEmail(
+        msg.accountId,
+        provider,
+        {
+          providerMessageId: msg.email.providerMessageId,
+          messageId: msg.email.messageId ?? null,
+          threadId: msg.email.providerThreadId ?? null,
+          uid: msg.email.uid ?? null,
+          subject: msg.email.subject,
+          fromEmail: msg.email.fromEmail,
+          fromName: msg.email.fromName ?? null,
+          snippet: msg.email.snippet ?? null,
+          bodyText: msg.email.textBody ?? null,
+          receivedAt: new Date(msg.email.date),
+          hasAttachments: msg.email.hasAttachments,
+        },
+        accountLabel,
+      );
       const decision = rebuildFinalDecision({
         priority: latest.priority,
         category: latest.category,

@@ -61,6 +61,11 @@ export type GmailPollDeps = {
    * 静默 no-op。由 createGmailPoller 接收、main.ts 接线从 `account.processFrom` 放进 deps。
    */
   readonly processFrom?: Date | null;
+  /**
+   * 通知用显示名 = `label ?? email`（design 决策 1）；缺省 = 不携（下游渲染回落裸 accountId）。
+   * 镜像 processFrom 同款穿透：main.ts 接线从 `account.accountLabel` 放进 deps、经 toRawEmail 填进 RawEmail。
+   */
+  readonly accountLabel?: string;
   /** 每轮 get 预算（默认 200）。 */
   readonly getBudget?: number;
   /** processEmail 注入点。默认真身；测试注入闭包传 InMemoryMailRepo + provider + 假 classify。 */
@@ -149,7 +154,7 @@ export async function gmailPoll(accountId: string, deps: GmailPollDeps): Promise
     let normalized: NormalizedEmail;
     try {
       const res = await gmail.users.messages.get({ userId: 'me', id, format: 'full' });
-      const raw = toRawEmail(res.data, accountId);
+      const raw = toRawEmail(res.data, accountId, deps.accountLabel);
       normalized = normalizeEmail(raw);
     } catch (err) {
       // 读侧 429/配额 与 401/403 **绕过逐封 skip**、上抛结束本轮并隔离（不逐封继续翻页加剧限流）。
@@ -266,7 +271,7 @@ function handleReadError(accountId: string, err: unknown): void {
  * - htmlBody 可选保留（审计）；全无正文 → 不设 textBody（normalize 后以 subject+headers 分类）。
  * - payload.headers 仅取分类器白名单 → headers；From/Subject 经各自字段（不塞 headers）。
  */
-export function toRawEmail(message: GmailMessage, accountId: string): RawEmail {
+export function toRawEmail(message: GmailMessage, accountId: string, accountLabel?: string): RawEmail {
   const payload = message.payload ?? undefined;
   const headerMap = collectHeaders(payload);
 
@@ -300,6 +305,10 @@ export function toRawEmail(message: GmailMessage, accountId: string): RawEmail {
     headers: whitelistHeaders,
     hasAttachments: detectAttachments(payload),
   };
+  // accountLabel（显示名 label??email）：穿透链承载，缺省不设（normalize 后下游回落裸 accountId）。
+  if (accountLabel !== undefined) {
+    raw.accountLabel = accountLabel;
+  }
   if (typeof message.threadId === 'string' && message.threadId.length > 0) {
     raw.providerThreadId = message.threadId;
   }
