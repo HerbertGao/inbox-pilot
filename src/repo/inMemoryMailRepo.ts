@@ -84,6 +84,14 @@ type AccountRow = {
   processFrom: Date | null;
 };
 
+/**
+ * 克隆水位线 Date：防外部经引用改内部状态，并与 PrismaMailRepo（每次读从 PG 反序列化出全新 Date）的
+ * 值语义对齐——本内存双件在存/取边界不外泄、不 retain 可变 Date 引用（避免双件与真实 repo 的值语义漂移）。
+ */
+function cloneProcessFrom(d: Date | null): Date | null {
+  return d === null ? null : new Date(d.getTime());
+}
+
 export class InMemoryMailRepo implements MailRepo {
   private readonly emailsById = new Map<string, EmailRow>();
   private readonly emailIdByDedupKey = new Map<string, string>();
@@ -104,7 +112,7 @@ export class InMemoryMailRepo implements MailRepo {
     const rows: StoredAccount[] = [];
     for (const row of this.accountsById.values()) {
       if (row.enabled) {
-        rows.push({ ...row });
+        rows.push({ ...row, processFrom: cloneProcessFrom(row.processFrom) });
       }
     }
     return rows;
@@ -114,14 +122,14 @@ export class InMemoryMailRepo implements MailRepo {
     // 所有行（不按 enabled 过滤）——account list 用，使被禁用/reauth-suspend 的行可见。
     const rows: StoredAccount[] = [];
     for (const row of this.accountsById.values()) {
-      rows.push({ ...row });
+      rows.push({ ...row, processFrom: cloneProcessFrom(row.processFrom) });
     }
     return rows;
   }
 
   async getAccountById(id: string): Promise<StoredAccount | null> {
     const row = this.accountsById.get(id);
-    return row === undefined ? null : { ...row };
+    return row === undefined ? null : { ...row, processFrom: cloneProcessFrom(row.processFrom) };
   }
 
   async updateGmailTokens(
@@ -144,8 +152,12 @@ export class InMemoryMailRepo implements MailRepo {
     // 因 .set 会整行替换、clobber 既有 processFrom。existing 存在（update/re-auth）⇒ 保留 existing.processFrom、
     // **忽略 input**（Prisma 经省略字段达成相同语义）；不存在（create）⇒ input.processFrom ?? 精确瞬时。
     const existing = this.accountsById.get(input.id);
+    // existing（update/re-auth）保留内部 Date 引用（已是本件私有）；create 分支克隆外部 input.processFrom
+    // （或种精确瞬时 new Date()），不 retain 调用方可变引用——与 Prisma 值语义对齐。
     const processFrom =
-      existing !== undefined ? existing.processFrom : input.processFrom ?? new Date();
+      existing !== undefined
+        ? existing.processFrom
+        : cloneProcessFrom(input.processFrom ?? null) ?? new Date();
     // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
     this.accountsById.set(input.id, {
       id: input.id,
@@ -183,7 +195,7 @@ export class InMemoryMailRepo implements MailRepo {
     if (row === undefined) {
       throw new Error(`InMemoryMailRepo.setProcessFrom: 未知 accountId ${id}`);
     }
-    row.processFrom = date;
+    row.processFrom = cloneProcessFrom(date); // 克隆外部 Date（不 retain 调用方可变引用）。
   }
 
   async getCursor(accountId: string): Promise<string | null> {
