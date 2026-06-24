@@ -5,7 +5,7 @@
 
 **来源邮箱标签**:渲染时优先用账号 `label`（中文别名,见 account-registry「账号可选展示别名 label」），未设则用账号 `email`（稳定必有）——二者经 `accountLabel` 投影到 payload。`accountId` 亦投影,仅作穿透链漏填时的**末位兜底**（裸 id、**绝不**渲染空来源）。**不**用 accountId-strip 作主回落（自定义 account-id 未必含邮箱、prefix-only id strip 后为空）。多账号下通知必须可辨来源。
 
-**渲染净化（单点防御,choke point）**:来源标签(无论来自 `label` / `email` / 裸 accountId)在**渲染边界**必须净化——剥除 `\p{Cc}` / `\p{Cf}` / U+2028 / U+2029 / U+2066–U+2069。`label` 已在 add 处按 denylist 校验、`accountId` 已严格 ASCII,但账号 `email` 是 IMAP 运维自由文本(`--email` 在 add 处**未**按此 denylist 校验、原样存),若直接渲染会经 email 重开 RTL-override 等来源伪装面;故须在渲染单点统一净化(覆盖 email、label、裸 id 及未来任何来源字段)。
+**渲染净化（单点防御,choke point）**:**每个攻击者可影响的渲染自由文本字段**(主题 / 原因 / 发件人 / 风险标记 / 来源标签候选)在**渲染边界**必须净化——剥除 `\p{Cc}`(含 `\r`/`\n`) / `\p{Cf}` / U+2028 / U+2029 / U+2066–U+2069。**理由**:仅净化来源标签不够——subject 等含换行会在多行消息里**伪造结构行**(如假「邮箱：」行)、绕过来源可辨保证;且账号 `email`(IMAP `--email` 未按 denylist 校验、原样存)会经其重开 RTL-override 伪装面。来源标签按 **sanitize-then-fallback**:`label`/`email` 候选经净化,净化后为空才回落**裸 `accountId`**——后者是 **clean-by-invariant**(PK 已严格 ASCII、不含任何被净化字符),作末位非空兜底、**非**主动再净化(若未来放松 PK 字符集须把 accountId 也纳入主动净化)。
 
 **中文分类**:category 英文枚举经**单点映射**渲染为**中文** hashtag（映射覆盖全部 category 枚举臂；新增枚举臂无映射必须构建期失败），如 `#系统告警`/`#交易`/`#安全`/`#营销`；**禁止**直接渲染英文枚举名。
 

@@ -30,27 +30,32 @@ const TELEGRAM_TIMEOUT_MS = 10_000;
  *
  * 邮箱来源标签 **sanitize-then-fallback**（决策 1）：先净化 label 候选、净化后为空才回落
  * 裸 accountId（ASCII、净化 no-op、必非空）→ **绝不渲染空**「邮箱:」。绝不写成
- * `sanitizeSource(accountLabel || accountId)`——全危险字符候选 pre-sanitize 非空被 `||`
+ * `sanitizeField(accountLabel || accountId)`——全危险字符候选 pre-sanitize 非空被 `||`
  * 选中、再净化成空 → 空来源。
  *
  * 只引用 payload 的白名单字段——textBody/htmlBody 不在 payload 中，从结构上杜绝正文泄露。
  */
 export function renderTelegramText(payload: NotificationPayload): string {
-  const sender = formatSender(payload.fromName, payload.fromEmail);
+  // **所有攻击者可影响的自由文本字段**（主题 / 原因 / 发件人 / 风险标记 / 来源标签）在渲染前一律净化:
+  // 仅净化 mailboxLabel 不够——subject 等含换行（`\r`/`\n`/U+2028/U+2029）会在多行消息里**伪造结构行**
+  // （如假「邮箱：…」行），绕过来源可辨保证（CodeRabbit review）。sanitizeField 同时剥控制/格式/bidi。
+  const subject = sanitizeField(payload.subject);
+  const reason = sanitizeField(payload.reason);
+  const sender = sanitizeField(formatSender(payload.fromName, payload.fromEmail));
   // sanitize-then-fallback：先净化 label 候选，净化后为空才回落裸 accountId（绝不空）。
-  const fromLabel = sanitizeSource(payload.accountLabel ?? '').trim();
+  const fromLabel = sanitizeField(payload.accountLabel ?? '').trim();
   const mailboxLabel = fromLabel || payload.accountId;
   const lines = [
-    `[${payload.priority} 邮件] ${payload.subject}`,
+    `[${payload.priority} 邮件] ${subject}`,
     `邮箱：${mailboxLabel}`,
     `发件人：${sender}`,
-    `原因：${payload.reason}`,
+    `原因：${reason}`,
     `分类：#${CATEGORY_LABELS[payload.category]}`,
     `置信度：${formatConfidence(payload.confidence)}`,
   ];
-  // riskFlags 非空才加风险行（空则不渲染）。
+  // riskFlags 非空才加风险行（空则不渲染）；join 后净化（防风险标记里的换行伪造行）。
   if (payload.riskFlags.length > 0) {
-    lines.push(`风险：${payload.riskFlags.join('、')}`);
+    lines.push(`风险：${sanitizeField(payload.riskFlags.join('、'))}`);
   }
   // 仅 P4 附安全核验提示。
   if (payload.priority === 'P4') {
@@ -66,7 +71,7 @@ export function renderTelegramText(payload: NotificationPayload): string {
  * 账号 `email` 是 IMAP `--email` 未按 denylist 校验的自由文本，统一在此净化、防经 email
  * 重开 RTL-override 等来源伪装面；`label` 已 add 校验、`accountId` 已 ASCII，对其为 no-op。
  */
-function sanitizeSource(s: string): string {
+function sanitizeField(s: string): string {
   return s.replace(/[\p{Cc}\p{Cf}\u2028\u2029\u2066-\u2069]/gu, '');
 }
 

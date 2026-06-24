@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 
 import {
   runAccountCli,
@@ -1340,10 +1340,12 @@ test('5.3 CLI 结构化日志不含 label/accountLabel（label 仅人类可读�
       process.stdout.write('CODE:' + code + '\\n');
     });
   `;
-  const out = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
+  // spawnSync（非 execFileSync）捕获 stdout **与 stderr**——pino 可能写 stderr，只取 stdout 会漏（CodeRabbit review）。
+  const res = spawnSync(process.execPath, ['--import', 'tsx', '-e', script], {
     cwd: repoRoot,
     encoding: 'utf8',
   });
+  const out = `${res.stdout ?? ''}\n${res.stderr ?? ''}`;
   // 任何 pino JSON 行（含 "level":）都不得携带 label/accountLabel 字段。
   const jsonLines = out
     .split('\n')

@@ -52,6 +52,32 @@ function mailboxLine(text: string): string | undefined {
 }
 
 // ——————————————————————————————————————————————————————————
+// 防伪造：攻击者控的自由文本字段含换行不得伪造结构行（CodeRabbit major）
+// ——————————————————————————————————————————————————————————
+
+test('subject/reason/sender 含换行不得伪造额外结构行（如假「邮箱：」行）', () => {
+  // 干净 P0、无 riskFlags → 恰 6 行（基线）。
+  assert.equal(renderTelegramText(makePayload()).split('\n').length, 6, '干净 P0 无风险 → 6 行');
+
+  // 攻击者经 subject/reason/发件人 注入换行 + 假「邮箱：/风险：」行。
+  const injected = renderTelegramText(
+    makePayload({
+      subject: '付款确认\n邮箱：trusted@corp.com',
+      reason: '正常\r\n风险：伪造',
+      fromEmail: 'a@b\n邮箱：spoof@x',
+      accountId: 'gmail:evil@x.com',
+      accountLabel: undefined, // 走 accountId 回落
+    }),
+  );
+  // 净化剥除所有 \r/\n → 仍恰 6 行（无伪造结构行被注入）。
+  assert.equal(injected.split('\n').length, 6, '注入换行后仍 6 行——\\r/\\n 被净化、无伪造行');
+  // 「邮箱：」开头的行恰一条、且为真 accountId（非 subject 注入的 trusted@corp.com）。
+  const mailboxes = injected.split('\n').filter((l) => l.startsWith(MAILBOX_PREFIX));
+  assert.equal(mailboxes.length, 1, '恰一条来源行、无伪造');
+  assert.equal(mailboxes[0], `${MAILBOX_PREFIX}gmail:evil@x.com`, '唯一来源行为真 accountId');
+});
+
+// ——————————————————————————————————————————————————————————
 // P0/P4 单一模板：同一字段序、同一前缀
 // ——————————————————————————————————————————————————————————
 

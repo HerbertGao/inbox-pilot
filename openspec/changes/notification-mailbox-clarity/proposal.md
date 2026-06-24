@@ -5,7 +5,7 @@
 ## 变更内容
 
 - **通知指明邮箱**:渲染来源邮箱标签 = 账号 `label`（中文别名）优先、否则账号 `email`（稳定必有）——经 `accountLabel` 投影进 `NotificationPayload`;`accountId` 亦投影、仅作末位兜底(绝不空)。**不**用 accountId-strip 作主回落(自定义 account-id 未必含邮箱)。
-- **可选中文别名**:**新增**可空列 `MailAccount.label`(允许中文/Unicode);`account add … --label <名>` 设置;通知**优先渲染 label**,未设回落账号 `email`(末位兜底裸 accountId、**绝不空**;**非** accountId-strip 派生)。**account-id 主键仍严格 ASCII 不放松**——`label` 是区别于 PK 的另一列,校验**拒控制字符/换行 + 限长**(防注入通知行/日志行),但允许 Unicode 字形。
+- **可选中文别名**:**新增**可空列 `MailAccount.label`(允许中文/Unicode);`account add … --label <名>` 设置;通知**优先渲染 label**,未设回落账号 `email`(末位兜底裸 accountId、**绝不空**;**非** accountId-strip 派生)。**account-id 主键仍严格 ASCII 不放松**——`label` 是区别于 PK 的另一列,校验**拒控制/格式/bidi/行分隔 + trim 判空 + ≤64 码元**(防注入通知行/日志行),但允许 Unicode 字形。
 - **分类中文标签**:category 9 枚举 → 中文映射(单点维护的新映射表),渲染为 `#系统告警`/`#交易`/`#安全`/`#营销` 等 hashtag。
 - **P0/P4 统一模板**:合并成一套,`riskFlags` **非空才显示**、P4 安全提示按 `priority==='P4'` 条件附加;消除两分支字段不一致（**行为变更**:P0 此前不显示风险行,合并后 `riskFlags` 非空时会显示）。
 - **不泄露正文**:仍只渲染白名单结构字段(`textBody`/`htmlBody` 类型层排除不变);`label`/邮箱标签/分类均为结构字段。
@@ -13,7 +13,7 @@
 ## 功能 (Capabilities)
 
 ### 新增功能
-- `account-registry`: 「账号可选展示别名 `label`」——per-account 可空 Unicode 显示名,严格区别于严格-ASCII 的主键 `id`;校验拒控制字符/换行 + 限长。
+- `account-registry`: 「账号可选展示别名 `label`」——per-account 可空 Unicode 显示名,严格区别于严格-ASCII 的主键 `id`;校验拒控制/格式/bidi/行分隔 + trim 判空 + ≤64 码元。
 
 ### 修改功能
 - `notifications`: 「通知不泄露完整正文」需求扩展——通知必须含**来源邮箱标签**(label 优先、否则账号 `email`,**不**用 accountId-strip 派生;末位兜底裸 accountId、绝不空)与**中文分类**;来源标签在渲染边界净化(剥控制/格式/bidi/行分隔);P0/P4 合并为单一模板(`riskFlags` 非空才显示、P4 安全提示条件附加);白名单与不泄露正文不变。
