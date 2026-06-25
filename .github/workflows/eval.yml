@@ -10,6 +10,8 @@ on:
       - 'src/classifier/classifyEmail.ts'
       - 'src/classifier/schema.ts'
       - 'src/classifier/eval/**'
+      - '.github/workflows/eval.yml' # gate 自身的改动也触发，防悄悄改弱
+      - 'package.json' # eval 脚本改动也触发
   schedule:
     - cron: '17 22 * * *' # 误报噪音线：每日一次（UTC，约北京 06:17）
   workflow_dispatch: {}
@@ -24,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # eval 步骤不需 git 凭据，关闭 token 持久化
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -44,6 +48,8 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false # eval 步骤不需 git 凭据，关闭 token 持久化
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -59,7 +65,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          existing=$(gh issue list --label eval-regression --state open --json number --jq '.[0].number' || echo '')
+          # 先确保 label 存在——否则 `gh issue create --label` 在标签缺失时报错、issue 开不出来（此前无 issue 的根因）。
+          gh label create eval-regression --color FBCA04 --description "eval 误报回归" 2>/dev/null || true
+          existing=$(gh issue list --label eval-regression --state open --json number --jq '.[0].number' 2>/dev/null || true)
           body="误报集（噪音线）通过率低于阈值——过度评级可能回潮。见运行：${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --body "$body"
