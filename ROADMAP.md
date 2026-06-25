@@ -117,6 +117,7 @@ P0–P2 占 **93%**（仅 5.6% 进 P3 静默）；旧邮件为**真·未读**（
 - 不泄露正文（均为已白名单结构字段，`textBody`/`htmlBody` 仍结构性排除）。
 - 锚点：`notifier.ts:26-35,73-84`、`telegram.ts:29-49`、`prisma/schema.prisma`（新 `label` 列）、`cli/account.ts`（`--label` + label 校验）。
 - 范围注：因加了 `label` 列 + account-add 流程，比纯渲染略大（仍低风险：增列 + 可选 flag）。
+- **待办 · `account set-label <id> <名>` 子命令**：`--label` 现为 create-only（决策 5/7 镜像 `processFrom`），既有账号**无受支持的改别名入口**。补一个 `set-label` verb（照 `set-process-from` 模板：两位置参数 + `JSON.stringify` 转义回显 + 复用 `validateLabel` 的 denylist/≤64 码元校验）+ repo `setLabel`（镜像 `setProcessFrom`），重启后生效。锚点：`cli/account.ts`（新 case + cmd）、`repo/mailRepo.ts`+`inMemoryMailRepo.ts`、`specs/account-cli/spec.md`。临记：2026-06-25 已临时经直接 DB `UPDATE mail_accounts SET label` 给 3 个既有账号设别名（163 / hbtgao / heapcn）作权宜，正式 CLI 入口待此子命令。
 
 ### 提案 3 · rating-calibration（③A prompt + ③B-手动 B1）
 
