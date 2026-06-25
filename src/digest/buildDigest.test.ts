@@ -13,19 +13,28 @@ import {
   buildDigest,
   renderItemLine,
   renderP3CountLine,
+  renderNoiseTopN,
   truncateUtf16,
   SEGMENT_MAX,
   FIELD_CAP,
+  NOISE_TOPN,
 } from './buildDigest.js';
-import type { DigestCandidate, MailRepo } from '../repo/mailRepo.js';
+import type { DigestCandidate, MailRepo, SenderCount } from '../repo/mailRepo.js';
 import { DIGEST_TYPE_DAILY } from '../repo/mailRepo.js';
 
-// 注入假 repo：仅实现 buildDigest 用到的 listDigestCandidates（返回 crafted 候选）。
-function fakeRepo(candidates: DigestCandidate[]): Pick<MailRepo, 'listDigestCandidates'> {
+// 注入假 repo：实现 buildDigest 用到的 listDigestCandidates + countRecentSenders（返回 crafted 数据）。
+// recentSenders 缺省 [] → Top-N 区块省略（既有断言不受影响）。
+function fakeRepo(
+  candidates: DigestCandidate[],
+  recentSenders: SenderCount[] = [],
+): Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders'> {
   return {
     async listDigestCandidates(digestType: string): Promise<DigestCandidate[]> {
       assert.equal(digestType, DIGEST_TYPE_DAILY); // 钉死按 daily 命名空间查
       return candidates;
+    },
+    async countRecentSenders(): Promise<SenderCount[]> {
+      return recentSenders;
     },
   };
 }
@@ -349,5 +358,103 @@ test('安全（4.4）：所有 segment.text 不含 bodyText —— 候选无该�
         lineText.startsWith('P3 广告营销：');
       assert.ok(ok, `意外行内容（可能泄露非候选文本）：${lineText.slice(0, 60)}`);
     }
+  }
+});
+
+// ─────────────── noise-discovery 决策 5：Top-N 只读区块（task 3.4） ───────────────
+
+test('Top-N 随非空摘要附带：列出高频发件人 + count + 「noise_senders」提示', async () => {
+  const repo = fakeRepo(
+    [makeCandidate({ messageRowId: 'p1', priority: 'P1' })],
+    [
+      { fromEmail: 'nas@home.local', count: 9 },
+      { fromEmail: 'hkss@club.org', count: 4 },
+    ],
+  );
+  const result = await buildDigest(repo, NOW);
+  assert.notEqual(result, null);
+  const text = result!.segments.map((s) => s.text).join('\n');
+  assert.ok(text.includes('nas@home.local'), '应列高频发件人');
+  assert.ok(text.includes('9'), '应列计数');
+  assert.ok(text.includes('hkss@club.org'));
+  assert.ok(text.includes('noise_senders'), '应提示可加入 noise_senders 降噪');
+});
+
+test('Top-N 区块的 segment 不携带 messageRowIds（只读频率快照、不被 markDigested）', async () => {
+  const repo = fakeRepo(
+    [makeCandidate({ messageRowId: 'p1', priority: 'P1' })],
+    [{ fromEmail: 'a@x.com', count: 3 }],
+  );
+  const result = await buildDigest(repo, NOW);
+  // 找到含 Top-N 头的段，断言其 row-ids 为空（绝不让频率快照的发件人行被标记已摘要）。
+  const noiseSeg = result!.segments.find((s) => s.text.includes('noise_senders'));
+  assert.ok(noiseSeg, '应有 Top-N 段');
+  assert.deepEqual(noiseSeg!.messageRowIds, [], 'Top-N 段不携带任何 messageRowId');
+  // 全部被 mark 的 row-ids 仍只含真实候选（p1），不含 Top-N 发件人。
+  const allIds = result!.segments.flatMap((s) => s.messageRowIds);
+  assert.deepEqual(allIds, ['p1']);
+});
+
+test('退化：recentSenders 为空 → 省略 Top-N 区块（不产空段、不报错）', async () => {
+  const repo = fakeRepo([makeCandidate({ messageRowId: 'p1', priority: 'P1' })], []);
+  const result = await buildDigest(repo, NOW);
+  assert.notEqual(result, null);
+  const text = result!.segments.map((s) => s.text).join('\n');
+  assert.ok(!text.includes('noise_senders'), '无数据时应省略 Top-N 区块');
+  // 不产空段：每段都有内容。
+  for (const seg of result!.segments) {
+    assert.ok(seg.text.length > 0);
+  }
+});
+
+test('退化：发件人不足 N → 仅列出已有的若干', async () => {
+  const repo = fakeRepo(
+    [makeCandidate({ messageRowId: 'p1', priority: 'P1' })],
+    [{ fromEmail: 'only@x.com', count: 2 }],
+  );
+  const block = renderNoiseTopN([{ fromEmail: 'only@x.com', count: 2 }]);
+  assert.ok(block !== null);
+  // 头行 + 1 条 = 2 行（少于 N 不补空行）。
+  assert.equal(block!.split('\n').length, 2);
+  const result = await buildDigest(repo, NOW);
+  assert.ok(result!.segments.some((s) => s.text.includes('only@x.com')));
+});
+
+test('renderNoiseTopN: 取计数降序前 N、空输入 → null', () => {
+  assert.equal(renderNoiseTopN([]), null);
+  const many: SenderCount[] = [];
+  for (let i = 0; i < NOISE_TOPN + 3; i++) {
+    many.push({ fromEmail: `s${i}@x.com`, count: NOISE_TOPN + 3 - i });
+  }
+  const block = renderNoiseTopN(many)!;
+  // 头行 + 至多 NOISE_TOPN 条。
+  assert.equal(block.split('\n').length, NOISE_TOPN + 1);
+  // 第 NOISE_TOPN+1 个发件人（被截掉）不应出现。
+  assert.ok(!block.includes(`s${NOISE_TOPN}@x.com`));
+});
+
+test('无常规摘要内容（无 P1/P2/P3）→ 即便有高频源也不为 Top-N 单独推送（返回 null）', async () => {
+  // countRecentSenders 返回高频源，但无任何 P1/P2/P3 候选 → 既有空摘要抑制生效、返回 null。
+  const repo = fakeRepo([], [{ fromEmail: 'spammy@x.com', count: 50 }]);
+  const result = await buildDigest(repo, NOW);
+  assert.equal(result, null, '无常规内容时不得仅为 Top-N 单独推送（既有空摘要抑制不变）');
+});
+
+test('安全：Top-N 区块只渲染 fromEmail+count，不引入正文（SenderCount 无 bodyText 字段）', async () => {
+  const SECRET = '【绝不应出现的正文】';
+  const repo = fakeRepo(
+    [makeCandidate({ messageRowId: 'p1', priority: 'P1' })],
+    // SenderCount 类型本身只有 fromEmail+count，无法注入正文；这里钉死渲染只来自这两字段。
+    [{ fromEmail: 'src@x.com', count: 7 }],
+  );
+  const result = await buildDigest(repo, NOW);
+  const text = result!.segments.map((s) => s.text).join('\n');
+  assert.ok(!text.includes(SECRET));
+  // Top-N 行结构 = 头行 / `地址 - N 封`，逐行核验无意外文本来源。
+  const noiseSeg = result!.segments.find((s) => s.text.includes('noise_senders'))!;
+  const ls = noiseSeg.text.split('\n');
+  assert.ok(ls[0]!.includes('noise_senders'), '首行是 Top-N 头');
+  for (let i = 1; i < ls.length; i++) {
+    assert.match(ls[i]!, /^.+ - \d+ 封$/u, `Top-N 行结构应为「地址 - N 封」：${ls[i]}`);
   }
 });

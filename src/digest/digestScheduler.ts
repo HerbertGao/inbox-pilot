@@ -108,8 +108,8 @@ function parseHourMinute(token: string): { hour: number; minute: number } | unde
 
 /** 一轮编排的最小依赖切片（注入式，使一轮编排可离线测试，不依赖真实 cron timing）。 */
 export type DigestRunDeps = {
-  /** 查候选 + 落库 seam（buildDigest 只读 listDigestCandidates；编排再 markDigested）。 */
-  readonly repo: Pick<MailRepo, 'listDigestCandidates' | 'markDigested'>;
+  /** 查候选 + 落库 + Top-N 频率快照 seam（buildDigest 读 listDigestCandidates+countRecentSenders；编排再 markDigested）。 */
+  readonly repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders' | 'markDigested'>;
   /** 摘要出口（逐段 notifyDigest）。 */
   readonly notifier: Pick<Notifier, 'notifyDigest'>;
   /** 调用时刻（注入 `() => Date` 时钟，使编排可测）。默认 `new Date()`。 */
@@ -201,8 +201,8 @@ export type DigestSchedulerOptions = {
   readonly timesString: string | undefined;
   /** cron 时区（容器 TZ 兜底；显式传使代码层可见可测）。 */
   readonly timezone: string;
-  /** 查候选 + 落库 seam。 */
-  readonly repo: Pick<MailRepo, 'listDigestCandidates' | 'markDigested'>;
+  /** 查候选 + 落库 + Top-N 频率快照 seam。 */
+  readonly repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders' | 'markDigested'>;
   /** 摘要出口。 */
   readonly notifier: Pick<Notifier, 'notifyDigest'>;
   /** 注入时钟（可测）。默认 `() => new Date()`。 */

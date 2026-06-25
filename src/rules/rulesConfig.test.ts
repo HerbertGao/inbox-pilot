@@ -111,6 +111,8 @@ test('合法 YAML → securityKeywords = 内置整集 ∪ YAML 新词，其余�
       '  - 促销',
       'never_mark_read_domains:',
       '  - bank.example',
+      'noise_senders:',
+      '  - nas@home.lan',
     ].join('\n'),
   );
   reloadRulesConfigForTest(yamlPath);
@@ -127,6 +129,7 @@ test('合法 YAML → securityKeywords = 内置整集 ∪ YAML 新词，其余�
   assert.deepEqual(active.importantDomains, ['example.com']);
   assert.deepEqual(active.marketingKeywords, ['促销']);
   assert.deepEqual(active.neverMarkReadDomains, ['bank.example']);
+  assert.deepEqual(active.noiseSenders, ['nas@home.lan']);
 });
 
 test('security_keywords:[] → 内置整集仍生效；经 applySafetyRules 对「医院预约」断言不标已读', () => {
@@ -188,6 +191,44 @@ test('某项非法（vip 标量）但 security 合法 → 仅 vip 回落、secur
   assert.deepEqual(active.vipSenders, []);
 });
 
+test('加载并归一 noise_senders：大小写/空白/空项 → trim+lower+丢空（发件人 + 域）', () => {
+  writeYaml('noise_senders:\n  - "NAS@home.LAN"\n  - "  "\n  - "hkss.example.com"\n');
+  reloadRulesConfigForTest(yamlPath);
+  const active = getActiveRules();
+  assert.deepEqual(active.noiseSenders, ['nas@home.lan', 'hkss.example.com']);
+  assert.ok(!active.noiseSenders.includes(''), '空白项归一后应被丢弃');
+});
+
+test('noise_senders 配成标量（非数组）→ 仅 noise 回落、其余五类生效、不崩', () => {
+  writeYaml(
+    [
+      'security_keywords:', '  - 对账单',
+      'vip_senders:', '  - vip@example.com',
+      'noise_senders: 不是数组',
+    ].join('\n'),
+  );
+  reloadRulesConfigForTest(yamlPath);
+  const active = getActiveRules();
+  // noise 回落（首次=空）。
+  assert.deepEqual(active.noiseSenders, []);
+  // 其余项不被 noise 非法连累。
+  assert.ok(active.securityKeywords.includes('对账单'));
+  assert.deepEqual(active.vipSenders, ['vip@example.com']);
+  for (const kw of SECURITY_PAYMENT_KEYWORDS) {
+    assert.ok(active.securityKeywords.includes(kw), `noise 非法不得连累内置整集：${kw}`);
+  }
+});
+
+test('noise_senders 坏重载 carry-forward 上一次有效值，不连累其余五类', () => {
+  writeYaml('noise_senders:\n  - nas@home.lan\n');
+  reloadRulesConfigForTest(yamlPath);
+  assert.deepEqual(getActiveRules().noiseSenders, ['nas@home.lan']);
+  // 改坏（解析失败）→ 全 carry-forward。
+  writeYaml('noise_senders: [unterminated\n');
+  reloadRulesConfigForTest(yamlPath);
+  assert.deepEqual(getActiveRules().noiseSenders, ['nas@home.lan'], 'operator noise 项在坏重载中存活');
+});
+
 test('解析失败（坏 YAML）→ 敏感邮件仍不标已读（内置整集 + 类别轴守住）', () => {
   // 先放一个合法文件建立基线，再放坏文件触发解析失败 → 全 carry-forward。
   writeYaml('vip_senders:\n  - vip@example.com\n');
@@ -221,6 +262,8 @@ test('凭据形态键/verification/sensitive_categories → 静默丢弃、不�
       '  - 不该被读',
       'security_keywords:',
       '  - 对账单',
+      'noise_senders:',
+      '  - nas@home.lan',
     ].join('\n'),
   );
 
@@ -228,8 +271,9 @@ test('凭据形态键/verification/sensitive_categories → 静默丢弃、不�
   const logs = captureLogs(() => reloadRulesConfigForTest(yamlPath));
 
   const active = getActiveRules();
-  // 已知键正常消费。
+  // 已知键正常消费（含新增第六类 noise_senders，证加 KNOWN_KEYS 后凭据丢弃契约不破）。
   assert.ok(active.securityKeywords.includes('对账单'));
+  assert.deepEqual(active.noiseSenders, ['nas@home.lan']);
   // 未知键/verification/sensitive_categories 绝不出现在快照（schema 不含、被丢弃）。
   const serialized = JSON.stringify(active);
   assert.ok(!serialized.includes('不该被读'), 'verification/sensitive_categories 内容不得进入快照');

@@ -1,7 +1,7 @@
 // rules-config 加载器（design 决策 2/3/4、spec rules-config）。
 //
 // 职责：读 rules/rules.yaml（路径可经 env RULES_FILE 覆盖）→ yaml 解析 → zod 校验为
-// 五类可配置名单 → 整集并集（security）/逐项回落 → 同步访问器 getActiveRules() 暴露快照 ref。
+// 六类可配置名单 → 整集并集（security）/逐项回落 → 同步访问器 getActiveRules() 暴露快照 ref。
 // 热重载（mtime 轮询）在后台两阶段原子发布。
 //
 // 不可违反的约束（逐条对应 spec）：
@@ -31,7 +31,7 @@ import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 type WarnSink = { warn: (obj: Record<string, unknown>, msg: string) => void };
 let logSink: WarnSink = { warn: (obj, msg) => logger.warn(obj, msg) };
 
-/** 五类可配置名单的有效快照（getActiveRules 返回此形状的 ref；属性 + 数组皆 readonly 并 Object.freeze，
+/** 六类可配置名单的有效快照（getActiveRules 返回此形状的 ref；属性 + 数组皆 readonly 并 Object.freeze，
  *  防消费者经重赋值/强转改动这个全局安全策略快照——见 assembleActive 的冻结）。 */
 export type ActiveRules = {
   /** 有效集 = 整个内置 SECURITY_PAYMENT_KEYWORDS ∪ YAML（只增不减）。 */
@@ -41,6 +41,8 @@ export type ActiveRules = {
   readonly vipSenders: readonly string[];
   readonly importantDomains: readonly string[];
   readonly marketingKeywords: readonly string[];
+  /** operator 手配的过度高评降噪发件人/域；内置默认空 = 全 no-op、行为与现状一致。 */
+  readonly noiseSenders: readonly string[];
 };
 
 // rules.yaml 默认路径（仓库根 rules/rules.yaml），可经 env RULES_FILE 覆盖。
@@ -59,16 +61,17 @@ function resolveRulesPath(): string {
 // 关键：**不**做整对象 safeParse——否则某项非法会使整对象校验失败、连累合法项一起回落，
 // 违背「仅该项回落」语义。改为：顶层只确认是 object（按名只读五类已知键、未知键不读 = 丢弃），
 // 每个已知键各自独立 z.array(z.string()).safeParse（见 validateField）。
-// 「不含 verification/sensitive_categories」由「只按这五个键名读取」天然落地——其余键名永不被读。
+// 「不含 verification/sensitive_categories」由「只按这六个键名读取」天然落地——其余键名永不被读。
 const stringArray = z.array(z.string());
 
-// 五类可配置名单的键名（只读这些键；未知键含凭据形态键一律不读 = 静默丢弃）。
+// 六类可配置名单的键名（只读这些键；未知键含凭据形态键一律不读 = 静默丢弃）。
 const KNOWN_KEYS = [
   'vip_senders',
   'important_domains',
   'marketing_keywords',
   'security_keywords',
   'never_mark_read_domains',
+  'noise_senders',
 ] as const;
 
 /**
@@ -90,6 +93,7 @@ type LastValid = {
   vipSenders: readonly string[];
   importantDomains: readonly string[];
   marketingKeywords: readonly string[];
+  noiseSenders: readonly string[];
 };
 
 function builtinLastValid(): LastValid {
@@ -99,6 +103,7 @@ function builtinLastValid(): LastValid {
     vipSenders: [],
     importantDomains: [],
     marketingKeywords: [],
+    noiseSenders: [],
   };
 }
 
@@ -112,6 +117,7 @@ function assembleActive(last: LastValid): ActiveRules {
     vipSenders: Object.freeze([...last.vipSenders]),
     importantDomains: Object.freeze([...last.importantDomains]),
     marketingKeywords: Object.freeze([...last.marketingKeywords]),
+    noiseSenders: Object.freeze([...last.noiseSenders]),
   });
 }
 
@@ -196,7 +202,7 @@ function loadFile(path: string): LoadOutcome {
     return { ok: false, kind: 'shape-error' };
   }
 
-  // 非 strict：**只按名读取**五类已知键、未知键（含凭据形态键）绝不读取 = 静默丢弃。
+  // 非 strict：**只按名读取**六类已知键、未知键（含凭据形态键）绝不读取 = 静默丢弃。
   // 逐项独立校验在 resolveField 内（某项非法仅该项回落）。
   const src = doc as Record<string, unknown>;
   const obj: Record<string, unknown> = {};
@@ -237,6 +243,7 @@ function buildAndPublish(path: string): void {
     vipSenders: resolveField('vip_senders', obj.vip_senders, prev.vipSenders),
     importantDomains: resolveField('important_domains', obj.important_domains, prev.importantDomains),
     marketingKeywords: resolveField('marketing_keywords', obj.marketing_keywords, prev.marketingKeywords),
+    noiseSenders: resolveField('noise_senders', obj.noise_senders, prev.noiseSenders),
   };
 
   publish(candidate);

@@ -9,8 +9,8 @@
 //   有界渲染器对发件人/主题/原因各截到 FIELD_CAP、整行最终无条件再截到 < SEGMENT_MAX；
 //   按整条行分段、P3 计数行并入末段；P3 计数行**不**写「已标记已读」字样。
 
-import type { DigestCandidate, MailRepo } from '../repo/mailRepo.js';
-import { DIGEST_TYPE_DAILY } from '../repo/mailRepo.js';
+import type { DigestCandidate, MailRepo, SenderCount } from '../repo/mailRepo.js';
+import { DIGEST_TYPE_DAILY, NOISE_TOPN_WINDOW_DAYS } from '../repo/mailRepo.js';
 
 /** 段预算：Telegram sendMessage 上限 4096 UTF-16 单位，留余量（决策 5）。`text.length <= SEGMENT_MAX`。 */
 export const SEGMENT_MAX = 4000;
@@ -91,6 +91,30 @@ export function renderP3CountLine(count: number): string {
   return `P3 广告营销：${count} 封`;
 }
 
+/** 「最近高频发件人 TOP-N」展示条数（noise-discovery 决策 5）。 */
+export const NOISE_TOPN = 5;
+
+/** Top-N 区块头行（noise-discovery 决策 5）。 */
+const NOISE_HEADER = `最近高频发件人 TOP${NOISE_TOPN}（可加入 noise_senders 降噪）`;
+
+/**
+ * 渲染只读「最近高频发件人 TOP-N」区块（noise-discovery 决策 5）：取计数降序前 N，每行 `地址 - N 封`。
+ * **纯只读**（零入站面、不触发动作、不泄正文——SenderCount 仅含 fromEmail+count）。数据不足 → 列出已有的若干；
+ * 无任何发件人 → 返回 `null`（调用方省略该区块，优雅退化、不产空行）。
+ * 发件人地址做字段级有界截断 + 去内联换行（防注入/超限），同 renderItemLine 纪律。
+ */
+export function renderNoiseTopN(senders: readonly SenderCount[]): string | null {
+  if (senders.length === 0) {
+    return null;
+  }
+  const lines = senders.slice(0, NOISE_TOPN).map((s) => {
+    const addr = truncateUtf16(stripInlineBreaks(s.fromEmail), FIELD_CAP) || UNKNOWN_SENDER;
+    return `${addr} - ${s.count} 封`;
+  });
+  // 整块兜底截到 < SEGMENT_MAX（N 小、单地址已截 FIELD_CAP，正常远不触发；防御性保每段有界）。
+  return truncateUtf16([NOISE_HEADER, ...lines].join('\n'), SEGMENT_MAX - 1);
+}
+
 type Segment = { text: string; messageRowIds: string[] };
 
 /**
@@ -119,23 +143,29 @@ function packLines(
   return segments;
 }
 
+/** Top-N 频率快照的滚动窗起点：now - NOISE_TOPN_WINDOW_DAYS（noise-discovery 决策 5；独立于 processFrom）。 */
+function noiseWindowSince(now: Date): Date {
+  return new Date(now.getTime() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+}
+
 /**
- * 组装每日摘要（纯函数，决策 2/4/5）。
- * @param repo 最小 repo 切片（仅 listDigestCandidates）——测试可注入假 repo。
- * @param now 调用时刻（透传给 listDigestCandidates 的去重命名空间不需要它；保留以与编排层签名/纯函数测试一致）。
+ * 组装每日摘要（纯函数，决策 2/4/5 + noise-discovery 决策 5）。
+ * @param repo 最小 repo 切片（listDigestCandidates + countRecentSenders）——测试可注入假 repo。
+ * @param now 调用时刻；noise Top-N 的滚动窗 since = now - NOISE_TOPN_WINDOW_DAYS（其余沿用既有语义）。
  * @returns `{ segments }`（每段 text.length ≤ SEGMENT_MAX、携带该段 messageRowIds）；
- *   无 P1/P2 且 P3 计数为 0 → `null`。
+ *   无 P1/P2 且 P3 计数为 0 → `null`（此时**不**附 Top-N、不单独推送——既有空摘要抑制不变）。
  */
 export async function buildDigest(
-  repo: Pick<MailRepo, 'listDigestCandidates'>,
-  _now: Date,
+  repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders'>,
+  now: Date,
 ): Promise<{ segments: Segment[] } | null> {
   const candidates = await repo.listDigestCandidates(DIGEST_TYPE_DAILY);
 
   const items = candidates.filter((c) => c.priority === 'P1' || c.priority === 'P2');
   const p3 = candidates.filter((c) => c.priority === 'P3');
 
-  // null 条件：无 P1/P2 条目 **且** P3 计数为 0（决策 2）。
+  // null 条件：无 P1/P2 条目 **且** P3 计数为 0（决策 2）。Top-N **只随非空摘要附带**——此处早返回
+  // 即保证「无常规内容时不为 Top-N 单独推送」（noise-discovery 决策 5、不改既有空摘要抑制）。
   if (items.length === 0 && p3.length === 0) {
     return null;
   }
@@ -163,6 +193,15 @@ export async function buildDigest(
         messageRowIds: p3.map((c) => c.messageRowId),
       });
     }
+  }
+
+  // 只读 Top-N 区块（noise-discovery 决策 5）：仅随非空摘要附带（已过上面的 null 短路）。独占一段、
+  // **messageRowIds 为空**——它是频率快照、不绑 digest_items，绝不让其计数行被 markDigested。
+  // 数据不足/无邮件 → renderNoiseTopN 返回 null → 优雅省略该区块（不产空段、不报错）。
+  const recent = await repo.countRecentSenders(noiseWindowSince(now));
+  const noiseBlock = renderNoiseTopN(recent);
+  if (noiseBlock !== null) {
+    segments.push({ text: noiseBlock, messageRowIds: [] });
   }
 
   return { segments };

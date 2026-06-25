@@ -18,6 +18,7 @@ import {
   rebuildFinalDecision,
   rebuildNormalizedEmail,
   sortDigestCandidates,
+  tallySenderCounts,
   type AccountWriteInput,
   type DigestCandidate,
   type DueRetryAction,
@@ -25,6 +26,7 @@ import {
   type RawAiJson,
   type RebuildResult,
   type RecordActionResult,
+  type SenderCount,
   type StoredAccount,
   type StoredEmail,
 } from './mailRepo.js';
@@ -565,6 +567,23 @@ export class InMemoryMailRepo implements MailRepo {
     return sortDigestCandidates(enriched).map(
       ({ receivedAt: _receivedAt, id: _id, ...candidate }) => candidate,
     );
+  }
+
+  async countRecentSenders(since: Date): Promise<SenderCount[]> {
+    // 与 prisma 同谓词（noise-discovery 决策 5）：processedAt != null 且 receivedAt ≥ since 窗内**全部**已处理
+    // 邮件——含所有优先级（不读分类行）、不查 digestItems 去重。归一 + 计数共用 tallySenderCounts（测试忠实）。
+    // receivedAt = new Date(email.date)（与 prisma MailMessage.receivedAt 同一映射）。
+    const fromEmails: string[] = [];
+    for (const row of this.emailsById.values()) {
+      if (row.processedAt === null) {
+        continue;
+      }
+      if (new Date(row.email.date).getTime() < since.getTime()) {
+        continue;
+      }
+      fromEmails.push(row.email.fromEmail);
+    }
+    return tallySenderCounts(fromEmails);
   }
 
   async markDigested(

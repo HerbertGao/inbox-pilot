@@ -13,7 +13,8 @@
 //   ① 最终优先级（验证码主题 P0 > P4 保持 > confidence<0.65 降 P1 > 取建议）
 //   ② 算四轴敏感守卫 sensitiveGuardFired（类别 ∨ 关键词 ∨ 验证码关键词(主题/正文) ∨ 域名）
 //   ③ marketing 轴：priority==='P2' ∧ ¬sensitiveGuardFired ∧ 命中 → P3（只动 P2）
-//   ④ floor 轴（vip/important）：priority∈{P2,P3} ∧ (vip ∨ important) → P1（显式条件、非 max；marketing 在前）
+//   ③A noise 轴：priority∈{P0,P1,P2} ∧ ¬sensitiveGuardFired ∧ 命中 noise_senders → P3（marketing 后、floor 前）
+//   ④ floor 轴（vip/important）：priority∈{P2,P3} ∧ (vip ∨ important) → P1（显式条件、非 max；marketing/noise 在前）
 //   ⑤ 从终末 priority 派生动作；shouldMarkRead 只算一次（敏感守卫 false 粘住）。
 
 import type { Classification } from '../classifier/schema.js';
@@ -190,6 +191,20 @@ export function applySafetyRules(
   ) {
     priority = 'P3';
     appliedRules.push('marketing→P3');
+  }
+
+  // —— ③A 新增 noise 轴（operator 手配过度高评降噪、¬sensitiveGuardFired 门控、绝不碰 P3/P4/敏感）——
+  // priority∈{P0,P1,P2} ∧ ¬sensitiveGuardFired ∧ (发件人精确∈noise_senders ∨ 发件域∈noise_senders) → P3。
+  // 置于 marketing 后、floor 前：被误列为 noise 的 vip/important 发件人随后由 floor 抬回 P1（vip 胜，安全方向）。
+  // noise→P3 且 ¬guard ⇒ shouldMarkRead 在 ⑤ 自然派生为 true（静默已读）——与「敏感不自动已读」一致（敏感被门控挡在外）。
+  if (
+    (priority === 'P0' || priority === 'P1' || priority === 'P2') &&
+    !sensitiveGuardFired &&
+    (matchesVipSender(email.fromEmail, rules.noiseSenders) ||
+      matchesDomain(email.fromEmail, rules.noiseSenders))
+  ) {
+    priority = 'P3';
+    appliedRules.push('noise→P3');
   }
 
   // —— ④ 新增 floor 轴（vip/important、urgency-floor 显式条件、禁 max() 字面量）——
