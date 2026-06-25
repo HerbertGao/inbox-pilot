@@ -1,7 +1,7 @@
 ## 1. 前置决策（eval 守门机制）
 
 - [x] 1.1 守门机制**已定案**（见 design「守门机制」节）：安全线 PR 阻塞 + paths 过滤、**k=5 多数表决（≥3/5 落 P4）**；噪音线 nightly + **Y=70%**；配 `OPENROUTER_API_KEY` secret（成本 <$0.5/月、`pull_request` + fork 无 key skip 标绿）；语料二象限矩阵（象限B 真脱敏 ≥50%、象限A ≤30% 封顶）
-- [ ] 1.2 **剩余人工动作**（gate 实装）：① ⏳用户把 `OPENROUTER_API_KEY` 加为 GitHub Actions secret；② ⏳人工脱敏的象限B 真钓鱼样例 ≥6 条填入 `corpus.ts`（内容欺骗强/表层弱，不可自动生成）；③ ✅eval 骨架已搭（`src/classifier/eval/` runner+corpus+README、`pnpm eval:*`、`.github/workflows/eval.yml`、无 key skip 标绿）
+- [~] 1.2 **剩余人工动作**（gate 实装）：① ⏳用户把 `OPENROUTER_API_KEY` 加为 GitHub Actions secret；② ⏳人工脱敏的象限B 真钓鱼样例 ≥6 条填入 `corpus.ts`（内容欺骗强/表层弱，不可自动生成）；③ ✅eval 骨架已搭（`src/classifier/eval/` runner+corpus+README、`pnpm eval:*`、`.github/workflows/eval.yml`、无 key skip 标绿）
 
 ## 2. Prompt 收紧
 
