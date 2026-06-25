@@ -120,7 +120,9 @@ P0–P2 占 **93%**（仅 5.6% 进 P3 静默）；旧邮件为**真·未读**（
 
 ### 提案 3 · rating-calibration（③A prompt + ③B-手动 B1）
 
-> **已拆分为两个并列 OpenSpec change**（经架构 + 产品双视角校准）：`rating-calibration-prompt`（③A 治本，先做；eval 守门机制为前置未解问题）+ `noise-discovery`（重塑的 ③B：noise_senders 轴 + 摘要 Top-N 发现 + 可选 CLI mute）。原设想的 **Telegram 交互降级按钮经评估·暂缓**（单用户过度工程；第 2 个用户出现 = 决定性触发点），分阶段触发器与前置拦路石见 `openspec/changes/noise-discovery/design.md`。
+> **已拆分为两个并列 OpenSpec change**（经架构 + 产品双视角校准）：`rating-calibration-prompt`（③A 治本，先做；eval 守门机制为前置未解问题）+ `noise-discovery`（重塑的 ③B：noise_senders 轴 + 摘要 Top-N 发现 + 可选 CLI mute）。原设想的 **Telegram 交互降级按钮经评估·暂缓**（单用户过度工程；第 2 个用户出现 = 决定性触发点），分阶段触发器与前置拦路石见 `openspec/changes/archive/2026-06-25-noise-discovery/design.md`。
+>
+> **✅ 均已实现合并归档（2026-06-25）**：`rating-calibration-prompt`（PR #28；eval 守门两线 CI 绿——真钓鱼/BEC k=5 多数表决 + 误报 70% 阈值；象限B 真语料 = accepted-gap）+ `noise-discovery`（PR #29；review-loop APPROVE-DEGRADED）。spec delta 已折入主 specs。「无声消失」专用披露行延后提案 4。
 - **③A 只改 prompt、不动规则引擎**：把「**任何疑似**钓鱼/异常登录/支付风险 → P4」改为「**P4 需内容层欺骗证据**（诱导按欺骗前提行动），表层信号（TLD `.xyz` / 截断 / 未渲染模板 / return-path 单独，尤其命中自有转发域）**不作数**」；P0 去掉「交易/告警」一刀切（收据 → P2）。
 - **强制双向回归语料**：4 个误报样例（网易登录 / PayPal 收据 / HKSS / 交易收据）+ 一组**真钓鱼**；CI 里真钓鱼掉出 P4 即失败——证明没削弱检测。
 - **③B-B1**：rules.yaml 新增第六轴 `noise_senders`（按发件人 / 域名 / 主题降级到 P2/P3），插在敏感守卫之后、`!sensitiveGuardFired` 门控——能压过度高评的 P0，**绝不**清「不自动已读」硬底线（被降级的 cloudflared 告警若来自敏感发件人仍保持未读）。NAS 每日 + HKSS 每周各一行规则即可。
