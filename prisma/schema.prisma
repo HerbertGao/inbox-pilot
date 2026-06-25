@@ -55,6 +55,10 @@ model MailMessage {
   digestItems     DigestItem[]
 
   @@unique([accountId, providerMessageId])
+  // receivedAt 范围查询索引：countRecentSenders（近窗频率快照）+ listDigestCandidates（receivedAt 排序）都用；
+  // 现 1243 行 seq-scan sub-ms，但 mail_messages append-only、年级增长后选择性恶化——前向健康。
+  // 大表上线如需无锁可手改迁移为 CREATE INDEX CONCURRENTLY（当前量级 plain CREATE INDEX 锁仅 ms）。
+  @@index([receivedAt])
   @@map("mail_messages")
 }
 

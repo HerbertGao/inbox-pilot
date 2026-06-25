@@ -30,6 +30,54 @@ const GMAIL_MODIFY_SCOPE = 'https://www.googleapis.com/auth/gmail.modify';
 export const DIGEST_TYPE_DAILY = 'daily';
 
 /**
+ * 「最近高频发件人 TOP-N」频率快照的滚动窗（天）（noise-discovery 决策 5）。**独立命名常量**——
+ * 与 `processFrom` 水位线 / 候选年龄上限正交：这是发现辅助的频率快照，不绑 onboarding-watermark、
+ * 不引用任何摄入下界。`countRecentSenders` 的 since = now - 此天数。
+ */
+export const NOISE_TOPN_WINDOW_DAYS = 7;
+
+/**
+ * `countRecentSenders` 的单行结果（noise-discovery 决策 5）：归一后裸地址 + 窗口内出现计数。
+ * **故意只含这两字段**——显式 select 白名单杜绝正文（无 `bodyText`/`htmlBody`）。
+ */
+export type SenderCount = {
+  /** 归一后的发件人裸地址（小写、剥显示名/尖括号；空/非法已丢弃）。 */
+  fromEmail: string;
+  /** 该归一地址在窗口内的出现次数（含所有优先级 P0–P4、不经 digestItems 去重）。 */
+  count: number;
+};
+
+/**
+ * 归一发件人裸地址用于频率计数（noise-discovery 决策 5）：剥显示名/尖括号得 user@host、小写；
+ * 无法定位裸地址 → 空串（调用方丢弃）。复刻 applySafetyRules.ts 的 `normalizeFromAddress` 同款纪律
+ * （未导出，此处等价小函数），免同一发件人裂成 `Name <a@x>`/`a@x` 等多变体稀释计数。
+ */
+export function normalizeSenderForCount(fromEmail: string): string {
+  const angle = fromEmail.match(/<([^>]+)>/);
+  const raw = (angle ? angle[1]! : fromEmail).trim().toLowerCase();
+  const m = raw.match(/^[^\s<>@]+@[a-z0-9.-]+/);
+  return m ? m[0] : '';
+}
+
+/**
+ * 由一批 `fromEmail` 字段（窗口内全部已处理邮件、含 P0–P4、不去重）聚合归一计数（prisma 与内存共用）：
+ * 归一（丢空/非法）→ 计数 → 降序（同计数按地址升序稳定 tie-break）。返回 `SenderCount[]`。
+ */
+export function tallySenderCounts(fromEmails: readonly string[]): SenderCount[] {
+  const counts = new Map<string, number>();
+  for (const raw of fromEmails) {
+    const addr = normalizeSenderForCount(raw);
+    if (addr.length === 0) {
+      continue;
+    }
+    counts.set(addr, (counts.get(addr) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([fromEmail, count]) => ({ fromEmail, count }))
+    .sort((a, b) => (b.count !== a.count ? b.count - a.count : a.fromEmail < b.fromEmail ? -1 : 1));
+}
+
+/**
  * 摘要候选邮件的最小投影（daily-digest 决策 4）。**故意无 `bodyText`/`htmlBody`**——正文绝不进摘要
  * 投影对象（显式 select 白名单保证；DigestCandidate 类型层再钉一遍）。
  * `messageRowId` = `MailMessage.id`（行主键），**非** RFC 头 `MailMessage.messageId`——后者非 FK 目标，
@@ -336,6 +384,15 @@ export type MailRepo = {
    * 稳定。投影为 `DigestCandidate`（显式 select 白名单，**无 bodyText**）。
    */
   listDigestCandidates(digestType: string): Promise<DigestCandidate[]>;
+
+  /**
+   * 统计 `receivedAt >= since` 滚动窗内**全部已处理邮件**的归一 fromEmail 计数（noise-discovery 决策 5）。
+   * **不复用 `listDigestCandidates`**——含**所有优先级（P0–P4）**、**不经 `digestItems` 去重**、
+   * **显式 select 白名单（仅 `fromEmail` + 计数，绝不 `bodyText`/`htmlBody`）**。计数前归一发件人
+   * （`normalizeSenderForCount`：裸地址 + 小写 + 丢空/非法），免同一发件人裂成多变体。
+   * 返回 `SenderCount[]` 按计数降序（同计数地址升序稳定）；buildDigest 取前 N 渲染只读 Top-N 区块。
+   */
+  countRecentSenders(since: Date): Promise<SenderCount[]>;
 
   /**
    * 落 `digest_items` 标记一批邮件已进摘要（daily-digest 决策 1/3）：批量插入
@@ -1026,6 +1083,17 @@ export class PrismaMailRepo implements MailRepo {
     return sortDigestCandidates(enriched).map(
       ({ receivedAt: _receivedAt, id: _id, ...candidate }) => candidate,
     );
+  }
+
+  async countRecentSenders(since: Date): Promise<SenderCount[]> {
+    // 频率快照（noise-discovery 决策 5）：receivedAt ≥ since 窗内**全部已处理邮件**（含所有优先级、
+    // 不 join digest_items 去重）。**显式 select 白名单（仅 fromEmail，杜绝正文）**——非 include。
+    // 归一 + 计数在 JS 做（normalizeSenderForCount 剥显示名/小写，SQL distinct 做不到归一）。
+    const rows = await prisma.mailMessage.findMany({
+      where: { processedAt: { not: null }, receivedAt: { gte: since } },
+      select: { fromEmail: true },
+    });
+    return tallySenderCounts(rows.map((r) => r.fromEmail));
   }
 
   async markDigested(

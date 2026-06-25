@@ -32,6 +32,7 @@ function makeRules(overrides: Partial<ActiveRules> = {}): ActiveRules {
     vipSenders: [],
     importantDomains: [],
     marketingKeywords: [],
+    noiseSenders: [],
     ...overrides,
   };
 }
@@ -737,4 +738,137 @@ test('域名轴空（默认）：敏感邮件仍由类别轴守住 → 不标已
   );
   assert.equal(d.shouldMarkRead, false);
   assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+// ——————————————————————————————————————————————————————————
+// noise 轴（marketing 后、floor 前、¬sensitiveGuardFired 门控、降至 P3、绝不碰 P4/敏感）
+// ——————————————————————————————————————————————————————————
+
+test('noise 轴：非敏感 P2（发件人精确命中 noise_senders）→ P3、静默已读、不入摘要、不通知', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'nas@noisy.example', subject: 'NAS 每日报告' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['nas@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P3');
+  assert.ok(d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, true); // P3 非敏感 → 静默已读
+  assert.equal(d.shouldIncludeDigest, false); // P3 只计数
+  assert.equal(d.shouldNotifyNow, false);
+});
+
+test('noise 轴：非敏感 P0（发件域命中 noise_senders）→ P3、静默已读', () => {
+  // P0 建议（高置信、非验证码主题）→ 命中 noise 域 → 降 P3。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'alert@mail.noisy.example', subject: '每周巡检' }),
+    makeClassification({ priority: 'P0', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['noisy.example'] }), // 域命中（子域归一）
+  );
+  assert.equal(d.priority, 'P3');
+  assert.ok(d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, true);
+  assert.equal(d.shouldNotifyNow, false); // 原 P0 的即时推送被降噪掉
+});
+
+test('noise 轴：非敏感 P1 命中 noise_senders → P3、静默已读（P1 在降级集合）', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'hkss@noisy.example' }),
+    makeClassification({ priority: 'P1', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['hkss@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P3');
+  assert.ok(d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, true);
+});
+
+test('noise 轴：命中敏感守卫（类别轴）时 no-op、保原优先级、shouldMarkRead 仍 false（硬底线）', () => {
+  // 发件人在 noise_senders，但 category=finance（敏感）→ ¬sensitiveGuardFired 门控为假 → noise no-op。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'nas@noisy.example', subject: '账户对账单' }),
+    makeClassification({ priority: 'P2', category: 'finance', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['nas@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P2'); // noise 因 sensitiveGuardFired 不下调
+  assert.ok(!d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, false); // 敏感「不自动已读」硬底线粘住
+  assert.ok(d.appliedRules.includes('sensitive-category→no-mark-read'));
+});
+
+test('noise 轴：命中敏感守卫（验证码正文轴）时 no-op 且保未读', () => {
+  // 主题无验证码（不强制 P0）、正文含验证码 → verificationAxis 命中 → noise 门控为假。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'nas@noisy.example', subject: 'NAS 通知', textBody: '您的验证码是 246810' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['nas@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P2');
+  assert.ok(!d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, false);
+  assert.ok(d.appliedRules.includes('verification-keyword→no-mark-read'));
+});
+
+test('noise 轴：绝不碰 P4（P4 命中 noise_senders）→ no-op、shouldNotifyNow=true、shouldMarkRead=false', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'risk@noisy.example' }),
+    makeClassification({ priority: 'P4', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['risk@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P4'); // P4 不在降级集合
+  assert.ok(!d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldNotifyNow, true);
+  assert.equal(d.shouldMarkRead, false);
+});
+
+test('noise 轴：P3 已是 P3 → no-op（不重复 push、行为不变）', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'nas@noisy.example' }),
+    makeClassification({ priority: 'P3', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['nas@noisy.example'] }),
+  );
+  assert.equal(d.priority, 'P3');
+  assert.ok(!d.appliedRules.includes('noise→P3')); // P3 不在降级集合 {P0,P1,P2}
+  assert.equal(d.shouldMarkRead, true);
+});
+
+test('noise 轴空默认（makeRules 缺省）：发件人不在任何 noise 名单 → no-op', () => {
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'nas@noisy.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules(), // noiseSenders=[] → noise 轴 no-op，行为与现状一致
+  );
+  assert.equal(d.priority, 'P2');
+  assert.ok(!d.appliedRules.includes('noise→P3'));
+  assert.equal(d.shouldMarkRead, true);
+});
+
+test('vip 救回被 noise 误降（floor 在 noise 之后）：noise+vip → noise 先 P3、floor 再 P1（vip 胜）', () => {
+  // 非敏感 P1，发件人同时在 noise_senders 与 vip_senders。
+  const d = applySafetyRules(
+    makeEmail({ fromEmail: 'boss@vip.example' }),
+    makeClassification({ priority: 'P1', category: 'work', confidence: 0.9 }),
+    makeRules({ noiseSenders: ['boss@vip.example'], vipSenders: ['boss@vip.example'] }),
+  );
+  assert.equal(d.priority, 'P1'); // vip 胜
+  assert.ok(d.appliedRules.includes('noise→P3')); // round-trip 两条共存（预期审计语义）
+  assert.ok(d.appliedRules.includes('vip-important→P1'));
+  assert.equal(d.shouldMarkRead, false); // floor 抬回 P1 → markRead 自然 false
+  assert.equal(d.shouldIncludeDigest, true);
+});
+
+test('marketing→noise→floor 顺序：P2 广告 + noise + vip → 终末 P1（三轴各自如实记录）', () => {
+  // P2 命中 marketing（P2→P3）；发件人在 noise（P3 已是 P3、noise no-op）；同时 vip（floor P3→P1）。
+  const d = applySafetyRules(
+    makeEmail({ subject: '限时 sale 大促', fromEmail: 'boss@vip.example' }),
+    makeClassification({ priority: 'P2', category: 'work', confidence: 0.9 }),
+    makeRules({
+      marketingKeywords: ['sale', '大促'],
+      noiseSenders: ['boss@vip.example'],
+      vipSenders: ['boss@vip.example'],
+    }),
+  );
+  assert.equal(d.priority, 'P1'); // vip 胜
+  assert.ok(d.appliedRules.includes('marketing→P3')); // marketing 先把 P2→P3
+  assert.ok(!d.appliedRules.includes('noise→P3')); // noise 见到 P3、不在降级集合 → no-op
+  assert.ok(d.appliedRules.includes('vip-important→P1')); // floor 再 P3→P1
+  assert.equal(d.shouldMarkRead, false);
 });

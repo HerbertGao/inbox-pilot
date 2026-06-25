@@ -20,7 +20,7 @@ import {
   type DigestSchedulerOptions,
 } from './digestScheduler.js';
 import { FIELD_CAP } from './buildDigest.js';
-import type { DigestCandidate, MailRepo } from '../repo/mailRepo.js';
+import type { DigestCandidate, MailRepo, SenderCount } from '../repo/mailRepo.js';
 import type { Notifier, NotifyResult } from '../notify/notifier.js';
 
 /** 让 microtask 队列排空（使 await 链上的同步分支跑完）。 */
@@ -63,7 +63,7 @@ function candidate(over: Partial<DigestCandidate> & { messageRowId: string }): D
  * （buildDigest 经 listDigestCandidates 产出 segments，使我们无需 mock buildDigest 即可驱动逐段编排。）
  */
 function fakeRepo(candidates: DigestCandidate[]): {
-  repo: Pick<MailRepo, 'listDigestCandidates' | 'markDigested'>;
+  repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders' | 'markDigested'>;
   markCalls: string[][];
 } {
   const markCalls: string[][] = [];
@@ -72,6 +72,10 @@ function fakeRepo(candidates: DigestCandidate[]): {
     repo: {
       async listDigestCandidates(): Promise<DigestCandidate[]> {
         return candidates;
+      },
+      // Top-N 频率快照：编排测试不关心 Top-N 内容，返回 [] → buildDigest 省略该区块（不影响 mark/segments 断言）。
+      async countRecentSenders(): Promise<SenderCount[]> {
+        return [];
       },
       async markDigested(messageRowIds: string[]): Promise<void> {
         markCalls.push([...messageRowIds]);
@@ -378,9 +382,12 @@ test('无候选（buildDigest → null）：不调用 notify、记 digest-empty�
 });
 
 test('运行期 repo 抛错被 catch、不外泄、不崩（runDigestOnce 自身不抛）', async () => {
-  const repo: Pick<MailRepo, 'listDigestCandidates' | 'markDigested'> = {
+  const repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders' | 'markDigested'> = {
     async listDigestCandidates(): Promise<DigestCandidate[]> {
       throw Object.assign(new Error('db down'), { code: 'P1001' });
+    },
+    async countRecentSenders(): Promise<SenderCount[]> {
+      return [];
     },
     async markDigested(): Promise<void> {},
   };
@@ -391,10 +398,13 @@ test('运行期 repo 抛错被 catch、不外泄、不崩（runDigestOnce 自身
 
 test('运行期抛错经共享锁 runOnce → finally 释放锁、不漏 promise（回调内自吞）', async () => {
   let calls = 0;
-  const repo: Pick<MailRepo, 'listDigestCandidates' | 'markDigested'> = {
+  const repo: Pick<MailRepo, 'listDigestCandidates' | 'countRecentSenders' | 'markDigested'> = {
     async listDigestCandidates(): Promise<DigestCandidate[]> {
       calls += 1;
       throw new Error('boom');
+    },
+    async countRecentSenders(): Promise<SenderCount[]> {
+      return [];
     },
     async markDigested(): Promise<void> {},
   };

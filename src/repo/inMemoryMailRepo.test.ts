@@ -589,3 +589,74 @@ test('Prisma create/upsert 分支: create 含 processFrom、upsert.update 省略
     (prisma as { mailAccount: unknown }).mailAccount = original;
   }
 });
+
+// ─────────────── countRecentSenders（noise-discovery 决策 5：Top-N 频率快照数据源） ───────────────
+// 与 listDigestCandidates 的关键区别：含所有优先级（P0–P4）、不经 digestItems 去重、不读分类档（纯按
+// receivedAt 窗 + processedAt 聚合归一 fromEmail 计数）。窗口由调用方传 since（buildDigest 派生 now-N天）。
+
+test('countRecentSenders: 含 P0/P4（不像 listDigestCandidates 丢弃告警类）', async () => {
+  const repo = new InMemoryMailRepo();
+  const since = new Date('2026-06-01T00:00:00.000Z');
+  await seedEmail(repo, { providerMessageId: 'p0', priority: 'P0', fromEmail: 'alert@nas.local', date: '2026-06-10T00:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'p4', priority: 'P4', fromEmail: 'code@bank.com', date: '2026-06-10T01:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'p2', priority: 'P2', fromEmail: 'news@list.com', date: '2026-06-10T02:00:00.000Z' });
+
+  const counts = await repo.countRecentSenders(since);
+  const byAddr = new Map(counts.map((c) => [c.fromEmail, c.count]));
+  // P0/P4 必须计入（listDigestCandidates 会把它们丢弃 → 此处证明未复用它）。
+  assert.equal(byAddr.get('alert@nas.local'), 1, 'P0 应计入');
+  assert.equal(byAddr.get('code@bank.com'), 1, 'P4 应计入');
+  assert.equal(byAddr.get('news@list.com'), 1, 'P2 应计入');
+});
+
+test('countRecentSenders: 不经 digestItems 去重（已摘要邮件仍计数）', async () => {
+  const repo = new InMemoryMailRepo();
+  const since = new Date('2026-06-01T00:00:00.000Z');
+  const a = await seedEmail(repo, { providerMessageId: 'a', priority: 'P2', fromEmail: 'noisy@x.com', date: '2026-06-05T00:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'b', priority: 'P2', fromEmail: 'noisy@x.com', date: '2026-06-06T00:00:00.000Z' });
+  // 把其中一封标记已进摘要 → listDigestCandidates 会排除它，但 countRecentSenders 必须仍计数。
+  await repo.markDigested([a], DIGEST_TYPE_DAILY, new Date());
+
+  const counts = await repo.countRecentSenders(since);
+  assert.equal(counts.find((c) => c.fromEmail === 'noisy@x.com')?.count, 2, '已摘要的邮件不应被去重排除');
+});
+
+test('countRecentSenders: 发件人归一（显示名/大小写裂变收敛为同一裸地址）', async () => {
+  const repo = new InMemoryMailRepo();
+  const since = new Date('2026-06-01T00:00:00.000Z');
+  await seedEmail(repo, { providerMessageId: 'v1', fromEmail: 'Alice <Boss@Corp.com>', date: '2026-06-05T00:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'v2', fromEmail: 'boss@corp.com', date: '2026-06-06T00:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'v3', fromEmail: '<BOSS@corp.com>', date: '2026-06-07T00:00:00.000Z' });
+
+  const counts = await repo.countRecentSenders(since);
+  assert.equal(counts.length, 1, '三种变体应归一为一条');
+  assert.deepEqual(counts[0], { fromEmail: 'boss@corp.com', count: 3 });
+});
+
+test('countRecentSenders: 窗口外（receivedAt < since）与未处理邮件被排除', async () => {
+  const repo = new InMemoryMailRepo();
+  const since = new Date('2026-06-10T00:00:00.000Z');
+  await seedEmail(repo, { providerMessageId: 'old', fromEmail: 'old@x.com', date: '2026-06-01T00:00:00.000Z' }); // 窗外
+  await seedEmail(repo, { providerMessageId: 'unproc', fromEmail: 'pending@x.com', date: '2026-06-15T00:00:00.000Z', processed: false }); // 未处理
+  await seedEmail(repo, { providerMessageId: 'in', fromEmail: 'in@x.com', date: '2026-06-15T00:00:00.000Z' });
+
+  const counts = await repo.countRecentSenders(since);
+  assert.deepEqual(counts, [{ fromEmail: 'in@x.com', count: 1 }], '仅窗内已处理邮件计入');
+});
+
+test('countRecentSenders: 降序 + 空/非法发件人丢弃 + 无邮件返回 []', async () => {
+  const repo = new InMemoryMailRepo();
+  const since = new Date('2026-06-01T00:00:00.000Z');
+  assert.deepEqual(await repo.countRecentSenders(since), [], '无邮件 → []');
+
+  await seedEmail(repo, { providerMessageId: 'h1', fromEmail: 'hi@x.com', date: '2026-06-05T00:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'h2', fromEmail: 'hi@x.com', date: '2026-06-05T01:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'l1', fromEmail: 'lo@x.com', date: '2026-06-05T02:00:00.000Z' });
+  await seedEmail(repo, { providerMessageId: 'junk', fromEmail: 'not-an-address', date: '2026-06-05T03:00:00.000Z' }); // 非法 → 丢弃
+
+  const counts = await repo.countRecentSenders(since);
+  assert.deepEqual(counts, [
+    { fromEmail: 'hi@x.com', count: 2 },
+    { fromEmail: 'lo@x.com', count: 1 },
+  ], '降序 + 非法地址丢弃');
+});
