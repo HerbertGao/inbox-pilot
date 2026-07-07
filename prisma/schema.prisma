@@ -47,6 +47,9 @@ model MailMessage {
   hasAttachments    Boolean   @default(false)
   isRead            Boolean   @default(false)
   processedAt       DateTime?
+  // re-poll 计数（migration §1.3 / design D3 死信门）：notify 耗尽后每轮 cron re-poll 重跑时于入口
+  // 推进；`计数 ≥ K` → dead_letter + markProcessed。PG16 元数据级 ADD COLUMN（无重写，既有行 = 0）。
+  repollCount       Int       @default(0)
   createdAt         DateTime  @default(now())
 
   account         MailAccount          @relation(fields: [accountId], references: [id], onDelete: Restrict)

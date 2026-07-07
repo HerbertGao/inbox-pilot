@@ -19,7 +19,7 @@ import type { ChannelSendResult } from './telegram.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import { normalizeEmail } from '../normalizer/normalizeEmail.js';
-import { toRawEmail } from '../providers/gmail/gmailPoller.js';
+import { toRawEmail } from '../providers/gmail/gmailMap.js';
 import { InMemoryMailRepo } from '../repo/inMemoryMailRepo.js';
 import type { Classification } from '../classifier/schema.js';
 
@@ -187,61 +187,8 @@ test('poller 填 accountLabel：gmail toRawEmail(message, accountId, accountLabe
   assert.equal(channel.payloads[0]!.accountLabel, '公司邮箱', 'poller→normalize→notify 链路保住 accountLabel');
 });
 
-test('retry/drain：rebuildNormalizedEmail 经 selectDueRetries——account.label 非空且≠email → 重建 accountLabel == label（非 email 回落）', async () => {
-  const repo = new InMemoryMailRepo();
-  const accountId = 'gmail:me@example.com';
-  const accountEmail = 'me@example.com';
-  const accountLabel = '公司邮箱'; // **非空且 ≠ email**（守 label 掉出 rebuild select 经 email 回落空过）
-
-  // seed 账号行（label ≠ email）。
-  await repo.upsertAccount({
-    id: accountId,
-    provider: 'gmail',
-    email: accountEmail,
-    authJson: { refreshToken: 'RT', scopes: [] },
-    label: accountLabel,
-  });
-
-  // 落一封邮件 + 一条分类行（rebuild 需最新分类，否则 {ok:false} 永久）。
-  const { id: messageRowId } = await repo.saveEmail({
-    accountId,
-    provider: 'gmail',
-    providerMessageId: 'm1',
-    subject: '主题',
-    fromEmail: 'sender@example.com',
-    to: [],
-    date: '2026-06-20T00:00:00.000Z',
-    hasAttachments: false,
-    headers: {},
-  });
-  const classification: Classification = {
-    priority: 'P0',
-    category: 'security',
-    should_notify_now: true,
-    should_mark_read: false,
-    should_include_digest: false,
-    confidence: 0.9,
-    reason: '裁定原因',
-    risk_flags: [],
-  };
-  await repo.saveClassification(messageRowId, classification, makeDecision({ category: 'security' }));
-
-  // 入队一条到期重试动作（nextRetryAt 在过去 → due）。
-  const { actionRowId } = await repo.recordAction(messageRowId, 'notify');
-  await repo.enqueueRetry(actionRowId, 0, new Date(Date.now() - 60_000));
-
-  const due = await repo.selectDueRetries(accountId, new Date(), 10);
-  assert.equal(due.length, 1, '选出一条到期重试');
-  const rebuild = due[0]!.rebuild;
-  assert.ok(rebuild.ok, '重建成功（有分类行）');
-  // 关键：重建 email 的 accountLabel == 账号 label（非 email 回落）。
-  assert.equal(
-    rebuild.email.accountLabel,
-    accountLabel,
-    '重试重建的 accountLabel 是账号 label（非 email；label 未掉出 rebuild select）',
-  );
-  assert.notEqual(rebuild.email.accountLabel, accountEmail, 'accountLabel 不是 email 回落');
-});
+// (migration §1.2) durable retry/drain（selectDueRetries/rebuildNormalizedEmail）已剥离，其
+//  accountLabel-rebuild 用例随之删除；re-poll 复用分类的 accountLabel 保真由 §2 self-check 覆盖。
 
 test('notify 日志字段：失败日志仅 {kind,priority,channel,error}、不含 label/accountLabel（子进程捕获 pino 行）', () => {
   // pino 同步写 fd 1（非 process.stdout.write），故在子进程跑 notify 失败路径、捕获其 stdout 的

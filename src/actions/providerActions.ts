@@ -17,32 +17,14 @@ import type { FinalDecision } from '../rules/finalDecision.js';
  * **账号级致命错误**：方法遇 token 撤销 / scope 403 等账号级失效须抛 `ProviderReauthRequired`
  * （src/providers/provider.ts），executeActions 重抛、scheduler 隔离该账号——区别于发送态瞬时失败。
  */
+// 每方法可选 `signal?: AbortSignal`（design D7 best-effort 取消）：executeActions 由 per-email 超时 abort
+// 时透传，底层 gmail.modify 尽力中止在途调用；缺省 undefined，既有调用点不受影响。
 export type ProviderActions = {
   /** 把指定邮件标为已读（真实实现应幂等：重复标已读不报错）。 */
-  markRead(email: NormalizedEmail): Promise<void>;
+  markRead(email: NormalizedEmail, signal?: AbortSignal): Promise<void>;
   /**
    * 把最终优先级落到 provider 维度（Gmail 加权威 `AI/P*` 标签；IMAP 本期 no-op）。
    * **始终**被 executeActions 调用（标签是分类可见性，不被 shouldMarkRead 门控）；**幂等**。
    */
-  reflectPriority(email: NormalizedEmail, decision: FinalDecision): Promise<void>;
+  reflectPriority(email: NormalizedEmail, decision: FinalDecision, signal?: AbortSignal): Promise<void>;
 };
-
-/**
- * 假 provider：记录被请求标已读 / 落优先级的邮件（用于离线断言），不连真实邮箱、不发任何网络请求、
- * 绝不发送/回复邮件。测试可读 `markReadCalls` / `reflectPriorityCalls` 断言 executeActions 是否
- * 按 FinalDecision 发起动作。
- */
-export class FakeProviderActions implements ProviderActions {
-  /** 所有被请求标已读的邮件（按调用顺序）。 */
-  readonly markReadCalls: NormalizedEmail[] = [];
-  /** 所有被请求落优先级的邮件 + 裁定（按调用顺序）。 */
-  readonly reflectPriorityCalls: Array<{ email: NormalizedEmail; decision: FinalDecision }> = [];
-
-  async markRead(email: NormalizedEmail): Promise<void> {
-    this.markReadCalls.push(email);
-  }
-
-  async reflectPriority(email: NormalizedEmail, decision: FinalDecision): Promise<void> {
-    this.reflectPriorityCalls.push({ email, decision });
-  }
-}
