@@ -295,11 +295,9 @@ export class InMemoryMailRepo implements MailRepo {
   }
 
   async getRepollCount(messageRowId: string): Promise<number> {
-    const row = this.emailsById.get(messageRowId);
-    if (row === undefined) {
-      throw new Error(`InMemoryMailRepo.getRepollCount: 未知 messageRowId ${messageRowId}`);
-    }
-    return row.repollCount;
+    // 契约（MailRepo.getRepollCount）+ Prisma 实现：缺行 → 0（`row?.repollCount ?? 0`）。
+    // 内存 double 对齐之（原先抛，会与生产行为分叉，CodeRabbit #35）。
+    return this.emailsById.get(messageRowId)?.repollCount ?? 0;
   }
 
   async incrementRepollCount(messageRowId: string): Promise<number> {
