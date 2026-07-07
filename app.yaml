@@ -4,9 +4,9 @@ executor: pipeline
 
 triggers:
   - type: cron
-    # TODO(§5.1): 亚小时 cron —— P0 验证码会过期（design D3 P0 时效），且 notify 耗尽会推迟一个 cron 周期
-    #   再发。占位每 30 分钟；真实 cadence 待 §6.1 按实测失败率定。
-    schedule: "*/30 * * * *"
+    # §5.1: 亚小时 cron —— P0 验证码会过期（design D3 P0 时效），notify 耗尽会推迟一个 cron 周期再发。
+    #   */3（180s，沿用旧 inbox-pilot 的 POLL_INTERVAL_SECONDS=180）；真实 cadence 可按 §6.1 实测失败率再调。
+    schedule: "*/3 * * * *"
     timezone: "Asia/Shanghai"
 
 # 无 tools、无 permissions.approval —— inbox 现状无高危动作，自动动作（reflect/mark_read/notify）在
