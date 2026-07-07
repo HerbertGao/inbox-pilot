@@ -10,22 +10,16 @@
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
-import type { ActionType } from '../actions/actionTypes.js';
-import { ActionStatus } from '../actions/actionTypes.js';
 import { logger } from '../logger.js';
 import {
   buildRawAiJson,
   rebuildFinalDecision,
-  rebuildNormalizedEmail,
   sortDigestCandidates,
   tallySenderCounts,
   type AccountWriteInput,
   type DigestCandidate,
-  type DueRetryAction,
   type MailRepo,
   type RawAiJson,
-  type RebuildResult,
-  type RecordActionResult,
   type SenderCount,
   type StoredAccount,
   type StoredEmail,
@@ -39,6 +33,8 @@ type EmailRow = {
   providerMessageId: string;
   email: NormalizedEmail;
   processedAt: Date | null;
+  /** re-poll 计数（design D3 死信门；镜像 mail_messages.repollCount）。 */
+  repollCount: number;
 };
 
 /** 内存分类行（含 latest-wins 排序所需的 createdAt / 自增序号 seq）。 */
@@ -51,20 +47,6 @@ export type ClassificationRow = {
   confidence: number;
   reason: string;
   rawAiJson: RawAiJson;
-  createdAt: Date;
-};
-
-/** 内存动作行（供组 F 断言动作类型 + 终态 + error；durable-retry 加 retryCount/nextRetryAt）。 */
-export type ActionRow = {
-  id: string;
-  messageRowId: string;
-  actionType: ActionType;
-  status: ActionStatus;
-  error: string | null;
-  /** durable-retry：重试计数（初值 0；retrying 推进时写）。 */
-  retryCount: number;
-  /** durable-retry：下次到期时刻（仅 retrying 行有值，其余 null）。 */
-  nextRetryAt: Date | null;
   createdAt: Date;
 };
 
@@ -101,12 +83,8 @@ export class InMemoryMailRepo implements MailRepo {
   private readonly emailIdByDedupKey = new Map<string, string>();
   /** 账号行：id → 行（`MailAccount` 是唯一账号真相源）。游标存其 lastSyncCursor 字段。 */
   private readonly accountsById = new Map<string, AccountRow>();
-  /** id → 同步游标（lastSyncCursor）。仅对已写入账号有效（未写入即抛，见 setCursor）。 */
-  private readonly cursorsByAccountId = new Map<string, string | null>();
   /** 暴露给测试断言；按插入顺序。 */
   readonly classifications: ClassificationRow[] = [];
-  /** 暴露给测试断言；按插入顺序。 */
-  readonly actions: ActionRow[] = [];
   /** digest_items 行（摘要去重存在性）；暴露给测试断言，按插入顺序。重复 (rowId,type) 行容忍。 */
   readonly digestItems: DigestItemRow[] = [];
 
@@ -176,10 +154,6 @@ export class InMemoryMailRepo implements MailRepo {
       processFrom,
       label,
     });
-    // 写入路径即「播种」游标命名空间（取代旧 ensureAccountAnchor）；幂等：已存不重置游标。
-    if (!this.cursorsByAccountId.has(input.id)) {
-      this.cursorsByAccountId.set(input.id, null);
-    }
   }
 
   async createAccount(input: AccountWriteInput): Promise<void> {
@@ -207,19 +181,6 @@ export class InMemoryMailRepo implements MailRepo {
     row.processFrom = cloneProcessFrom(date); // 克隆外部 Date（不 retain 调用方可变引用）。
   }
 
-  async getCursor(accountId: string): Promise<string | null> {
-    return this.cursorsByAccountId.get(accountId) ?? null;
-  }
-
-  async setCursor(accountId: string, cursor: string): Promise<void> {
-    // 与 PrismaMailRepo.setCursor（update→未知账号即抛）保持契约一致：账号未写入即抛，
-    // 使「漏调 createAccount/upsertAccount」在测试就暴露、而非到生产才报。
-    if (!this.cursorsByAccountId.has(accountId)) {
-      throw new Error(`InMemoryMailRepo.setCursor: 未写入的 accountId ${accountId}`);
-    }
-    this.cursorsByAccountId.set(accountId, cursor);
-  }
-
   private dedupKey(accountId: string, providerMessageId: string): string {
     // 以 (NUL) 分隔，避免 accountId / providerMessageId 边界歧义（NUL 不会出现在二者内容中）。
     return `${accountId}\u0000${providerMessageId}`;
@@ -242,7 +203,7 @@ export class InMemoryMailRepo implements MailRepo {
     if (row === undefined) {
       return null;
     }
-    return { id: row.id, processedAt: row.processedAt };
+    return { id: row.id, processedAt: row.processedAt, receivedAt: new Date(row.email.date) };
   }
 
   async saveEmail(email: NormalizedEmail): Promise<StoredEmail> {
@@ -251,7 +212,7 @@ export class InMemoryMailRepo implements MailRepo {
     const existingId = this.emailIdByDedupKey.get(key);
     if (existingId !== undefined) {
       const existing = this.emailsById.get(existingId)!;
-      return { id: existing.id, processedAt: existing.processedAt };
+      return { id: existing.id, processedAt: existing.processedAt, receivedAt: new Date(existing.email.date) };
     }
     const id = this.nextId('msg');
     const row: EmailRow = {
@@ -260,10 +221,11 @@ export class InMemoryMailRepo implements MailRepo {
       providerMessageId: email.providerMessageId,
       email,
       processedAt: null,
+      repollCount: 0,
     };
     this.emailsById.set(id, row);
     this.emailIdByDedupKey.set(key, id);
-    return { id: row.id, processedAt: row.processedAt };
+    return { id: row.id, processedAt: row.processedAt, receivedAt: new Date(row.email.date) };
   }
 
   async saveClassification(
@@ -313,190 +275,38 @@ export class InMemoryMailRepo implements MailRepo {
     return latest;
   }
 
-  async recordAction(
-    messageRowId: string,
-    actionType: ActionType,
-  ): Promise<RecordActionResult> {
-    // 对 (messageRowId, actionType) 活跃行 upsert（决策 4）：活跃 = status ∈ {pending, retrying}。
-    // 忠实建模 partial unique index + upsert 分流：命中活跃 retrying → already-retrying（保持原样、不清零）；
-    // 命中活跃 pending（崩溃残留）→ 复用同行 proceed；无活跃行 → INSERT pending proceed。
-    const active = this.actions.find(
-      (a) =>
-        a.messageRowId === messageRowId &&
-        a.actionType === actionType &&
-        (a.status === 'pending' || a.status === 'retrying'),
-    );
-    if (active !== undefined) {
-      if (active.status === 'retrying') {
-        // 保持 retrying 原样、不清零 retryCount/nextRetryAt（drain 拥有它）。
-        return { actionRowId: active.id, disposition: 'already-retrying' };
-      }
-      return { actionRowId: active.id, disposition: 'proceed' };
-    }
-    const id = this.nextId('act');
-    const row: ActionRow = {
-      id,
-      messageRowId,
-      actionType,
-      status: 'pending',
-      error: null,
-      retryCount: 0,
-      nextRetryAt: null,
-      createdAt: new Date(),
-    };
-    this.actions.push(row);
-    return { actionRowId: id, disposition: 'proceed' };
-  }
-
-  async updateAction(
-    actionRowId: string,
-    status: Exclude<ActionStatus, 'pending' | 'retrying'>,
-    error?: string,
-  ): Promise<void> {
-    const row = this.actions.find((a) => a.id === actionRowId);
-    if (row === undefined) {
-      throw new Error(`InMemoryMailRepo.updateAction: 未知 actionRowId ${actionRowId}`);
-    }
-    row.status = status;
-    row.error = error ?? null;
-    // 离开 retrying 落终态：清空 nextRetryAt（维持「仅 retrying 行有 nextRetryAt」不变量，与 prisma 一致）。
-    row.nextRetryAt = null;
-  }
-
-  async enqueueRetry(
-    actionRowId: string,
-    retryCount: number,
-    nextRetryAt: Date,
-    error?: string,
-  ): Promise<void> {
-    // 落 retrying（决策 2）：写 retryCount/nextRetryAt/error（首次入队 retryCount=0；drain 推进 +1）。
-    const row = this.actions.find((a) => a.id === actionRowId);
-    if (row === undefined) {
-      throw new Error(`InMemoryMailRepo.enqueueRetry: 未知 actionRowId ${actionRowId}`);
-    }
-    row.status = ActionStatus.Retrying;
-    row.retryCount = retryCount;
-    row.nextRetryAt = nextRetryAt;
-    row.error = error ?? null;
-  }
-
-  async markActionDeadLetter(actionRowId: string, retryCount: number, error?: string): Promise<void> {
-    // 落终态 dead_letter（决策 2/3）：写死亡时的 retryCount、清空 nextRetryAt、写脱敏 error（绝不正文/凭据/PII）。
-    const row = this.actions.find((a) => a.id === actionRowId);
-    if (row === undefined) {
-      throw new Error(
-        `InMemoryMailRepo.markActionDeadLetter: 未知 actionRowId ${actionRowId}`,
-      );
-    }
-    row.status = ActionStatus.DeadLetter;
-    row.retryCount = retryCount;
-    row.nextRetryAt = null;
-    row.error = error ?? null;
-  }
-
-  async selectDueRetries(
-    accountId: string,
-    now: Date,
-    limit: number,
-  ): Promise<DueRetryAction[]> {
-    // 先选 retry 动作行（决策 5/6）：status='retrying' ∧ nextRetryAt ≤ now ∧ message.accountId=accountId，
-    // 按 nextRetryAt 升序、至多 limit 条。再对每条 LEFT 语义重建输入（关联分类行缺失 → 永久、不丢动作行）。
-    const due = this.actions
-      .filter((a) => {
-        if (a.status !== 'retrying' || a.nextRetryAt === null) {
-          return false;
-        }
-        if (a.nextRetryAt.getTime() > now.getTime()) {
-          return false;
-        }
-        const msg = this.emailsById.get(a.messageRowId);
-        return msg !== undefined && msg.accountId === accountId;
-      })
-      .sort((x, y) => {
-        // nextRetryAt 升序（两者非 null，上面已过滤）；同刻按 id 稳定 tie-break。
-        const dx = x.nextRetryAt!.getTime();
-        const dy = y.nextRetryAt!.getTime();
-        if (dx !== dy) {
-          return dx - dy;
-        }
-        return x.id < y.id ? -1 : x.id > y.id ? 1 : 0;
-      })
-      .slice(0, limit);
-
-    return due.map((action) => {
-      const msg = this.emailsById.get(action.messageRowId)!;
-      // receivedAt 与 prisma 一致：MailMessage.receivedAt = new Date(email.date)。
-      const receivedAt = new Date(msg.email.date);
-      const rebuild = this.rebuildInput(action.messageRowId, msg, accountId);
-      return {
-        actionRowId: action.id,
-        actionType: action.actionType,
-        retryCount: action.retryCount,
-        receivedAt,
-        rebuild,
-      };
-    });
-  }
-
-  /**
-   * 重建一条到期重试动作的输入（忠实建模 prisma 的 LEFT join + 分流，决策 5）：
-   *   - 无最新分类行 → 永久（`{ ok: false }`）；
-   *   - rawAiJson 的 finalDecision shape 不符 → rebuildFinalDecision throw → 永久；
-   *   - 否则 → `{ ok: true, email, decision }`。
-   * provider 由账号行派生（与 prisma 共用 rebuildNormalizedEmail）；账号行缺失/非法时回落 email 行的
-   * provider（内存写入约束保证合法，二者本就一致）。
-   * // ponytail: prisma 的 coerceProvider 对**非法 account.provider** 返回 null → {ok:false}（永久死信）；
-   * //   内存此处回落 email.provider（恒合法）→ 复现不了该永久路径，故「非法 provider→死信」仅 prisma 端
-   * //   正确、离线 harness 不测（已知保真度缺口；内存测不建账号模型，强行对齐需新增账号建模、超出该 nit 价值）。
-   */
-  private rebuildInput(
-    messageRowId: string,
-    msg: { accountId: string; email: NormalizedEmail },
-    accountId: string,
-  ): RebuildResult {
+  async getClassification(messageRowId: string): Promise<FinalDecision | null> {
+    // 最新分类行（getLatestClassification：createdAt desc, seq desc）；复用 rebuildFinalDecision（design D4）。
     const latest = this.getLatestClassification(messageRowId);
     if (latest === null) {
-      return { ok: false };
+      return null; // 无分类行 → 当无分类、重 LLM。
     }
-    const account = this.accountsById.get(accountId);
-    const provider =
-      account?.provider === 'gmail' || account?.provider === 'imap'
-        ? account.provider
-        : msg.email.provider;
-    // 显示名 label??email（design 决策 1）：锁步 prisma 同传，使重试通知与首发一致指明邮箱（tasks 2.6）。
-    // 账号行缺失（accountsById 无此行）→ undefined（下游回落裸 accountId）。
-    const accountLabel = account ? account.label?.trim() || account.email : undefined;
     try {
-      const email = rebuildNormalizedEmail(
-        msg.accountId,
-        provider,
-        {
-          providerMessageId: msg.email.providerMessageId,
-          messageId: msg.email.messageId ?? null,
-          threadId: msg.email.providerThreadId ?? null,
-          uid: msg.email.uid ?? null,
-          subject: msg.email.subject,
-          fromEmail: msg.email.fromEmail,
-          fromName: msg.email.fromName ?? null,
-          snippet: msg.email.snippet ?? null,
-          bodyText: msg.email.textBody ?? null,
-          receivedAt: new Date(msg.email.date),
-          hasAttachments: msg.email.hasAttachments,
-        },
-        accountLabel,
-      );
-      const decision = rebuildFinalDecision({
+      return rebuildFinalDecision({
         priority: latest.priority,
         category: latest.category,
         confidence: latest.confidence,
         reason: latest.reason,
         rawAiJson: latest.rawAiJson,
       });
-      return { ok: true, email, decision };
     } catch {
-      // rawAiJson finalDecision shape 不符 = 永久（独立解析 try 内 throw，决策 5）。
-      return { ok: false };
+      return null; // rawAiJson malformed → 当无分类、重 LLM。
     }
+  }
+
+  async getRepollCount(messageRowId: string): Promise<number> {
+    // 契约（MailRepo.getRepollCount）+ Prisma 实现：缺行 → 0（`row?.repollCount ?? 0`）。
+    // 内存 double 对齐之（原先抛，会与生产行为分叉，CodeRabbit #35）。
+    return this.emailsById.get(messageRowId)?.repollCount ?? 0;
+  }
+
+  async incrementRepollCount(messageRowId: string): Promise<number> {
+    const row = this.emailsById.get(messageRowId);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.incrementRepollCount: 未知 messageRowId ${messageRowId}`);
+    }
+    row.repollCount += 1;
+    return row.repollCount;
   }
 
   async markProcessed(messageRowId: string): Promise<void> {
@@ -505,11 +315,6 @@ export class InMemoryMailRepo implements MailRepo {
       throw new Error(`InMemoryMailRepo.markProcessed: 未知 messageRowId ${messageRowId}`);
     }
     row.processedAt = new Date();
-  }
-
-  /** 取某邮件的所有动作行（组 F 断言用），按插入顺序。 */
-  getActions(messageRowId: string): ActionRow[] {
-    return this.actions.filter((a) => a.messageRowId === messageRowId);
   }
 
   async listDigestCandidates(digestType: string): Promise<DigestCandidate[]> {

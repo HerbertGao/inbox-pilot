@@ -24,6 +24,9 @@ import { ProviderReauthRequired } from '../provider.js';
  * Gmail API 的**最小结构子集**（poller / actions 用到的方法）。用结构接口而非具体 gmail_v1.Gmail，
  * 使测试可注入假 client、并使「无 send 路径」可结构性断言（本类型故意**不含** messages.send）。
  */
+// 每方法可选 `signal?: AbortSignal`（design D7 best-effort 取消）：run() 的 per-email/list 超时 abort 时
+// 传入，Gaxios(googleapis 传输层) 尽力中止在途 socket——**不保证**毁 socket，真正的 anti-wedge 靠 run()
+// 侧 fence + 吞诺（见 pipeline.ts raceTimeout）。缺省 undefined，既有调用点不受影响。
 export type GmailApi = {
   users: {
     messages: {
@@ -32,25 +35,29 @@ export type GmailApi = {
         q?: string;
         pageToken?: string;
         maxResults?: number;
+        signal?: AbortSignal;
       }): Promise<{ data: { messages?: Array<{ id?: string | null }> | null; nextPageToken?: string | null } }>;
       get(params: {
         userId: string;
         id: string;
         format?: string;
+        signal?: AbortSignal;
       }): Promise<{ data: GmailMessage }>;
       modify(params: {
         userId: string;
         id: string;
         requestBody: { addLabelIds?: string[]; removeLabelIds?: string[] };
+        signal?: AbortSignal;
       }): Promise<{ data: unknown }>;
     };
     labels: {
-      list(params: { userId: string }): Promise<{
+      list(params: { userId: string; signal?: AbortSignal }): Promise<{
         data: { labels?: Array<{ id?: string | null; name?: string | null }> | null };
       }>;
       create(params: {
         userId: string;
         requestBody: { name: string; labelListVisibility?: string; messageListVisibility?: string };
+        signal?: AbortSignal;
       }): Promise<{ data: { id?: string | null; name?: string | null } }>;
     };
   };
