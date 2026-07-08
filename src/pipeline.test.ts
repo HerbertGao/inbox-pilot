@@ -11,7 +11,7 @@ import type { Logger } from 'pino';
 
 import { run, type RunOverrides } from './pipeline.js';
 import { InMemoryMailRepo } from './repo/inMemoryMailRepo.js';
-import type { MailRepo } from './repo/mailRepo.js';
+import type { MailRepo, DigestCandidate, SenderCount } from './repo/mailRepo.js';
 import { toRawEmail } from './providers/gmail/gmailMap.js';
 import type { GmailApi, GmailMessage } from './providers/gmail/gmailClient.js';
 import { normalizeEmail, type NormalizedEmail } from './normalizer/normalizeEmail.js';
@@ -37,8 +37,8 @@ const silentLogger = {
   },
 } as unknown as Logger;
 
-/** fake ctx：记录真实 emit 的 kind+payload（不 stub emit 逻辑，只捕获）。 */
-function makeCtx() {
+/** fake ctx：记录真实 emit 的 kind+payload（不 stub emit 逻辑，只捕获）。trigger 可选（多触发路由，缺省 = undefined → poll）。 */
+function makeCtx(trigger?: string) {
   const events: Array<{ kind: string; payload?: object }> = [];
   const ctx = {
     input: undefined as unknown,
@@ -50,6 +50,7 @@ function makeCtx() {
     async propose() {
       return undefined;
     },
+    trigger,
     events,
   };
   return ctx;
@@ -722,4 +723,139 @@ test('m5 reauth 持久 disable 落库失败（setAccountEnabled 抛）→ run �
     ),
     'setAccountEnabled 抛仍 emit account.suspended(reauth-required)、run 完成',
   );
+});
+
+// ─────────────── §3.5 多触发路由 self-check（add-multi-trigger，驱动真实 run(ctx)、不 stub buildDigest/notifyDigest/emit） ───────────────
+
+/** digest 假 repo：listDigestCandidates 返回脚本候选、记 markDigested；其余 MailRepo 方法 digest 路径不触碰。 */
+function digestRepo(candidates: DigestCandidate[]): { repo: MailRepo; markCalls: string[][] } {
+  const markCalls: string[][] = [];
+  const repo = {
+    async listDigestCandidates(): Promise<DigestCandidate[]> {
+      return candidates;
+    },
+    async countRecentSenders(): Promise<SenderCount[]> {
+      return [];
+    },
+    async markDigested(ids: string[]): Promise<void> {
+      markCalls.push([...ids]);
+    },
+  } as unknown as MailRepo;
+  return { repo, markCalls };
+}
+
+/** digest 假 notifier：记 notifyDigest 文本 + per-email notify 次数（断言 poll 路径不走）；outcomes 脚本、用尽默认 sent。 */
+function digestNotifier(outcomes: Array<NotifyResult['outcome']>): {
+  notifier: Notifier;
+  digestTexts: string[];
+  calls: { notify: number };
+} {
+  const digestTexts: string[] = [];
+  const calls = { notify: 0 };
+  let i = 0;
+  const notifier = {
+    async notify(): Promise<NotifyResult> {
+      calls.notify += 1;
+      return SENT;
+    },
+    async notifyDigest(text: string): Promise<NotifyResult> {
+      digestTexts.push(text);
+      const outcome = outcomes[i++] ?? 'sent';
+      if (outcome === 'sent') return { outcome: 'sent', channel: 'fake' };
+      if (outcome === 'skipped') return { outcome: 'skipped', reason: 'no-channel' };
+      return { outcome: 'failed', channel: 'fake', error: 'fake-error' };
+    },
+  } as Notifier;
+  return { notifier, digestTexts, calls };
+}
+
+function digestCandidate(over: Partial<DigestCandidate> & { messageRowId: string }): DigestCandidate {
+  return {
+    priority: 'P1',
+    category: 'work',
+    subject: 'subj',
+    fromEmail: 'a@example.com',
+    fromName: 'Alice',
+    reason: 'reason',
+    ...over,
+  };
+}
+
+/** 足量满字段 P1 候选（各字段远超 FIELD_CAP=200）→ buildDigest.packLines 必分 ≥2 段。 */
+function manyDigestCandidates(n: number): DigestCandidate[] {
+  return Array.from({ length: n }, (_, idx) =>
+    digestCandidate({
+      messageRowId: `r${idx}`,
+      subject: 's'.repeat(300),
+      fromName: 'n'.repeat(300),
+      reason: 'z'.repeat(300),
+    }),
+  );
+}
+
+test('3.5① ctx.trigger=digest → buildDigest+逐段 notifyDigest+markDigested；poll 路径不走', async () => {
+  const { repo, markCalls } = digestRepo([digestCandidate({ messageRowId: 'r1' })]);
+  const { notifier, digestTexts, calls } = digestNotifier([]);
+  const ctx = makeCtx('digest');
+
+  await run(ctx, { repo, notifier, now: () => NOW });
+
+  assert.ok(digestTexts.length >= 1, 'notifyDigest 被调用（摘要推送）');
+  assert.deepEqual(markCalls, [['r1']], 'markDigested(该段 row-ids)');
+  assert.equal(calls.notify, 0, 'poll 的 per-email notify 未被调用（poll 路径不走）');
+  assert.ok(ctx.events.some((e) => e.kind === 'digest.sent'), 'emit digest.sent');
+  assert.ok(!ctx.events.some((e) => e.kind.startsWith('notify.')), '无 poll 的 notify.* 事件');
+});
+
+test('3.5② ctx.trigger=poll/undefined → 走现有 poll、不发摘要', async () => {
+  for (const trig of ['poll', undefined] as const) {
+    const repo = new InMemoryMailRepo();
+    await seedGmailAccount(repo);
+    const gmail = makeGmail({ messages: { m1: gmailMsg('m1') } });
+    const provider = makeProvider();
+    const notifier = makeNotifier(() => SENT);
+    const classify = makeClassify(() => classification({ priority: 'P4' }));
+    const ctx = makeCtx(trig);
+
+    await run(ctx, baseOverrides({ repo, gmail, provider, notifier, classify }));
+
+    assert.ok(gmail.listCalls >= 1, `poll 走 gmail list（trigger=${String(trig)}）`);
+    assert.ok(gmail.getCalls >= 1, 'poll 逐封 get（走现有 fetch→classify→…）');
+    assert.ok(!ctx.events.some((e) => e.kind.startsWith('digest.')), '无 digest.* 事件（不发摘要）');
+  }
+});
+
+test('3.5③ digest 空（buildDigest→null）→ emit digest.empty、不推、不 mark', async () => {
+  const { repo, markCalls } = digestRepo([]);
+  const { notifier, digestTexts } = digestNotifier([]);
+  const ctx = makeCtx('digest');
+
+  await run(ctx, { repo, notifier, now: () => NOW });
+
+  assert.equal(digestTexts.length, 0, '空 → 不推');
+  assert.equal(markCalls.length, 0, '空 → 不 mark');
+  assert.ok(ctx.events.some((e) => e.kind === 'digest.empty'), 'emit digest.empty');
+});
+
+test('3.5④ digest 段发失败 → 停、不 markDigested 后续段', async () => {
+  const candidates = manyDigestCandidates(20);
+  const allIds = candidates.map((c) => c.messageRowId);
+  const { repo, markCalls } = digestRepo(candidates);
+  // seg1 sent、seg2 failed → 停。
+  const { notifier, digestTexts } = digestNotifier(['sent', 'failed']);
+  const ctx = makeCtx('digest');
+
+  await run(ctx, { repo, notifier, now: () => NOW });
+
+  assert.equal(digestTexts.length, 2, 'seg1(sent) 后 seg2(failed) 即停（后续段不发）');
+  assert.equal(markCalls.length, 1, '只 mark seg1（成功段），后续段不 mark');
+  const marked = markCalls[0]!;
+  assert.ok(marked.length > 0 && marked.length < allIds.length, 'seg1 是非空前缀、未含全部');
+  assert.deepEqual(marked, allIds.slice(0, marked.length), 'marked = row-ids 前缀（seg1）');
+  assert.ok(ctx.events.some((e) => e.kind === 'digest.failed'), 'emit digest.failed');
+});
+
+test('3.1 未知 trigger → run throw（响亮失败、不静默走 poll）', async () => {
+  const ctx = makeCtx('bogus-trigger');
+  await assert.rejects(run(ctx, {}), /unknown trigger/, '未知 name → throw（供 trace 发现拼错/漏配）');
 });

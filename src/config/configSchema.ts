@@ -110,11 +110,10 @@ export const configSchema = z.object({
   // IMAP 账号凭据不走 env——统一存 DB MailAccount.authJson，经 `account add --imap` 写入
   // （P3 的 IMAP_* env 键 + 一次性迁移脚本已退役）。轮询间隔仍是进程级 env 配置。
   POLL_INTERVAL_SECONDS: z.preprocess(emptyToUndefined, z.coerce.number().default(180)),
-  // DIGEST_TIMES（每日摘要触发时刻列表，如 `12:30,21:30`）：**有意**不走 emptyToUndefined、
-  // 不用 zod .default()——这是本文件 optional 键惯例的**例外**，切勿"修"回去。
-  // 必须区分 undefined（env 缺省 → 由 digestScheduler 层兜底成默认 `12:30,21:30`）
-  // 与 ''（显式空串 → 空列表 → 不调度任何摘要）。若包 emptyToUndefined，''→undefined→默认
-  // 排程复活，"显式空 → 不调度"语义被毁；故此处用裸 z.string().optional() 原样透传。
+  // DIGEST_TIMES（每日摘要触发时刻列表，如 `12:30,21:30`）：**已退役、不再读**（add-multi-trigger）——
+  // 摘要调度移到 `app.yaml` 的 digest 触发器 cron 数组 + hangar daemon，本进程不再解析/调度 DIGEST_TIMES。
+  // **仅保留字段声明**（不删），使既有 `.env` 仍设 `DIGEST_TIMES=...` 时**不**触发 config 严格校验报错；
+  // 无消费者读取本值。裸 z.string().optional() 原样透传（保留退役前的宽松形状，不加默认/不归一）。
   DIGEST_TIMES: z.string().optional(),
 });
 

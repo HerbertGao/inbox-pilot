@@ -46,6 +46,7 @@ import type { Classification } from './classifier/schema.js';
 import { applySafetyRules } from './rules/applySafetyRules.js';
 import { executeActions } from './actions/executeActions.js';
 import { defaultNotifier, type Notifier } from './notify/notifier.js';
+import { runDigestOnce } from './digest/digestScheduler.js';
 
 /**
  * **本地结构化 RunContext**（R10/M6）：外部 pilot 不 import @hangar/core 的类型——用本地结构 type，
@@ -59,6 +60,12 @@ type RunContext = {
   logger: Logger;
   emit(kind: string, payload?: object): void;
   propose(action: Action): Promise<unknown>;
+  /**
+   * 可选触发身份（脊柱零域、多触发路由，design D1/D2）：脊柱把触发的**不透明 name**（app.yaml
+   * trigger.name）塞进此字段；`run()` 据此 `switch` 分派（`'digest'`→摘要、`'poll'`/undefined→poll）。
+   * 老脊柱不传 → undefined → 向后兼容走 poll。**运行时鸭子契约新增字段**，pilot 防御性读、fail-loud 断言**不**含它。
+   */
+  trigger?: string;
 };
 
 /** 每轮 get 预算（design D5 成本上界 §3.2；否则大量 unread 积压下每 tick 穷尽 get/classify 爆发）。 */
@@ -254,6 +261,47 @@ export async function run(ctx: RunContext, overrides?: RunOverrides): Promise<vo
       'inbox pipeline: incompatible RunContext (expected emit/config/input/logger) — rebuild pilot against current @hangar/core',
     );
   }
+
+  // —— 多触发路由（design D1/D2 + spec「每日摘要作为 digest 触发器」/「未知 trigger 响亮失败」）：脊柱把触发的
+  //    不透明 name 塞进 ctx.trigger，app 内**显式 case + loud default**分派——`'digest'`→摘要、`'poll'`/undefined→poll、
+  //    其余未知非空 name → **throw**（拼错/漏配触发器时响亮失败，不静默走 poll 致 digest 时刻双 poll）。undefined
+  //    向后兼容（老脊柱不传）。名→行为绑定是约定（脊柱零域、无法内省 app 的 switch），故 app 侧自守 loud default。——
+  if (ctx.trigger === 'digest') {
+    await runDigest(ctx, overrides);
+    return;
+  }
+  if (ctx.trigger === 'poll' || ctx.trigger === undefined) {
+    await runPoll(ctx, overrides);
+    return;
+  }
+  throw new Error(
+    `inbox pipeline: unknown trigger '${String(ctx.trigger)}' — expected 'poll'/'digest' (check app.yaml trigger name)`,
+  );
+}
+
+/**
+ * digest 触发（design「inbox 落地」/ spec「每日摘要作为 digest 触发器」）：**包裹**一轮编排 `runDigestOnce`，
+ * 把审计经 `ctx.emit`（digest.sent/digest.empty/digest.failed，非 PII）而非模块 logger，并组装与 poll 同的
+ * 依赖（PrismaMailRepo / defaultNotifier；now 由 overrides 注入假时钟）。build 为 null → digest.empty 不推。
+ * 一轮编排的**逐段提交语义**（成功即 markDigested、遇非 sent 停）由 runDigestOnce 保证。
+ */
+async function runDigest(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
+  const repo: MailRepo = overrides?.repo ?? new PrismaMailRepo();
+  const notifier: Notifier = overrides?.notifier ?? defaultNotifier;
+  const now: () => number = overrides?.now ?? (() => Date.now());
+  await runDigestOnce({
+    repo,
+    notifier,
+    now: () => new Date(now()),
+    emit: (kind, payload) => ctx.emit(kind, payload),
+  });
+}
+
+/**
+ * poll 触发（现有 fetch→classify→executeActions→markProcessed 每轮循环，design D2/D5/D7）：
+ * 从 run() 主体原样抽出——多触发路由前的**唯一**行为，`ctx.trigger` 为 `'poll'`/undefined 时走此路径。
+ */
+async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
   const log = ctx.logger;
 
   // —— config fail-loud（D8）：run() 开头校验并 throw（→ run.failed，受 choke-point+reaper 覆盖）；
