@@ -68,10 +68,10 @@ test('configSchema：POLL_INTERVAL_SECONDS 空串/省略 → 180，显式值 →
   assert.equal(configSchema.parse({ DATABASE_URL: DB, POLL_INTERVAL_SECONDS: '60' }).POLL_INTERVAL_SECONDS, 60);
 });
 
-// ── DIGEST_TIMES：裸 z.string().optional()，区分缺省(undefined) vs 显式空('') vs 显式值 ──
-// 关键：env 缺省 → undefined（digestScheduler 层兜底默认）；显式 '' → 原样 ''（**不**被归一为
-// undefined、**不**落成默认）——保住"显式空 → 不调度"语义；显式值 → 透传。
-// （若 DIGEST_TIMES 被错误地包 emptyToUndefined，'' 会变 undefined，本测试即失败。）
+// ── DIGEST_TIMES：字段已退役（add-multi-trigger：摘要调度移到 app.yaml 的 digest 触发器 + hangar
+// daemon），但 configSchema 保留裸 z.string().optional() 声明，使既有 .env 仍设 DIGEST_TIMES 时不触发
+// 严格校验报错。**已无消费者读它**——旧的 '' vs undefined "不调度" 语义已无意义；下列测试仅守住"保留字段
+// 未被误删、也未被误包 emptyToUndefined"（缺省→undefined / 显式值→原样透传）。
 
 test('configSchema：DIGEST_TIMES env 缺省 → undefined', () => {
   assert.equal(configSchema.parse({ DATABASE_URL: DB }).DIGEST_TIMES, undefined);
