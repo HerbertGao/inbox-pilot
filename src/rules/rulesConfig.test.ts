@@ -229,6 +229,25 @@ test('noise_senders 坏重载 carry-forward 上一次有效值，不连累其余
   assert.deepEqual(getActiveRules().noiseSenders, ['nas@home.lan'], 'operator noise 项在坏重载中存活');
 });
 
+test('加载 noise overlay 并 set-union 进 noiseSenders（rules.yaml noise_senders ∪ overlay、归一、去重）', () => {
+  writeYaml('noise_senders:\n  - nas@home.lan\n');
+  // overlay 与 rules.yaml 同目录（resolveNoiseOverlayPath 由 buildAndPublish 传入的 path 派生）。
+  writeFileSync(
+    join(tmpDir, 'noise_senders.overlay'),
+    'nas@home.lan\nPUSH@taobao.com\n  \nnoreply@jd.com\n',
+    'utf8',
+  );
+  reloadRulesConfigForTest(yamlPath);
+  // yaml 的 nas 与 overlay 的 nas 去重；overlay 归一 lower+trim+丢空；YAML 在前、overlay 新增在后。
+  assert.deepEqual(getActiveRules().noiseSenders, ['nas@home.lan', 'push@taobao.com', 'noreply@jd.com']);
+});
+
+test('noise overlay 缺失 → 仅用 rules.yaml noise_senders（不崩、优雅退化）', () => {
+  writeYaml('noise_senders:\n  - nas@home.lan\n');
+  reloadRulesConfigForTest(yamlPath); // tmpDir 下无 overlay 文件
+  assert.deepEqual(getActiveRules().noiseSenders, ['nas@home.lan']);
+});
+
 test('解析失败（坏 YAML）→ 敏感邮件仍不标已读（内置整集 + 类别轴守住）', () => {
   // 先放一个合法文件建立基线，再放坏文件触发解析失败 → 全 carry-forward。
   writeYaml('vip_senders:\n  - vip@example.com\n');

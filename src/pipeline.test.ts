@@ -6,6 +6,9 @@
 // spy 计到的真实 classify 调用数。
 
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type { Logger } from 'pino';
 
@@ -858,4 +861,112 @@ test('3.5④ digest 段发失败 → 停、不 markDigested 后续段', async ()
 test('3.1 未知 trigger → run throw（响亮失败、不静默走 poll）', async () => {
   const ctx = makeCtx('bogus-trigger');
   await assert.rejects(run(ctx, {}), /unknown trigger/, '未知 name → throw（供 trace 发现拼错/漏配）');
+});
+
+// ─────────────── noise-feedback self-check（interpret 确定性匹配 + apply set-union 幂等，跨 repo 契约 add-view-command-path） ───────────────
+
+/** interpret 假 repo：countRecentSenders 返回脚本候选（其余方法 interpret 路径不触碰）。 */
+function senderRepo(senders: SenderCount[]): MailRepo {
+  return {
+    async countRecentSenders(): Promise<SenderCount[]> {
+      return senders;
+    },
+  } as unknown as MailRepo;
+}
+
+test('nf① interpret-feedback: token 命中 → add=命中候选子集（去重、输出⊆候选、不 throw）', async () => {
+  const repo = senderRepo([
+    { fromEmail: 'noreply@taobao.com', count: 9 },
+    { fromEmail: 'push@weibo.com', count: 5 },
+    { fromEmail: 'alice@work.example', count: 2 },
+  ]);
+  const ctx = makeCtx('interpret-feedback');
+  // 'jd' 长度 2 < 3 被丢弃 → 只 taobao/weibo（长度≥3）命中候选（证 ≥3 token 门 + 子串匹配）。
+  ctx.input = { text: '把 taobao 和 weibo 加进去降噪（jd 太短不算）' };
+
+  await run(ctx, { repo });
+
+  const ev = ctx.events.find((e) => e.kind === 'interpretation.proposed');
+  assert.ok(ev, 'emit interpretation.proposed');
+  const add = (ev!.payload as { add: string[] }).add;
+  assert.deepEqual(add, ['noreply@taobao.com', 'push@weibo.com'], '命中 taobao/weibo、未命中 work');
+  const candidateSet = new Set(['noreply@taobao.com', 'push@weibo.com', 'alice@work.example']);
+  assert.ok(add.every((a) => candidateSet.has(a)), '输出⊆候选集（零幻觉）');
+});
+
+test('nf② interpret-feedback: 纯中文虚词（无 ascii token≥3）→ add=[]（切分剔除、无副作用）', async () => {
+  const repo = senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]);
+  const ctx = makeCtx('interpret-feedback');
+  ctx.input = { text: '把第一个和那个都加进去吧' };
+
+  await run(ctx, { repo });
+
+  const ev = ctx.events.find((e) => e.kind === 'interpretation.proposed');
+  assert.deepEqual((ev!.payload as { add: string[] }).add, [], '中文虚词经 [^a-z0-9]+ 切分被剔除 → 无命中');
+});
+
+test('nf③ interpret-feedback: input 非对象/缺 text/非串 → 当空、add=[]', async () => {
+  const repo = senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]);
+  for (const bad of [undefined, null, 42, { nope: 1 }, { text: 123 }]) {
+    const ctx = makeCtx('interpret-feedback');
+    ctx.input = bad;
+    await run(ctx, { repo });
+    const ev = ctx.events.find((e) => e.kind === 'interpretation.proposed');
+    assert.deepEqual((ev!.payload as { add: string[] }).add, [], `input=${JSON.stringify(bad)} → add=[]`);
+  }
+});
+
+test('nf④ apply-feedback: set-union 幂等 + 原子写产文件 + added/already_present + 归一/去重/非串丢弃', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'noise-overlay-'));
+  const overlay = join(dir, 'noise_senders.overlay');
+  const prevEnv = process.env.NOISE_OVERLAY_FILE;
+  process.env.NOISE_OVERLAY_FILE = overlay;
+  try {
+    // 首次 apply：全部新增、原子写产文件。
+    const ctx1 = makeCtx('apply-feedback');
+    ctx1.input = { add: ['a@x.com', 'b@y.com'] };
+    await run(ctx1, {});
+    const p1 = ctx1.events.find((e) => e.kind === 'feedback.applied')!.payload as {
+      added: string[];
+      already_present: string[];
+    };
+    assert.deepEqual(p1.added, ['a@x.com', 'b@y.com'], '首次全部 added');
+    assert.deepEqual(p1.already_present, [], '首次无 already_present');
+    assert.deepEqual(readFileSync(overlay, 'utf8').trim().split('\n').sort(), ['a@x.com', 'b@y.com'], 'overlay 文件含并集');
+
+    // 重发同一 add：幂等 → added=[]、already_present=全部、文件不变。
+    const ctx2 = makeCtx('apply-feedback');
+    ctx2.input = { add: ['a@x.com', 'b@y.com'] };
+    await run(ctx2, {});
+    const p2 = ctx2.events.find((e) => e.kind === 'feedback.applied')!.payload as {
+      added: string[];
+      already_present: string[];
+    };
+    assert.deepEqual(p2.added, [], '重发 → added=[]（set-union 幂等）');
+    assert.deepEqual(p2.already_present.sort(), ['a@x.com', 'b@y.com'], '重发 → already_present=全部');
+    assert.deepEqual(readFileSync(overlay, 'utf8').trim().split('\n').sort(), ['a@x.com', 'b@y.com'], '文件不变');
+
+    // 增量 apply：部分新增、部分已在；42/空白丢弃、C@Z.COM 归一后与 c 去重。
+    const ctx3 = makeCtx('apply-feedback');
+    ctx3.input = { add: ['b@y.com', 'c@z.com', 42, '  ', 'C@Z.COM'] };
+    await run(ctx3, {});
+    const p3 = ctx3.events.find((e) => e.kind === 'feedback.applied')!.payload as {
+      added: string[];
+      already_present: string[];
+    };
+    assert.deepEqual(p3.added, ['c@z.com'], '仅 c 新增（非串/空白丢弃、大小写归一去重）');
+    assert.deepEqual(p3.already_present, ['b@y.com'], 'b 已在');
+    assert.deepEqual(
+      readFileSync(overlay, 'utf8').trim().split('\n').sort(),
+      ['a@x.com', 'b@y.com', 'c@z.com'],
+      'overlay 增量并集',
+    );
+  } finally {
+    if (prevEnv === undefined) {
+      delete process.env.NOISE_OVERLAY_FILE;
+    } else {
+      process.env.NOISE_OVERLAY_FILE = prevEnv;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
