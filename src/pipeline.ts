@@ -21,10 +21,13 @@
 // STATE_BY_KIND（events.ts）——否则 appendEvent 遇生命周期 kind 会误移状态。外部 pilot 不 import
 // @hangar/core，此约束由命名纪律 + 本注释守（待解问题 R3 CR-n1）。
 
+import { renameSync, writeFileSync } from 'node:fs';
+
 import type { Logger } from 'pino';
 
 import { loadConfig } from './config/config.js';
-import { PrismaMailRepo, type MailRepo } from './repo/mailRepo.js';
+import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
+import { readNoiseOverlay, resolveNoiseOverlayPath } from './rules/rulesConfig.js';
 import { loadEnabledAccounts } from './accounts/accountRegistry.js';
 import type { Account } from './providers/provider.js';
 import { ProviderReauthRequired } from './providers/provider.js';
@@ -274,8 +277,17 @@ export async function run(ctx: RunContext, overrides?: RunOverrides): Promise<vo
     await runPoll(ctx, overrides);
     return;
   }
+  // noise-feedback 反馈闭环（跨 repo 契约 add-view-command-path）：interpret 干跑解析（无写）、apply 幂等落 overlay。
+  if (ctx.trigger === 'interpret-feedback') {
+    await runInterpretFeedback(ctx, overrides);
+    return;
+  }
+  if (ctx.trigger === 'apply-feedback') {
+    await runApplyFeedback(ctx, overrides);
+    return;
+  }
   throw new Error(
-    `inbox pipeline: unknown trigger '${String(ctx.trigger)}' — expected 'poll'/'digest' (check app.yaml trigger name)`,
+    `inbox pipeline: unknown trigger '${String(ctx.trigger)}' — expected 'poll'/'digest'/'interpret-feedback'/'apply-feedback' (check app.yaml trigger name)`,
   );
 }
 
@@ -295,6 +307,115 @@ async function runDigest(ctx: RunContext, overrides?: RunOverrides): Promise<voi
     now: () => new Date(now()),
     emit: (kind, payload) => ctx.emit(kind, payload),
   });
+}
+
+/**
+ * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何写、不 throw**。
+ * 取最近高频发件人候选（复用 buildDigest 同源的 `repo.countRecentSenders`，窗口 = now - NOISE_TOPN_WINDOW_DAYS），
+ * 对用户自然语言 text 做**确定性子串匹配**（无 LLM）→ 命中候选地址原文 add，emit interpretation.proposed。
+ * 输出恒为候选集子集（零幻觉）；误命中由后续 apply 前的**人工确认**兜住（interpret 只提议、不落地）。
+ */
+async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
+  const repo: MailRepo = overrides?.repo ?? new PrismaMailRepo();
+  const now: () => number = overrides?.now ?? (() => Date.now());
+  const text = readFeedbackText(ctx.input);
+  const since = new Date(now() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
+  const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
+  const add = matchNoiseCandidates(text, candidates.map((c) => c.fromEmail));
+  ctx.emit('interpretation.proposed', { add });
+}
+
+/** 从 ctx.input 读反馈自然语言（`{ text: string }`）；非对象/缺 text/非串 → 空串（当空处理）。 */
+function readFeedbackText(input: unknown): string {
+  if (input !== null && typeof input === 'object' && 'text' in input) {
+    const t = (input as { text: unknown }).text;
+    if (typeof t === 'string') {
+      return t;
+    }
+  }
+  return '';
+}
+
+/**
+ * 确定性候选匹配（无 LLM）：text 按非字母数字切 token、小写、只留长度≥3；对每个候选地址（小写），
+ * 任一 token 是其子串 → 命中（域名是完整地址的连续子串，故整地址 `includes` 已覆盖「匹配地址或其域名」）。
+ * 返回去重命中的**候选地址原文**（保候选顺序）。中文虚词经 `[^a-z0-9]+` 切分被剔除，故不匹配。
+ * // ponytail: 通用短 token（如 "com"）可过匹配——设计上由 apply 前人工确认兜住，非本层职责
+ */
+function matchNoiseCandidates(text: string, candidates: readonly string[]): string[] {
+  const tokens = text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length >= 3);
+  if (tokens.length === 0) {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const addr of candidates) {
+    const lower = addr.toLowerCase();
+    if (!seen.has(addr) && tokens.some((tok) => lower.includes(tok))) {
+      seen.add(addr);
+      out.push(addr);
+    }
+  }
+  return out;
+}
+
+/**
+ * apply-feedback 触发（noise-feedback 契约）：把确认后的 add **幂等**并入 overlay 机器文件、**只写 overlay**。
+ * add 过滤为字符串（非串丢弃）+ trim+lower+丢空归一（同 loader ingest，使并集去重成立）；读现有 overlay
+ * （缺失/读错误→空，overlay 机器可再生）；`added` = 不在现有集的、`already_present` = 已在的（set-union 幂等）；
+ * 原子写 tmp+rename（**绝不碰 rules.yaml**）；emit feedback.applied。重发安全：同一 add 再 apply → added=[]。
+ */
+async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Promise<void> {
+  const add = normalizeFeedbackAdd(ctx.input);
+  const overlayPath = resolveNoiseOverlayPath();
+  const existing = new Set<string>(readNoiseOverlay(overlayPath));
+  const added: string[] = [];
+  const alreadyPresent: string[] = [];
+  const seenInput = new Set<string>();
+  for (const s of add) {
+    if (seenInput.has(s)) {
+      continue; // 同一 add 内去重（避免同一地址重复计入 added/already_present）。
+    }
+    seenInput.add(s);
+    if (existing.has(s)) {
+      alreadyPresent.push(s);
+    } else {
+      existing.add(s);
+      added.push(s);
+    }
+  }
+  writeNoiseOverlayAtomic(overlayPath, existing);
+  ctx.emit('feedback.applied', { added, already_present: alreadyPresent });
+}
+
+/** 从 ctx.input 读确认后的 add（`{ add: string[] }`）：非数组→空；过滤非串；trim+lower+丢空归一。 */
+function normalizeFeedbackAdd(input: unknown): string[] {
+  const raw =
+    input !== null && typeof input === 'object' && 'add' in input
+      ? (input as { add: unknown }).add
+      : undefined;
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .filter((s): s is string => typeof s === 'string')
+    .map((s) => s.trim().toLowerCase())
+    .filter((s) => s.length > 0);
+}
+
+/**
+ * 原子写 overlay（同盘 tmp+rename 原子发布）：写 `<overlay>.tmp` 再 renameSync 覆盖 overlay。
+ * 一行一个发件人（无注释纯机器文件）；空集 → 空文件。**绝不碰 rules.yaml**。
+ */
+function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>): void {
+  const list = [...entries];
+  const body = list.length > 0 ? list.join('\n') + '\n' : '';
+  const tmp = overlayPath + '.tmp';
+  writeFileSync(tmp, body, 'utf8');
+  renameSync(tmp, overlayPath);
 }
 
 /**

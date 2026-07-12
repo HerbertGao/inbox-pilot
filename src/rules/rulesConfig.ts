@@ -17,6 +17,7 @@
 //     非 strict、未知键（含凭据形态键）静默丢弃；禁止枚举被丢弃键名（键本身可能是密钥）、至多记数量。
 
 import { readFileSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parse as parseYaml } from 'yaml';
@@ -57,6 +58,48 @@ function resolveRulesPath(): string {
   return fromEnv !== undefined && fromEnv !== '' ? fromEnv : DEFAULT_RULES_PATH;
 }
 
+/**
+ * noise overlay 机器文件路径：默认与 rules.yaml 同目录的 `noise_senders.overlay`，env NOISE_OVERLAY_FILE 覆盖。
+ * apply-feedback（pipeline）**写**、本 loader **读**，共用此单一路径来源；rulesPath 参使 buildAndPublish
+ * 传入的 rules.yaml 路径与其 overlay 同目录（测试传 tmp path 时 overlay 亦落 tmp）。
+ */
+export function resolveNoiseOverlayPath(rulesPath: string = resolveRulesPath()): string {
+  const fromEnv = process.env.NOISE_OVERLAY_FILE;
+  if (fromEnv !== undefined && fromEnv !== '') {
+    return fromEnv;
+  }
+  return join(dirname(rulesPath), 'noise_senders.overlay');
+}
+
+/**
+ * 读机器生成的 noise overlay（apply-feedback 写、本 loader 读）：一行一个发件人，trim+lower+丢空归一
+ * （同 rules.yaml noise_senders 的 ingest 纪律，使并集去重成立）。绝不崩/绝不泄露：≤256KB（超限忽略）；
+ * 缺失→空（overlay 可选、缺失是常态，不记日志）；读错误→空 + 脱敏日志（只 kind、不记内容/路径）。
+ */
+export function readNoiseOverlay(path: string): string[] {
+  let size: number;
+  try {
+    size = statSync(path).size;
+  } catch {
+    return []; // 不存在等：overlay 可选，缺失是常态（不记日志）。
+  }
+  if (size > MAX_RULES_FILE_BYTES) {
+    logSink.warn({ kind: 'noise-overlay-too-large' }, 'noise overlay 超限，忽略 overlay（用现有 noiseSenders）');
+    return [];
+  }
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
+    return [];
+  }
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim().toLowerCase())
+    .filter((l) => l.length > 0);
+}
+
 // —— zod schema（每项独立校验，使「某项非法仅该项回落、其余生效」成立）——
 // 关键：**不**做整对象 safeParse——否则某项非法会使整对象校验失败、连累合法项一起回落，
 // 违背「仅该项回落」语义。改为：顶层只确认是 object（按名只读五类已知键、未知键不读 = 丢弃），
@@ -93,7 +136,10 @@ type LastValid = {
   vipSenders: readonly string[];
   importantDomains: readonly string[];
   marketingKeywords: readonly string[];
+  /** operator 经 rules.yaml 手配的 noise_senders（carry-forward 源）；overlay 单列（下）。 */
   noiseSenders: readonly string[];
+  /** 机器生成的 noise overlay（apply-feedback 写、每次 buildAndPublish 从文件重读；缺失/坏→空）。 */
+  noiseOverlay: readonly string[];
 };
 
 function builtinLastValid(): LastValid {
@@ -104,6 +150,7 @@ function builtinLastValid(): LastValid {
     importantDomains: [],
     marketingKeywords: [],
     noiseSenders: [],
+    noiseOverlay: [],
   };
 }
 
@@ -117,21 +164,27 @@ function assembleActive(last: LastValid): ActiveRules {
     vipSenders: Object.freeze([...last.vipSenders]),
     importantDomains: Object.freeze([...last.importantDomains]),
     marketingKeywords: Object.freeze([...last.marketingKeywords]),
-    noiseSenders: Object.freeze([...last.noiseSenders]),
+    // 有效 noiseSenders = rules.yaml noise_senders ∪ overlay（去重、YAML 在前）——apply-feedback 增量经 overlay 生效。
+    noiseSenders: Object.freeze(unionLists(last.noiseSenders, last.noiseOverlay)),
   });
 }
 
-/** security 整集并集：整个内置常量 ∪ YAML（去重、保持确定顺序：内置在前、YAML 新增在后）。 */
-function unionSecurity(yamlWords: readonly string[]): readonly string[] {
-  const seen = new Set<string>(SECURITY_PAYMENT_KEYWORDS);
-  const out: string[] = [...SECURITY_PAYMENT_KEYWORDS];
-  for (const w of yamlWords) {
+/** 通用有序去重并集：a 在前、b 中未见者按序追加（security ∪ YAML、noise_senders ∪ overlay 共用）。 */
+function unionLists(a: readonly string[], b: readonly string[]): string[] {
+  const seen = new Set<string>(a);
+  const out: string[] = [...a];
+  for (const w of b) {
     if (!seen.has(w)) {
       seen.add(w);
       out.push(w);
     }
   }
   return out;
+}
+
+/** security 整集并集：整个内置常量 ∪ YAML（去重、内置在前、YAML 新增在后）。 */
+function unionSecurity(yamlWords: readonly string[]): readonly string[] {
+  return unionLists(SECURITY_PAYMENT_KEYWORDS, yamlWords);
 }
 
 // —— 模块内可变状态（单一权威 ref + carry-forward 源）——
@@ -224,14 +277,16 @@ function loadFile(path: string): LoadOutcome {
  */
 function buildAndPublish(path: string): void {
   const prev = lastValid;
+  // overlay 独立于 rules.yaml、每次加载/重载从文件重读（apply-feedback 增量随之纳入）；缺失/坏→空、绝不崩。
+  // 与 rules.yaml 结果无关地先读，使「rules.yaml 坏但 overlay 在」仍能纳入 overlay。
+  const noiseOverlay = readNoiseOverlay(resolveNoiseOverlayPath(path));
   const outcome = loadFile(path);
 
   if (!outcome.ok) {
-    // 整文件读取/解析/shape 失败 → 全字段 carry-forward（退化情形，不回落空/builtin 丢 operator 守卫）。
-    // 记脱敏日志：只 kind；绝不记路径/文件内容/err 字段。
+    // 整文件读取/解析/shape 失败 → rules.yaml 各字段 carry-forward（退化情形，不回落空/builtin 丢 operator 守卫），
+    // overlay 仍用本次重读值。记脱敏日志：只 kind；绝不记路径/文件内容/err 字段。
     logSink.warn({ kind: 'rules-config-load-failed', cause: outcome.kind }, 'rules.yaml 加载失败，全字段 carry-forward');
-    // 候选 = prev（全 carry-forward）；与当前一致时 ref 切换是无害的等价替换。
-    publish(prev);
+    publish({ ...prev, noiseOverlay });
     return;
   }
 
@@ -244,6 +299,7 @@ function buildAndPublish(path: string): void {
     importantDomains: resolveField('important_domains', obj.important_domains, prev.importantDomains),
     marketingKeywords: resolveField('marketing_keywords', obj.marketing_keywords, prev.marketingKeywords),
     noiseSenders: resolveField('noise_senders', obj.noise_senders, prev.noiseSenders),
+    noiseOverlay,
   };
 
   publish(candidate);
