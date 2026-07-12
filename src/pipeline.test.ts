@@ -894,6 +894,24 @@ test('nf① interpret-feedback: token 命中 → add=命中候选子集（去重
   assert.ok(add.every((a) => candidateSet.has(a)), '输出⊆候选集（零幻觉）');
 });
 
+test('nf①b interpret-feedback: 只匹配 digest 展示的 TOP-N（第 6 位候选被 slice 排除）', async () => {
+  const repo = senderRepo([
+    { fromEmail: 'notifications@github.com', count: 61 }, // TOP-5 内(第 1)
+    { fromEmail: 'mon@alibabacloud.com', count: 8 },
+    { fromEmail: 'x@cloudflare.com', count: 7 },
+    { fromEmail: 'y@pixiv.net', count: 4 },
+    { fromEmail: 'z@example.com', count: 3 }, // TOP-5 边界(第 5)
+    { fromEmail: 'noreply@github.com', count: 2 }, // 第 6 —— slice(0, NOISE_TOPN) 排除
+  ]);
+  const ctx = makeCtx('interpret-feedback');
+  ctx.input = { text: '把 github 加进降噪' };
+
+  await run(ctx, { repo });
+
+  const add = (ctx.events.find((e) => e.kind === 'interpretation.proposed')!.payload as { add: string[] }).add;
+  assert.deepEqual(add, ['notifications@github.com'], '只命中 TOP-5 内的 github;第 6 位 noreply@github.com 被 slice 排除');
+});
+
 test('nf② interpret-feedback: 纯中文虚词（无 ascii token≥3）→ add=[]（切分剔除、无副作用）', async () => {
   const repo = senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]);
   const ctx = makeCtx('interpret-feedback');

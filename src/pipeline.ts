@@ -50,6 +50,7 @@ import { applySafetyRules } from './rules/applySafetyRules.js';
 import { executeActions } from './actions/executeActions.js';
 import { defaultNotifier, type Notifier } from './notify/notifier.js';
 import { runDigestOnce } from './digest/digestScheduler.js';
+import { NOISE_TOPN } from './digest/buildDigest.js';
 
 /**
  * **本地结构化 RunContext**（R10/M6）：外部 pilot 不 import @hangar/core 的类型——用本地结构 type，
@@ -311,8 +312,8 @@ async function runDigest(ctx: RunContext, overrides?: RunOverrides): Promise<voi
 
 /**
  * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何写、不 throw**。
- * 取最近高频发件人候选（复用 buildDigest 同源的 `repo.countRecentSenders`，窗口 = now - NOISE_TOPN_WINDOW_DAYS），
- * 对用户自然语言 text 做**确定性子串匹配**（无 LLM）→ 命中候选地址原文 add，emit interpretation.proposed。
+ * 取最近高频发件人候选（复用 buildDigest 同源的 `repo.countRecentSenders`，窗口 = now - NOISE_TOPN_WINDOW_DAYS，
+ * **并同 digest 只取计数降序 TOP-N**），对用户自然语言 text 做**确定性子串匹配**（无 LLM）→ 命中候选地址原文 add，emit interpretation.proposed。
  * 输出恒为候选集子集（零幻觉）；误命中由后续 apply 前的**人工确认**兜住（interpret 只提议、不落地）。
  */
 async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
@@ -321,7 +322,8 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
   const text = readFeedbackText(ctx.input);
   const since = new Date(now() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
-  const add = matchNoiseCandidates(text, candidates.map((c) => c.fromEmail));
+  // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
+  const add = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
   ctx.emit('interpretation.proposed', { add });
 }
 
