@@ -4,9 +4,10 @@
 //   - 假渠道注入 createNotifier({channel})：notifyDigest 把**预组装文本**原样透传给
 //     channel.sendText、返回 { outcome:'sent' }（不再投影 per-email payload）。
 //   - 渠道 sendText 失败 → notifyDigest 返回 failed（脱敏 error），不抛。
-//   - 无渠道（且无 TELEGRAM_* 配置）→ skipped 降级。本仓 .env 带 TELEGRAM_*，故经
-//     子进程清空 TELEGRAM_* 跑真实 createNotifier()→telegramChannelFromConfig()→undefined
-//     路径，确定性命中 no-channel 分支（与其它测试「绝不触达真实通道」同一纪律）。
+//   - 无渠道（resolver 解析不出目的地）→ skipped 降级。telegramChannelFromConfig 现读
+//     hangar-notify resolver，故经子进程把 HANGAR_NOTIFY_CONFIG 指向不存在的文件跑真实
+//     createNotifier()→telegramChannelFromConfig()→undefined 路径，确定性命中 no-channel
+//     分支（与其它测试「绝不触达真实通道」同一纪律）。
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
@@ -66,11 +67,12 @@ test('notifyDigest：渠道 sendText 失败 → 返回 failed（脱敏 error）�
   assert.equal(result.outcome === 'failed' ? result.error : undefined, 'telegram-http-500');
 });
 
-test('notifyDigest：无渠道（无 TELEGRAM_* 配置）→ skipped 降级', () => {
-  // 本仓 .env 带 TELEGRAM_*，进程内 createNotifier() 会构出真实渠道；故在清空 TELEGRAM_*
-  // 的子进程里跑真实 createNotifier()→telegramChannelFromConfig()→undefined 的 no-channel 分支，
-  // 确定性命中 skipped（不依赖、也绝不触达真实 telegram）。结果以 RESULT: 前缀打印，
-  // 与 pino 日志行（默认 stdout）区隔，避免脆弱的「取末行」解析。
+test('notifyDigest：无渠道（resolver 无 inbox 目的地）→ skipped 降级', () => {
+  // telegramChannelFromConfig 现读 hangar-notify resolver；进程内可能存在约定默认
+  // channels.yaml，故在子进程里把 HANGAR_NOTIFY_CONFIG 指向不存在的文件（config-missing →
+  // resolve 返回 undefined），确定性命中真实 createNotifier()→telegramChannelFromConfig()→
+  // undefined 的 no-channel 分支 → skipped（不依赖、也绝不触达真实 telegram）。结果以 RESULT:
+  // 前缀打印，与 pino 日志行（默认 stdout）区隔，避免脆弱的「取末行」解析。
   const notifierHref = new URL('./notifier.js', import.meta.url).href;
   const repoRoot = fileURLToPath(new URL('../../', import.meta.url));
   const script = `
@@ -81,7 +83,7 @@ test('notifyDigest：无渠道（无 TELEGRAM_* 配置）→ skipped 降级', ()
   `;
   const out = execFileSync(process.execPath, ['--import', 'tsx', '-e', script], {
     cwd: repoRoot,
-    env: { ...process.env, TELEGRAM_BOT_TOKEN: '', TELEGRAM_CHAT_ID: '' },
+    env: { ...process.env, HANGAR_NOTIFY_CONFIG: '/nonexistent/channels.yaml' },
     encoding: 'utf8',
   });
 

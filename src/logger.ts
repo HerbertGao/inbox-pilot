@@ -38,6 +38,9 @@ export const REDACT_PATHS: string[] = [
       '*.GMAIL_CLIENT_SECRET',
       'TELEGRAM_BOT_TOKEN',
       '*.TELEGRAM_BOT_TOKEN',
+      // TG_BOT_INBOX 是当前生效的 bot token 来源（resolver 从 env 读取此变量）。
+      'TG_BOT_INBOX',
+      '*.TG_BOT_INBOX',
       // CHAT_ID 非密钥（泄露无法冒充 bot），但 notifications spec 把 TELEGRAM_* 并列为凭据、
       // 要求失败日志禁含；当前 chat_id 结构上不入任何日志，此处为与 spec 措辞一致的兜底。
       'TELEGRAM_CHAT_ID',

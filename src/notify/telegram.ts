@@ -2,10 +2,12 @@
 //
 // 硬约束（spec「仅推送通知，绝不发送邮件」「通知密钥只从配置读、不入日志」「不泄露完整正文」）：
 //   1. 只 POST 到 Telegram sendMessage——绝不调用任何邮件发送/回复 API。
-//   2. token / chat_id 只从 config 读、禁写死；失败 error 摘要禁含 token/chat_id/正文。
+//   2. bot token 经 hangar-notify resolver 从 env 读、chat_id 从 channels.yaml 读，均禁写死；失败 error 摘要禁含 token/chat_id/正文。
 //   3. 渠道入参只接 NotificationPayload（白名单字段），textBody/htmlBody 结构上无法进入。
 
-import { config } from '../config/config.js';
+import { resolveWithReason } from 'hangar-notify';
+
+import { logger } from '../logger.js';
 import { CATEGORY_LABELS } from './categoryLabels.js';
 import type { NotificationChannel, NotificationPayload } from './notifier.js';
 
@@ -137,16 +139,25 @@ export function createTelegramChannel(args: {
 }
 
 /**
- * 默认从 config 构造 telegram 渠道；TELEGRAM_* 任一缺失返回 undefined（交由 notifier 降级）。
- * 凭据只从 config 读、禁写死。
+ * 默认从 hangar-notify resolver 取 telegram 目的地（inbox/private lane）；解析不出返回
+ * undefined（交由 notifier 降级）。传输一行不改——只换凭据/目的地来源。
+ * 凭据（bot token）经 resolver 从 env 读、禁写死；ERROR 日志只带 reason+varName，绝不带 token 值。
  */
 export function telegramChannelFromConfig(): NotificationChannel | undefined {
-  const botToken = config.TELEGRAM_BOT_TOKEN;
-  const chatId = config.TELEGRAM_CHAT_ID;
-  if (botToken === undefined || botToken.length === 0 || chatId === undefined || chatId.length === 0) {
-    return undefined;
+  const { destination, failure } = resolveWithReason('inbox', 'private');
+  if (destination === undefined) {
+    // present-but-invalid config (bad token shape / malformed yaml) → ERROR: a real
+    // misconfig, not just "unconfigured". absent → silent degrade (design D5/D6).
+    // NEVER logs the token value — only the stable reason + the env var NAME.
+    if (failure.severity === 'error') {
+      logger.error(
+        { kind: 'notify-config-invalid', reason: failure.reason, varName: failure.varName },
+        '通知配置无效，降级跳过推送',
+      );
+    }
+    return undefined; // notifier degrades to skipped (unchanged behavior)
   }
-  return createTelegramChannel({ botToken, chatId });
+  return createTelegramChannel(destination);
 }
 
 /** 取错误的类名做脱敏摘要（fetch 失败的 message 可能内嵌含 token 的 URL，故只取 name）。 */
