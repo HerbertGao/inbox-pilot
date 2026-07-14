@@ -17,39 +17,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      # inbox depends on hangar-notify via `file:../hangar/packages/notify`; both repos
-      # are checked out as siblings so that relative path resolves, and hangar-notify is
-      # built (its `main` is dist/, which is gitignored) before inbox installs/loads it.
       - uses: actions/checkout@v7
         with:
-          path: inbox-pilot
-          persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          repository: HerbertGao/hangar
-          path: hangar
           persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
       - run: corepack enable
-      - name: "Build hangar-notify (inbox's file: dependency)"
-        working-directory: hangar
-        run: |
-          pnpm install --frozen-lockfile --filter hangar-notify
-          pnpm --filter hangar-notify build
       - run: pnpm install --frozen-lockfile
-        working-directory: inbox-pilot
       - run: pnpm exec prisma validate
-        working-directory: inbox-pilot
         # prisma validate resolves env("DATABASE_URL") but does not connect; a placeholder satisfies it.
         env:
           DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
       - run: pnpm build
-        working-directory: inbox-pilot
       # Run the notify integration tests (wire parity: no parse_mode / literal bytes;
-      # ERROR-branch: token never logged) against the freshly-built hangar-notify dist.
-      # A postgres-free subset — the full `pnpm test` suite needs a DB, which is why the
-      # original CI ran build only; these src/notify/*.test.ts do not.
+      # ERROR-branch: token never logged). A postgres-free subset — the full `pnpm test`
+      # suite needs a DB, which is why the original CI ran build only; these do not.
       - run: pnpm exec tsx --test 'src/notify/*.test.ts'
-        working-directory: inbox-pilot

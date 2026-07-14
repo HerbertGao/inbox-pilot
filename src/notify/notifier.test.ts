@@ -5,7 +5,7 @@
 //     channel.sendText、返回 { outcome:'sent' }（不再投影 per-email payload）。
 //   - 渠道 sendText 失败 → notifyDigest 返回 failed（脱敏 error），不抛。
 //   - 无渠道（resolver 解析不出目的地）→ skipped 降级。telegramChannelFromConfig 现读
-//     hangar-notify resolver，故经子进程把 HANGAR_NOTIFY_CONFIG 指向不存在的文件跑真实
+//     @herbertgao/hangar-notify resolver，故经子进程把 HANGAR_NOTIFY_CONFIG 指向不存在的文件跑真实
 //     createNotifier()→telegramChannelFromConfig()→undefined 路径，确定性命中 no-channel
 //     分支（与其它测试「绝不触达真实通道」同一纪律）。
 
@@ -68,7 +68,7 @@ test('notifyDigest：渠道 sendText 失败 → 返回 failed（脱敏 error）�
 });
 
 test('notifyDigest：无渠道（resolver 无 inbox 目的地）→ skipped 降级', () => {
-  // telegramChannelFromConfig 现读 hangar-notify resolver；进程内可能存在约定默认
+  // telegramChannelFromConfig 现读 @herbertgao/hangar-notify resolver；进程内可能存在约定默认
   // channels.yaml，故在子进程里把 HANGAR_NOTIFY_CONFIG 指向不存在的文件（config-missing →
   // resolve 返回 undefined），确定性命中真实 createNotifier()→telegramChannelFromConfig()→
   // undefined 的 no-channel 分支 → skipped（不依赖、也绝不触达真实 telegram）。结果以 RESULT:

@@ -41,7 +41,7 @@ export const REDACT_PATHS: string[] = [
       // TG_BOT_INBOX 是当前生效的 bot token 来源（resolver 从 env 读取此变量）。
       'TG_BOT_INBOX',
       '*.TG_BOT_INBOX',
-      // botToken 是 hangar-notify resolver 返回密钥的对象键（{ botToken, chatId }）——
+      // botToken 是 @herbertgao/hangar-notify resolver 返回密钥的对象键（{ botToken, chatId }）——
       // env 名 redact 挡不住「调用方日志记录了 Destination 对象」这条路（CodeRabbit review）。
       'botToken',
       '*.botToken',

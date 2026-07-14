@@ -2,10 +2,10 @@
 //
 // 硬约束（spec「仅推送通知，绝不发送邮件」「通知密钥只从配置读、不入日志」「不泄露完整正文」）：
 //   1. 只 POST 到 Telegram sendMessage——绝不调用任何邮件发送/回复 API。
-//   2. bot token 经 hangar-notify resolver 从 env 读、chat_id 从 channels.yaml 读，均禁写死；失败 error 摘要禁含 token/chat_id/正文。
+//   2. bot token 经 @herbertgao/hangar-notify resolver 从 env 读、chat_id 从 channels.yaml 读，均禁写死；失败 error 摘要禁含 token/chat_id/正文。
 //   3. 渠道入参只接 NotificationPayload（白名单字段），textBody/htmlBody 结构上无法进入。
 
-import { resolveWithReason } from 'hangar-notify';
+import { resolveWithReason } from '@herbertgao/hangar-notify';
 
 import { logger } from '../logger.js';
 import { CATEGORY_LABELS } from './categoryLabels.js';
@@ -139,7 +139,7 @@ export function createTelegramChannel(args: {
 }
 
 /**
- * 默认从 hangar-notify resolver 取 telegram 目的地（inbox/private lane）；解析不出返回
+ * 默认从 @herbertgao/hangar-notify resolver 取 telegram 目的地（inbox/private lane）；解析不出返回
  * undefined（交由 notifier 降级）。传输一行不改——只换凭据/目的地来源。
  * 凭据（bot token）经 resolver 从 env 读、禁写死；ERROR 日志只带 reason+varName，绝不带 token 值。
  */

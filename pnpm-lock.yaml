@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@herbertgao/hangar-notify':
+        specifier: ^0.1.0
+        version: 0.1.0
       '@prisma/client':
         specifier: ^6.1.0
         version: 6.19.3(prisma@6.19.3(typescript@6.0.3))(typescript@6.0.3)
@@ -23,9 +26,6 @@ importers:
       googleapis:
         specifier: ^173.0.0
         version: 173.0.0
-      hangar-notify:
-        specifier: file:../hangar/packages/notify
-        version: file:../hangar/packages/notify
       imapflow:
         specifier: ^1.4.3
         version: 1.4.3
@@ -236,6 +236,11 @@ packages:
 
   '@fastify/proxy-addr@5.1.0':
     resolution: {integrity: sha512-INS+6gh91cLUjB+PVHfu1UqcB76Sqtpyp7bnL+FYojhjygvOPA9ctiD/JDKsyD9Xgu4hUhCSJBPig/w7duNajw==}
+
+  '@herbertgao/hangar-notify@0.1.0':
+    resolution: {integrity: sha512-318inlUtfLPp+Om0z9Us1p4X30z0nm34n+X8tgGVnZz6Z7w5uYMBRfdljtQsQMzbmWgcf5A+RDgkfPSzHC4QPA==}
+    engines: {node: '>=22.18.0'}
+    hasBin: true
 
   '@isaacs/cliui@8.0.2':
     resolution: {integrity: sha512-O8jcjabXaleOG9DQ0+ARXWZBTfnP4WNAqzuiJK7ll44AmxGKv/J2M4TPjxjY3znBCfvBXFzucm1twdyFybFqEA==}
@@ -588,11 +593,6 @@ packages:
   gtoken@8.0.0:
     resolution: {integrity: sha512-+CqsMbHPiSTdtSO14O51eMNlrp9N79gmeqmXeouJOhfucAedHw9noVe/n5uJk3tbKE6a+6ZCQg3RPhVhHByAIw==}
     engines: {node: '>=18'}
-
-  hangar-notify@file:../hangar/packages/notify:
-    resolution: {directory: ../hangar/packages/notify, type: directory}
-    engines: {node: '>=22.18.0'}
-    hasBin: true
 
   has-symbols@1.1.0:
     resolution: {integrity: sha512-1cDNdwJ2Jaohmb3sg4OmKaMBwuC48sYni5HUw2DvsC8LjGTLK9h+eb1X6RyuOHe4hT0ULCW68iomhjUoKUqlPQ==}
@@ -1056,6 +1056,11 @@ snapshots:
       '@fastify/forwarded': 3.0.1
       ipaddr.js: 2.4.0
 
+  '@herbertgao/hangar-notify@0.1.0':
+    dependencies:
+      yaml: 2.9.0
+      zod: 4.4.3
+
   '@isaacs/cliui@8.0.2':
     dependencies:
       string-width: 5.1.2
@@ -1490,11 +1495,6 @@ snapshots:
       jws: 4.0.1
     transitivePeerDependencies:
       - supports-color
-
-  hangar-notify@file:../hangar/packages/notify:
-    dependencies:
-      yaml: 2.9.0
-      zod: 4.4.3
 
   has-symbols@1.1.0: {}
 
