@@ -8,11 +8,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v6
         with:
           node-version: 24
@@ -23,3 +30,7 @@ jobs:
         env:
           DATABASE_URL: postgresql://placeholder:placeholder@localhost:5432/placeholder
       - run: pnpm build
+      # Run the notify integration tests (wire parity: no parse_mode / literal bytes;
+      # ERROR-branch: token never logged). A postgres-free subset — the full `pnpm test`
+      # suite needs a DB, which is why the original CI ran build only; these do not.
+      - run: pnpm exec tsx --test 'src/notify/*.test.ts'

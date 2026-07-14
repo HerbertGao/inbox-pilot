@@ -104,7 +104,7 @@ function sanitizeChannelError(error: string): string {
  * 否则降级——记一条结构化日志（不含凭据/正文）并返回 skipped，不抛、不崩。
  *
  * 渠道解析采用「构造时一次性解析」：channel 为 NotificationChannel 时直接用；
- * 为 undefined（默认）时调 telegramChannelFromConfig()（TELEGRAM_* 缺失则得 undefined → 降级）。
+ * 为 undefined（默认）时调 telegramChannelFromConfig()（resolver 无目的地则得 undefined → 降级）。
  */
 export function createNotifier(args?: {
   readonly channel?: NotificationChannel;

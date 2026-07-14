@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@herbertgao/hangar-notify':
+        specifier: ^0.1.0
+        version: 0.1.0
       '@prisma/client':
         specifier: ^6.1.0
         version: 6.19.3(prisma@6.19.3(typescript@6.0.3))(typescript@6.0.3)
@@ -233,6 +236,11 @@ packages:
 
   '@fastify/proxy-addr@5.1.0':
     resolution: {integrity: sha512-INS+6gh91cLUjB+PVHfu1UqcB76Sqtpyp7bnL+FYojhjygvOPA9ctiD/JDKsyD9Xgu4hUhCSJBPig/w7duNajw==}
+
+  '@herbertgao/hangar-notify@0.1.0':
+    resolution: {integrity: sha512-318inlUtfLPp+Om0z9Us1p4X30z0nm34n+X8tgGVnZz6Z7w5uYMBRfdljtQsQMzbmWgcf5A+RDgkfPSzHC4QPA==}
+    engines: {node: '>=22.18.0'}
+    hasBin: true
 
   '@isaacs/cliui@8.0.2':
     resolution: {integrity: sha512-O8jcjabXaleOG9DQ0+ARXWZBTfnP4WNAqzuiJK7ll44AmxGKv/J2M4TPjxjY3znBCfvBXFzucm1twdyFybFqEA==}
@@ -1047,6 +1055,11 @@ snapshots:
     dependencies:
       '@fastify/forwarded': 3.0.1
       ipaddr.js: 2.4.0
+
+  '@herbertgao/hangar-notify@0.1.0':
+    dependencies:
+      yaml: 2.9.0
+      zod: 4.4.3
 
   '@isaacs/cliui@8.0.2':
     dependencies:
