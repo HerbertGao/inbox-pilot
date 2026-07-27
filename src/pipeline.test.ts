@@ -6,7 +6,8 @@
 // spy 计到的真实 classify 调用数。
 
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -24,7 +25,13 @@ import type { ProviderActions } from './actions/providerActions.js';
 import { ProviderReauthRequired } from './providers/provider.js';
 import { GmailActionError } from './providers/gmail/gmailActions.js';
 import { applySafetyRules } from './rules/applySafetyRules.js';
-import { getActiveRules, reloadRulesConfigForTest, resetRulesConfigForTest } from './rules/rulesConfig.js';
+import {
+  checkEntry,
+  getActiveRules,
+  reloadRulesConfigForTest,
+  resetRulesConfigForTest,
+  resolveNoiseOverlayPath,
+} from './rules/rulesConfig.js';
 
 const ACCOUNT_ID = 'gmail:test@example.com';
 const NOW = Date.parse('2026-07-07T12:00:00.000Z');
@@ -896,6 +903,19 @@ test('nf① interpret-feedback: token 命中 → add=命中候选子集（去重
   assert.ok(add.every((a) => candidateSet.has(a)), '输出⊆候选集（零幻觉）');
 });
 
+test('nf①c interpret-feedback: countRecentSenders 抛错也不得逃逸（干跑腿契约是绝不 throw）', async () => {
+  // DB 抖动一次就让 interpret-feedback 变成 run.failed，把健康的 inbox 画成监控墙上的翻车。
+  const repo = {
+    async countRecentSenders(): Promise<SenderCount[]> {
+      throw new Error('db down');
+    },
+  } as unknown as MailRepo;
+  const ctx = makeCtx('interpret-feedback');
+  ctx.input = { text: '把 taobao 加进去降噪' };
+  await run(ctx, { repo });
+  assert.deepEqual(payloadOf(ctx, 'interpretation.proposed'), { add: [], remove: [] }, '退化为空提案，不 throw');
+});
+
 test('nf①b interpret-feedback: 只匹配 digest 展示的 TOP-N（第 6 位候选被 slice 排除）', async () => {
   const repo = senderRepo([
     { fromEmail: 'notifications@github.com', count: 61 }, // TOP-5 内(第 1)
@@ -946,7 +966,8 @@ test('nf③ interpret-feedback: input 非对象/缺 text/非串 → 当空、add
 const RULES_YAML_SENTINEL = 'noise_senders: []\n';
 
 /**
- * 临时 overlay 沙箱：env 指向 tmp 文件、同目录放一份 rules.yaml 哨兵。`seed` 为 null 表示 overlay 文件
+ * 临时 overlay 沙箱：`RULES_FILE` 指向 tmp 目录里的 rules.yaml 哨兵，overlay 路径由它**派生**
+ * （同目录 `noise_senders.overlay`），故沙箱只需这一个 env。`seed` 为 null 表示 overlay 文件
  * 不存在（首次 apply 的常态）。哨兵断言放在 `finally` 里——放 try 内会在 `fn` 抛出时被静默跳过。
  */
 async function withOverlay(
@@ -960,23 +981,19 @@ async function withOverlay(
   if (seed !== null) {
     writeFileSync(overlay, seed, 'utf8');
   }
-  const prevEnv = process.env.NOISE_OVERLAY_FILE;
   const prevRules = process.env.RULES_FILE;
-  process.env.NOISE_OVERLAY_FILE = overlay;
-  // **必须同时设 RULES_FILE**：否则 `resolveRulesPath()` 仍指向仓内真实 rules.yaml，沙箱里这份就是一个
-  // 生产代码从不命名的**诱饵**——那句哨兵断言无论生产代码做什么都不会红（round-3 的路径闸绕过就是从
-  // 这个缝里过的）。设了它，哨兵才真正守着「绝不碰人工维护的 rules.yaml」。
+  // 设 RULES_FILE 即同时把 overlay 关进沙箱（它由 rules 路径派生）。不设它则 `resolveRulesPath()` 仍指向
+  // 仓内真实 rules.yaml，沙箱里这份就是一个生产代码从不命名的**诱饵**——那句哨兵断言无论生产代码做什么
+  // 都不会红（round-3 的路径闸绕过就是从这个缝里过的）。设了它，哨兵才真正守着「绝不碰人工维护的 rules.yaml」。
   process.env.RULES_FILE = rulesYaml;
+  // 派生路径必须真的落在沙箱里：否则 `withOverlay(null, …)` 那几条不读文件的用例会把真实仓内
+  // rules/noise_senders.overlay 写脏而全绿。
+  assert.equal(resolveNoiseOverlayPath(), overlay, 'overlay 路径必须由 RULES_FILE 派生进沙箱');
   let sentinel: string | undefined;
   try {
     await fn(overlay, dir);
   } finally {
     sentinel = readFileSync(rulesYaml, 'utf8');
-    if (prevEnv === undefined) {
-      delete process.env.NOISE_OVERLAY_FILE;
-    } else {
-      process.env.NOISE_OVERLAY_FILE = prevEnv;
-    }
     if (prevRules === undefined) {
       delete process.env.RULES_FILE;
     } else {
@@ -1145,9 +1162,9 @@ test('nf⑧ apply 拒非法项与畸形 input；缺 key 视作 []（部署窗口
       'foo@', // 空域名
       '@b.com', // 空 local
       'a@@b.com', // 域名段含 @
-      'no-dot', // 无点的裸串不是域名
-      'a@x.1', // TLD 非纯字母
-      'a@x.c', // TLD 不足 2 位
+      'no-dot', // 无 @ 无点：既不是地址也不是域名
+      'com', // 裸 TLD：一条静音整个 .com
+      '<a@x.com>', // 已归一但匹配侧永不命中（尖括号会被 normalizeFromAddress 剥掉）
       'a b@x.com', // local 含空白
       'a@例子.com', // 非 ASCII（IDN v1 拒绝）
       'ctrl\u0001@x.com', // 控制字符（码位转义写，绝不贴字符本身）
@@ -1313,6 +1330,18 @@ test('nf⑮ overlay 读失败 → 写路径 fail-closed：apply 抛错不覆盖�
         { add: [], remove: [] },
         '读不到时空提案（确认键置灰），绝不提议一份 apply 会拒的 diff',
       );
+
+      // `{text}` 腿同纪律：它此前 emit 一份正常提案，用户确认后才在 apply 腿撞上 EACCES。
+      // 注意这条腿**不与 overlay 差分**（见 nf㉚），overlay 只用作写预算的字节基线——但「读不到」
+      // 依然必须退化为空提案。
+      const cText = makeCtx('interpret-feedback');
+      cText.input = { text: '把 taobao 加进降噪' };
+      await run(cText, { repo: senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]) });
+      assert.deepEqual(
+        payloadOf(cText, 'interpretation.proposed'),
+        { add: [], remove: [] },
+        '{text} 腿读不到 overlay 时同样空提案',
+      );
     } finally {
       chmodSync(overlay, 0o644);
     }
@@ -1349,10 +1378,11 @@ test('nf⑯ L = W：loader 认得的每一行都能经产品路径移除，且�
       assert.equal(payloadOf(ca, 'feedback.applied').removed.length, 3);
       assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n', '真的删掉了');
 
-      // 反向：同样的串走 add 仍被拒（只处理真正的邮箱）。
+      // 反向：走 add 侧要求可加入。`root@nas` 匹配侧命中，故**可**加入；
+      // `<alice@example.com>` 匹配侧永不命中（尖括号会被剥掉），故仍拒。
       const bad = makeCtx('apply-feedback');
-      bad.input = { add: ['root@nas'] };
-      await assert.rejects(run(bad, {}), /含不合规项/, 'add 侧仍要求可加入');
+      bad.input = { add: ['<alice@example.com>'] };
+      await assert.rejects(run(bad, {}), /含不合规项/, 'add 侧仍要求匹配侧能命中');
     } finally {
       resetRulesConfigForTest();
     }
@@ -1376,51 +1406,92 @@ test('nf⑰ 存量条目可移除：master 期写进去的不合新规条目不�
     assert.deepEqual(p.removed.sort(), ['admin@10.0.0.5', 'root@nas'], 'remove 只要求归一幂等，不要求可加入');
     assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n');
 
-    // 反向：同样的串走 add 仍必须被拒（只处理真正的邮箱）。
-    const bad = makeCtx('apply-feedback');
-    bad.input = { add: ['root@nas'] };
-    await assert.rejects(run(bad, {}), /含不合规项/, 'add 侧仍要求完整合法性');
+    // 反向：走 add 侧，这两个串**也**该被接受——它们在匹配侧本来就命中。
+    // 这正是上一版的功能回归：判据严于匹配侧，NAS/路由器发件人在 digest 里被展示为可加入、加却报错。
+    const ok = makeCtx('apply-feedback');
+    ok.input = { add: ['root@nas', 'admin@10.0.0.5'] };
+    await run(ok, {});
+    assert.deepEqual(payloadOf(ok, 'feedback.applied').added.sort(), ['admin@10.0.0.5', 'root@nas']);
   });
 });
 
-test('nf⑱ 只处理真正的邮箱：mailto:/comment/括号一律拒；VERP 与 SRS 收', async () => {
+test('nf⑱ 可加入 == 匹配侧能命中：拒永不命中的形态，收 VERP/SRS/内网地址', async () => {
   await withOverlay(null, async () => {
-    for (const bad of ['mailto:alice@example.com', 'a(b)c@x.com', 'a[b]@x.com', 'a\\b@x.com']) {
+    // 拒的理由只有一条：匹配侧的归一产不出这个串 → 写进去是一条永不命中的规则。
+    // `mailto:alice@example.com` 在此列：写路径**不改写**、只收或拒——剥前缀是在替用户解析意图，
+    // 而 local part 真叫 `mailto` 的发件人会因此被改写成另一个地址、静音错的人。
+    for (const bad of ['<a@x.com>', 'a b@x.com', 'a@x_y.com', 'com', 'mailto:alice@example.com']) {
       const ctx = makeCtx('apply-feedback');
       ctx.input = { add: [bad] };
       await assert.rejects(run(ctx, {}), /含不合规项/, `${bad} 在匹配侧永不命中，必须拒`);
     }
     const ok = makeCtx('apply-feedback');
-    ok.input = { add: ['bounces+1=user.com@sendgrid.net', 'srs0=a=b=user@fwd.net', 'ops!tag@x.com'] };
+    ok.input = {
+      add: ['bounces+1=user.com@sendgrid.net', 'srs0=a=b=user@fwd.net', 'ops!tag@x.com', 'root@nas', 'admin@10.0.0.5'],
+    };
     await run(ok, {});
-    assert.equal(payloadOf(ok, 'feedback.applied').added.length, 3, 'VERP/SRS/atext 特殊字符照收');
+    assert.equal(payloadOf(ok, 'feedback.applied').added.length, 5, 'VERP/SRS/atext/内网地址照收');
   });
 });
 
-test('nf⑲ 写侧闸门：条数上限、字节上限、NOISE_OVERLAY_FILE 指向 rules.yaml 一律拒', async () => {
-  await withOverlay(null, async (_overlay, dir) => {
+test('nf⑲ 写侧闸门：条数上限、字节上限、rules 文件叫 noise_senders.overlay 一律拒', async () => {
+  await withOverlay(null, async () => {
     const many = makeCtx('apply-feedback');
     many.input = { add: Array.from({ length: 501 }, (_, i) => `u${i}@x.com`) };
     await assert.rejects(run(many, {}), /条目数超上限/);
 
-    // 路径闸：把 NOISE_OVERLAY_FILE 指到**当前配置的** rules.yaml（故 RULES_FILE 同步指过去）。
-    // 无此闸时实测会把人工 YAML 按 overlay 平铺格式整体重写、缩进结构毁掉，而 run 仍是绿的。
-    const prevOverlay = process.env.NOISE_OVERLAY_FILE;
+    // 请求总字节闸：remove 侧刻意**没有**单条长度闸（存量行必须可移除），故有界性只剩这一道。
+    // 无它则 500 条任意长的串能把 not_present 回执与 run trace 撑到几百 MB。
+    const longRemove = Array.from({ length: 500 }, (_, i) => 'r'.repeat(200) + i); // 500×~203B ≫ 64KB
+    const fat = makeCtx('apply-feedback');
+    fat.input = { remove: longRemove };
+    await assert.rejects(run(fat, {}), /请求总字节超上限/, 'remove 侧的有界性靠请求总字节');
+    for (const item of longRemove) {
+      assert.equal(checkEntry(item, 'remove'), true, '每一条单独看都合规——超的只能是总量');
+    }
+
+    // 干跑腿对同一 input 不 throw，而是静默截断（它永远不能 throw）。
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { remove: longRemove };
+    await run(ci, { repo: senderRepo([]) });
+    const p = payloadOf(ci, 'interpretation.proposed');
+    assert.ok(p.remove.length < longRemove.length, `干跑腿按总字节截断（实际 ${p.remove.length} 条）`);
+
+    // 撞名闸：overlay 路径由 RULES_FILE 派生，故两者只可能在一种情形下相等——rules 文件自己就叫
+    // `noise_senders.overlay`。那时写下去就是把人工维护的 YAML 按 overlay 平铺格式整体重写，run 还是绿的。
+    const clash = mkdtempSync(join(tmpdir(), 'overlay-clash-'));
+    const clashPath = join(clash, 'noise_senders.overlay');
+    const clashBody = 'noise_senders:\n  - manual@x.com\n';
+    writeFileSync(clashPath, clashBody, 'utf8');
     const prevRules = process.env.RULES_FILE;
-    process.env.NOISE_OVERLAY_FILE = join(dir, 'rules.yaml');
-    process.env.RULES_FILE = join(dir, 'rules.yaml');
+    process.env.RULES_FILE = clashPath;
     try {
       const evil = makeCtx('apply-feedback');
       evil.input = { add: ['a@x.com'] };
-      await assert.rejects(run(evil, {}), /指向了 rules.yaml/, '硬 MUST 要有结构约束，不能只靠注释');
+      await assert.rejects(run(evil, {}), /不能命名为 noise_senders\.overlay/, '硬 MUST 要有结构约束，不能只靠注释');
+      assert.equal(readFileSync(clashPath, 'utf8'), clashBody, '拒绝时一个字节都不许动');
     } finally {
-      process.env.NOISE_OVERLAY_FILE = prevOverlay;
       if (prevRules === undefined) {
         delete process.env.RULES_FILE;
       } else {
         process.env.RULES_FILE = prevRules;
       }
+      rmSync(clash, { recursive: true, force: true });
     }
+  });
+});
+
+test('nf⑲b 单条 remove 永不被批量闸拦下：一条远超 MAX_REQUEST_BYTES 的存量行必须能删掉', async () => {
+  // 这条守的性质：**loader 接受的任一行 `l`，`{remove:[l]}` 恒被接受**。批量字节闸若从第一条起生效，
+  // 一条超长的手改行就会「loader 认得（正在静音邮件）、apply 却删不掉」= 结构性锁死，正是本能力要消灭的。
+  const long = 'x'.repeat(100 * 1024) + '@x.com'; // 100KB ≫ MAX_REQUEST_BYTES(64KB)
+  await withOverlay(long + '\n', async (overlay) => {
+    assert.equal(checkEntry(long, 'remove'), true, 'loader 侧接受这一行（否则下面是空转）');
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { remove: [long] };
+    await run(ctx, {});
+    assert.deepEqual(payloadOf(ctx, 'feedback.applied').removed, [long], '单条 remove 必须被接受');
+    assert.equal(readFileSync(overlay, 'utf8'), '', '那一行必须真的从文件里消失');
   });
 });
 
@@ -1456,24 +1527,6 @@ test('nf㉑ 字节闸：写下去会越过 loader 上限 → 抛错不写（越�
   });
 });
 
-test('nf㉒ 路径闸认文件身份而非路径字符串：硬链别名必须被拒（词法/realpath 都识别不出）', async () => {
-  await withOverlay(null, async (_overlay, dir) => {
-    const prevOverlay = process.env.NOISE_OVERLAY_FILE;
-    // **硬链**别名：路径字符串完全不同、realpath 也不同，只有 dev+ino 认得出是同一个 inode。
-    // 两个平台都成立——此前用 realpath 差异构造，在 Linux 上 aliasDir 退化为 dir 自身，CI 里零覆盖。
-    const alias = join(dir, 'alias.overlay');
-    linkSync(join(dir, 'rules.yaml'), alias);
-    process.env.NOISE_OVERLAY_FILE = alias;
-    try {
-      const ctx = makeCtx('apply-feedback');
-      ctx.input = { add: ['a@x.com'] };
-      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '硬链别名必须被 dev+ino 认出（词法与 realpath 都比不出来）');
-    } finally {
-      process.env.NOISE_OVERLAY_FILE = prevOverlay;
-    }
-  });
-});
-
 test('nf㉓ 提案腿也不得从原型链取键（此前只有 apply 腿挡住）', async () => {
   await withOverlay('keep@a.com\n', async (overlay) => {
     const mtimeBefore = statSync(overlay).mtimeMs;
@@ -1503,40 +1556,21 @@ test('nf㉔ 提案就是将写入的 diff：超条数/超字节时截断而非�
     await run(ca, {});
     assert.equal(payloadOf(ca, 'feedback.applied').added.length, 500);
   });
-});
 
-test('nf㉕ 路径闸：大小写别名（APFS 默认大小写不敏感）—— realpath 也解不掉，只有 dev+ino 认得出', async () => {
-  await withOverlay(null, async (_overlay, dir) => {
-    const upper = join(dir, 'RULES.YAML'); // 与 rules.yaml 同一 inode（大小写不敏感盘）
-    if (!existsSync(upper)) {
-      // 大小写敏感盘（CI 的 Linux）上此别名不成立。硬链版本由 nf㉒ 覆盖，两平台都有网。
-      return;
-    }
-    const prev = process.env.NOISE_OVERLAY_FILE;
-    process.env.NOISE_OVERLAY_FILE = upper;
-    try {
-      const ctx = makeCtx('apply-feedback');
-      ctx.input = { add: ['a@x.com'] };
-      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '大小写别名必须被 dev+ino 认出');
-    } finally {
-      process.env.NOISE_OVERLAY_FILE = prev;
-    }
-  });
-});
-
-test('nf㉖ 提案就是将写入的 diff：逼近 loader 字节上限时按字节截断（非只按条数）', async () => {
+  // 字节闸（条数闸够不着的那一半）：只请求 20 条，远低于 500，但 overlay 已逼近 loader 上限。
+  // 越限后 loader 会把**整份** overlay 静默丢弃 = 所有降噪一次性失效，而 run 仍是绿的。
   const line = 'u000000000000@example.com'; // 25B + 换行
   const rows = Math.floor((256 * 1024) / (line.length + 1)) - 6;
   const seed = Array.from({ length: rows }, (_, i) => `u${String(i).padStart(12, '0')}@example.com`).join('\n') + '\n';
   await withOverlay(seed, async () => {
-    // 只要 20 条（远低于 500 条上限），但字节预算只放得下少数几条。
     const ci = makeCtx('interpret-feedback');
     ci.input = { add: Array.from({ length: 20 }, (_, i) => `extra${String(i).padStart(8, '0')}@example.com`) };
     await run(ci, { repo: senderRepo([]) });
     const proposed = payloadOf(ci, 'interpretation.proposed');
+    assert.ok(proposed.add.length > 0, '预算里还放得下几条，不该退化为空提案');
     assert.ok(proposed.add.length < 20, `字节预算应截断提案（实际提议 ${proposed.add.length} 条）`);
 
-    // 提案逐字喂进 apply 必须被接受 —— 这就是「提案 == 将写入的」。
+    // 提案逐字喂进 apply 必须被接受 —— 没有这面镜子，干跑腿会提议一份 apply 必拒的 diff。
     const ca = makeCtx('apply-feedback');
     ca.input = { add: proposed.add, remove: proposed.remove };
     await run(ca, {});
@@ -1544,21 +1578,37 @@ test('nf㉖ 提案就是将写入的 diff：逼近 loader 字节上限时按字�
   });
 });
 
-test('nf㉗ tmp 用 O_EXCL：预置成 rules.yaml 的硬链时，绝不截断 rules.yaml（O_NOFOLLOW 挡不住硬链）', async () => {
+test('nf㉗ 不留孤儿 tmp：成功路径与 rename 失败路径都不留（tmp 里是完整发件人名单）', async () => {
+  // 上一版这条用「预置一个固定名的蹲名文件」来验 O_EXCL，而实现用的是随机名 —— 蹲名永远撞不上，
+  // 断言恒成立、去掉守卫也不会变红。改成验一条真会失败的性质：目录里不该剩 .tmp。
   await withOverlay('keep@a.com\n', async (overlay, dir) => {
-    const rulesYaml = join(dir, 'rules.yaml');
-    const before = readFileSync(rulesYaml, 'utf8');
-    // 无法预知随机后缀 ⇒ 攻击面本身已消除；这里直接验「同名已存在即开失败、不截断」。
-    const squat = `${overlay}.${process.pid}.deadbeefdead.tmp`;
-    linkSync(rulesYaml, squat);
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { add: ['new@x.com'] };
+    await run(ctx, {});
+    assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\nnew@x.com\n', '写入生效');
+    const leftovers = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+    assert.deepEqual(leftovers, [], `rename 后不得留下含发件人名单的 tmp：${leftovers.join(', ')}`);
+  });
+
+  // 失败路径才是 `unlinkSync(tmp)` 那段唯一的网 —— 只有成功路径时，孤儿 tmp 按构造不可能出现，
+  // 把清理代码整段删掉测试照绿。要让 open/write/fsync 全成功而**只有 rename 失败**：
+  // chflags uchg（目标文件不可改名，EPERM，内容仍可读）。把 overlayPath 指成目录不行——
+  // fail-closed 的读闸（ENOTFILE）先一步抛错，根本走不到写。
+  // ponytail: 这条只在 darwin 有网（chflags 是 BSD 的；Linux 的等价物 chattr +i 要 root）。
+  if (process.platform !== 'darwin') {
+    return;
+  }
+  await withOverlay('keep@a.com\n', async (overlay, dir) => {
+    execFileSync('chflags', ['uchg', overlay]);
     try {
       const ctx = makeCtx('apply-feedback');
       ctx.input = { add: ['new@x.com'] };
-      await run(ctx, {}); // 随机名绕开了蹲名，正常成功
-      assert.equal(readFileSync(rulesYaml, 'utf8'), before, 'rules.yaml 逐字节未变');
-      assert.equal(readFileSync(squat, 'utf8'), before, '被蹲的硬链也未被截断');
+      await assert.rejects(run(ctx, {}), /原子写失败/, 'rename 失败必须响亮，不得静默当成写成功');
+      assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n', '失败后旧 overlay 逐字节未变');
+      const leftovers = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+      assert.deepEqual(leftovers, [], `失败路径同样不得留下含发件人名单的 tmp：${leftovers.join(', ')}`);
     } finally {
-      rmSync(squat, { force: true });
+      execFileSync('chflags', ['nouchg', overlay]); // 还原，否则 withOverlay 的 rmSync 清不掉
     }
   });
 });
@@ -1587,15 +1637,23 @@ test('nf㉙ add 侧非 ASCII 在归一前判：U+212A KELVIN 不得小写成 ASC
   });
 });
 
-test('nf㉚ {text} 腿与结构化腿同纪律：已在名单的候选不显示为「将加入」', async () => {
+test('nf㉚ {text} 腿不与 overlay 差分：用户点名的地址即使已在名单里也要出现在提案', async () => {
   await withOverlay('noreply@taobao.com\n', async () => {
     const ci = makeCtx('interpret-feedback');
     ci.input = { text: '把 taobao 加进降噪' };
     await run(ci, { repo: senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]) });
     assert.deepEqual(
       payloadOf(ci, 'interpretation.proposed').add,
-      [],
-      '已在 overlay 里 → 不是「将加入」（提案就是将写入的 diff）',
+      ['noreply@taobao.com'],
+      '按 present 过滤会把用户点名的真阳性剔掉、只留 token 松匹配进来的假阳性',
     );
+
+    // 「已在名单里」由 apply 腿如实回执 —— 这正是四桶回执存在的理由。
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: ['noreply@taobao.com'] };
+    await run(ca, {});
+    const p = payloadOf(ca, 'feedback.applied');
+    assert.deepEqual(p.added, [], '本就在名单里 → 不计入 added');
+    assert.deepEqual(p.already_present, ['noreply@taobao.com'], 'already_present 桶如实报告');
   });
 });

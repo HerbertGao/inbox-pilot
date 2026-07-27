@@ -37,5 +37,7 @@ services:
       - "${APP_HOST_PORT:-3000}:3000"
     volumes:
       # rules.yaml bind-mount：提供宿主可编辑的 rules.yaml（改内容即被 mtime 热加载、实时生效），
-      # 存在时遮蔽镜像内烘焙拷贝（Dockerfile COPY rules）；无挂载时回落到该烘焙拷贝。:ro 因 app 只读不写。
-      - ./rules:/app/rules:ro
+      # 存在时遮蔽镜像内烘焙拷贝（Dockerfile COPY rules）；无挂载时回落到该烘焙拷贝。
+      # rw 是因为降噪反馈闭环要往同目录写机器文件 noise_senders.overlay（apply-feedback 的唯一写者）；
+      # app 仍不写 rules.yaml —— 那条硬 MUST 由写路径自己的撞名闸守，不靠挂载权限守。
+      - ./rules:/app/rules:rw

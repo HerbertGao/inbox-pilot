@@ -20,4 +20,4 @@ data/
 
 # 机器生成的降噪 overlay（apply-feedback 写、loader 读）：属运行期状态，不进版本库。
 # 它里面是真实发件人地址，误提交等于把 PII 推进仓库；而部署时一个 git clean 会抹掉 operator 攒的整份名单。
-rules/noise_senders.overlay
+rules/noise_senders.overlay*

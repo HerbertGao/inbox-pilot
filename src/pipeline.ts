@@ -23,18 +23,19 @@
 
 import { closeSync, constants, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 
 import type { Logger } from 'pino';
 
 import { loadConfig } from './config/config.js';
-import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
+import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo, type SenderCount } from './repo/mailRepo.js';
 import {
   canonicalizeOverlayLine,
   canonicalizeAddInput,
   checkEntry,
   hasOwnKey,
-  isSameFile,
   MAX_ENTRIES_PER_KEY,
+  MAX_REQUEST_BYTES,
   MAX_RULES_FILE_BYTES,
   readOverlayFile,
   readOwnKey,
@@ -349,13 +350,7 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
     // 响亮失败由 apply 腿承担（它对同一路径会抛错）。
     let present: Set<string>;
     try {
-      const overlayPath = resolveNoiseOverlayPath();
-      // 路径闸也要在提案腿问一次：否则 NOISE_OVERLAY_FILE 误指到 rules.yaml 时，提案腿会把 YAML 文本行
-      // 当 overlay 条目算出一份 apply 必拒的 diff（还构成对人工 YAML 内容的成员探测）。
-      if (isSameFile(overlayPath, resolveRulesPath())) {
-        throw new Error('overlay 路径指向 rules.yaml');
-      }
-      present = new Set(readOverlayFile(overlayPath, 'fail-closed'));
+      present = new Set(readOverlayFile(resolveNoiseOverlayPath(), 'fail-closed'));
     } catch {
       // 只记 kind 不记路径/内容。零日志是上一轮的缺陷：这条路径此前既不抛也不记，整条链路无可观测性。
       ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
@@ -380,33 +375,46 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
   const now: () => number = overrides?.now ?? (() => Date.now());
   const text = readFeedbackText(ctx.input);
   const since = new Date(now() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-  const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
+  // 只读（无写副作用），但**必须收在 try 里**：干跑腿的契约是「绝不 throw」，而这是它唯一的 DB 触点——
+  // 一次 DB 抖动就会让 interpret-feedback 变成 run.failed，把健康的 inbox 画成监控墙上的翻车。
+  let candidates: SenderCount[];
+  try {
+    candidates = await repo.countRecentSenders(since);
+  } catch {
+    // 只记 kind：不记路径、不记查询参数、不记任何值。
+    ctx.logger.warn({ kind: 'noise-candidates-unavailable' }, '候选查询失败，提案退化为空（干跑腿不 throw）');
+    ctx.emit('interpretation.proposed', { add: [], remove: [] });
+    return;
+  }
   // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
   const matched = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
-  // 与结构化腿同一条纪律：路径闸 + 与 overlay 差分 + 写预算。缺了它，确认页会把已在名单里的候选
-  // 显示成「将加入」，overlay 不可读或逼近上限时还会给出一份 apply 必拒的提案。
+  // overlay 读不到时**不提议**（同结构化腿）：契约只有两个字段、无法表达「overlay 不可用」，而提议一份
+  // apply 必然拒绝的变更会让用户确认后拿到 run.failed。响亮失败由 apply 腿承担。
   let textPresent: Set<string>;
   try {
-    const overlayPath = resolveNoiseOverlayPath();
-    if (isSameFile(overlayPath, resolveRulesPath())) {
-      throw new Error('overlay 路径指向 rules.yaml');
-    }
-    textPresent = new Set(readOverlayFile(overlayPath, 'fail-closed'));
+    textPresent = new Set(readOverlayFile(resolveNoiseOverlayPath(), 'fail-closed'));
   } catch {
     ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
     ctx.emit('interpretation.proposed', { add: [], remove: [] });
     return;
   }
-  // 候选已由 `normalizeSenderForCount`（mailRepo.ts）剥 `<>` + 小写，故此处**不做归一**（归一维度恒等）。
-  // 这一层的唯一作用是**过滤**：不合可加入判据的候选（无点域 `root@nas`、数字 TLD `admin@10.0.0.5`）
-  // 不进提案——否则确认后必在 apply 腿抛错。故本腿的 add 是变更前结果的**可加入子集**。
-  const textAdd = keepValidEntries(matched, 'add').filter((e) => !textPresent.has(e));
-  ctx.emit('interpretation.proposed', { add: fitWithinWriteBudget(textAdd, textPresent, []), remove: [] });
+  // 候选已由匹配侧的 `normalizeFromAddress` 剥 `<>` + 小写（mailRepo 只是 re-export 它），故此处**不做归一**，
+  // 只过滤掉不可加入的候选（apply 腿会对它们抛错）。
+  //
+  // **刻意不与 overlay 差分**：上一版在此按 `present` 过滤，效果是用户点名的那个地址（已在名单里）
+  // 被剔除、而 token 松匹配进来的其它 TOP-N 候选留下——真阳性消失、假阳性留在确认页。
+  // 「已在名单里」由 apply 腿的 `already_present` 桶如实回执，这正是四桶回执存在的理由。
+  // 故 `textPresent` **只**作写预算的字节基线，绝不用来过滤候选。
+  ctx.emit('interpretation.proposed', {
+    add: fitWithinWriteBudget(keepValidEntries(matched, 'add'), textPresent, []),
+    remove: [],
+  });
 }
 
 /**
  * 截断 add 到「apply 一定会接受」的前缀：镜像 apply 腿的条数闸与序列化字节闸。
- * 干跑腿不能 throw，所以超预算时少提议，而不是提议一份会被拒的 diff。
+ * 干跑腿不能 throw，所以超预算时少提议，而不是提议一份会被拒的 diff——越过 `MAX_RULES_FILE_BYTES` 后
+ * loader 会把**整份** overlay 静默丢弃，等于所有降噪一次性失效而 run 仍是绿的。
  */
 function fitWithinWriteBudget(add: readonly string[], present: ReadonlySet<string>, remove: readonly string[]): string[] {
   const removeSet = new Set(remove);
@@ -440,7 +448,8 @@ function readStructuredFeedback(input: unknown): { add: unknown; remove: unknown
 /**
  * interpret 侧的宽容读取：归一 + **按方向**判据（与 apply 腿共用 `checkEntry`）+ 按归一值去重；
  * 不合规项/非串**静默丢弃**（干跑腿不 throw）。非数组（`{add:'x'}` 这类畸形）→ 空集，由 apply 腿响亮失败。
- * 条数上限在此截断（而非丢弃全部），使提案与 apply 的接受集一致。
+ * 条数上限与**请求总字节**上限在此截断（而非丢弃全部），使提案与 apply 的接受集一致——本腿不 throw，
+ * 所以 apply 腿对超总字节抛错的那条，这里退化为静默截断。
  */
 function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
   if (!Array.isArray(raw)) {
@@ -448,6 +457,7 @@ function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
   }
   const out: string[] = [];
   const seen = new Set<string>();
+  let requestBytes = 0;
   for (const item of raw) {
     if (out.length >= MAX_ENTRIES_PER_KEY) {
       break;
@@ -460,6 +470,18 @@ function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
     const s = direction === 'add' ? canonicalizeAddInput(item) : canonicalizeOverlayLine(item);
     if (s === null || seen.has(s) || !checkEntry(s, direction)) {
       continue;
+    }
+    // remove 侧无单条长度闸（存量行必须可移除），故有界性靠请求总字节：无它则 500 条任意长的串
+    // 能把提案 payload 与 run trace 撑到几百 MB。干跑腿不 throw，超限即静默停收。
+    //
+    // ponytail: **批量闸从第二条起才生效**——守的性质是「loader 接受的任一行 `l`，`{remove:[l]}` 恒被接受」。
+    //           把预算加在第一条上会让一条超长的存量行**不可移除**，正是本能力要消灭的那类结构性锁死。
+    //           将来任何新增的批量闸都必须保留这条豁免。
+    if (out.length > 0) {
+      requestBytes += Buffer.byteLength(s, 'utf8');
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        break;
+      }
     }
     seen.add(s);
     out.push(s);
@@ -522,10 +544,10 @@ async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Pro
   //           将来在此插入任何 await 会静默打开丢更新窗口而回执照报 added；跨进程并发驱动需 O_EXCL lockfile。
   const { add, remove } = normalizeFeedbackInput(ctx.input);
   const overlayPath = resolveNoiseOverlayPath();
-  // 「绝不碰 rules.yaml」是硬 MUST，此前只由注释与纪律守着：`NOISE_OVERLAY_FILE` 是 operator 可控 env，
-  // 指错即把人工维护的 YAML 按 overlay 的平铺格式整体重写（缩进结构直接毁掉、无备份、run 还是绿的）。
-  if (isSameFile(overlayPath, resolveRulesPath())) {
-    throw new Error('inbox pipeline: NOISE_OVERLAY_FILE 指向了 rules.yaml，拒绝写入（overlay 必须是独立机器文件）');
+  // 路径由 RULES_FILE 派生，故两者相等当且仅当 rules 文件本身就叫 noise_senders.overlay。
+  // 纯字符串比较：别名机制（软链/硬链/大小写/bind mount）在这里没有作用面。
+  if (resolve(overlayPath) === resolve(resolveRulesPath())) {
+    throw new Error('inbox pipeline: rules 文件不能命名为 noise_senders.overlay（它会与机器 overlay 撞名）');
   }
   const existing = new Set<string>(readOverlayFile(overlayPath, 'fail-closed'));
   const added: string[] = [];
@@ -604,6 +626,7 @@ function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
   }
   const out: string[] = [];
   const seen = new Set<string>();
+  let requestBytes = 0;
   for (const item of raw) {
     if (!checkEntry(item, key)) {
       // 只回形状不回值：地址属邮件内容侧，run trace 与邮件 DB 是不同保留策略/访问路径的存储。
@@ -611,6 +634,20 @@ function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
         `inbox pipeline: apply-feedback 的 ${key} 含不合规项（${key === 'add' ? '须为已归一的合法 local@domain 或 domain' : '须为已归一形态'}）：` +
           `类型=${typeof item}、长度=${typeof item === 'string' ? item.length : 0}`,
       );
+    }
+    // remove 侧无单条长度闸（存量行必须可移除），故有界性靠**请求总字节**：无它则 500 条任意长的串
+    // 能把 `not_present` 回执与 run trace 撑到几百 MB。只回形状不回值（地址属邮件内容侧）。
+    //
+    // ponytail: **批量闸从第二条起才生效**——守的性质是「loader 接受的任一行 `l`，`{remove:[l]}` 恒被接受」。
+    //           把预算加在第一条上会让一条超长的存量行**不可移除**，正是本能力要消灭的那类结构性锁死。
+    //           将来任何新增的批量闸都必须保留这条豁免。
+    if (out.length > 0) {
+      requestBytes += Buffer.byteLength(item, 'utf8');
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        throw new Error(
+          `inbox pipeline: apply-feedback 的 ${key} 请求总字节超上限（> ${MAX_REQUEST_BYTES} 字节）`,
+        );
+      }
     }
     if (!seen.has(item)) {
       seen.add(item);
@@ -642,9 +679,16 @@ function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>)
   // 随机名 + `O_EXCL`：固定名可被预置成 rules.yaml 的**硬链**，那时 `O_TRUNC` 会先把 rules.yaml 截断，
   // 而 `O_NOFOLLOW` 只挡软链、挡不住硬链。`O_EXCL` 让「路径已存在」直接开失败，不可能截断任何东西。
   const tmp = `${overlayPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  // open 单独一段：**开失败就绝不 unlink**。O_EXCL 下 EEXIST 意味着那个路径上的文件不是本次创建的，
+  // 统一在 catch 里 unlink 会删掉别人的文件。只有开成功之后 tmp 才归本调用所有。
+  let fd: number;
   try {
     // openSync 而非 writeFileSync 的 flag 选项：后者的类型只收字符串标志，收不了 O_NOFOLLOW。
-    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+    fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  } catch (err) {
+    throw new Error(`inbox pipeline: overlay 原子写失败（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`);
+  }
+  try {
     try {
       writeFileSync(fd, body, 'utf8');
       fsyncSync(fd); // rename 可能先于数据落盘：掉电会留下空/截断的 overlay = 整份名单丢失。

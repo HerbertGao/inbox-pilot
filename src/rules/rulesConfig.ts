@@ -16,8 +16,8 @@
 //     脱敏日志（只 kind+项名+zod issue.path；禁 issue.message/received/解析节点/文件内容/任何解析值）；
 //     非 strict、未知键（含凭据形态键）静默丢弃；禁止枚举被丢弃键名（键本身可能是密钥）、至多记数量。
 
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { readFileSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parse as parseYaml } from 'yaml';
@@ -59,15 +59,14 @@ export function resolveRulesPath(): string {
 }
 
 /**
- * noise overlay 机器文件路径：默认与 rules.yaml 同目录的 `noise_senders.overlay`，env NOISE_OVERLAY_FILE 覆盖。
+ * noise overlay 机器文件路径：**恒为**与 rules.yaml 同目录的 `noise_senders.overlay`，**不可配置**。
  * apply-feedback（pipeline）**写**、本 loader **读**，共用此单一路径来源；rulesPath 参使 buildAndPublish
  * 传入的 rules.yaml 路径与其 overlay 同目录（测试传 tmp path 时 overlay 亦落 tmp）。
+ *
+ * 路径是**派生**的、从不被配置：只有 `RULES_FILE` 一个旋钮决定两个文件的位置，故它们不可能被指到
+ * 对方身上——「这两条路径是不是同一个文件」那一整类别名闸（软链/硬链/大小写/bind mount）随旋钮一起消失。
  */
 export function resolveNoiseOverlayPath(rulesPath: string = resolveRulesPath()): string {
-  const fromEnv = process.env.NOISE_OVERLAY_FILE;
-  if (fromEnv !== undefined && fromEnv !== '') {
-    return fromEnv;
-  }
   return join(dirname(rulesPath), 'noise_senders.overlay');
 }
 
@@ -78,13 +77,20 @@ export function resolveNoiseOverlayPath(rulesPath: string = resolveRulesPath()):
 // 三个持有者时把 (A,B) 调平必然打破 (B,C)，于是每一次「让某一份让步」的修复都生产出下一处分歧。
 // 所以这些问题在本模块各只有一个答案，pipeline 侧是纯消费者。
 //
-// 由此得到一条构造性事实：设 L = loader 接受的行语言、W = 写路径能表达/删除的语言，因两者共用
-// `canonicalizeOverlayLine`，故 **L = W**——不存在「loader 眼里活着、写路径既造不出也删不掉」的条目。
+// 由此：loader 接受的行与 remove 能删掉的行共用 `canonicalizeOverlayLine`，故**不存在**「loader 眼里
+// 活着、remove 却删不掉」的条目——包括超长的手改行（长度闸只在 add 侧，见 `checkEntry`）。
+// 注意「哪些条目可加入」比另外几个问题弱：它是一条**政策**（见 isAddableEntry），改它不影响 remove。
 
-/** 条目总长上限（信任边界：调用方可绕过 UI 直调，无上限则单行可撑爆 overlay）。 */
+/** **add 侧**条目总长上限（信任边界：调用方可绕过 UI 直调，无上限则单行可撑爆 overlay）。 */
 export const MAX_ENTRY_LEN = 254;
 /** 单侧条目数上限：`MAX_ENTRY_LEN` 只界住一行，不界住行数。 */
 export const MAX_ENTRIES_PER_KEY = 500;
+/**
+ * 单侧**请求**的总字节上限。remove 侧刻意不设单条长度闸（存量行必须可移除），故有界性由请求总量承担：
+ * 无它则 500 条任意长的串能把 `not_present` 回执与 run trace 撑到几百 MB。
+ * **只从第二条起生效**（见 pipeline 两条腿的 ponytail 注）：单条请求恒不被批量闸拦下。
+ */
+export const MAX_REQUEST_BYTES = 64 * 1024;
 
 /**
  * **overlay「一行是什么」的唯一实现**：`trim` → 转小写；空 → null。**刻意不剥 `<>`**——它与 master 的
@@ -103,6 +109,10 @@ export function canonicalizeOverlayLine(raw: string): string | null {
  * **用户输入的归一**（与「一行是什么」是两个问题）：`trim` → 剥掉**所有**包裹层 `<>` → 转小写。
  * 剥到不动点（`while` 而非 `if`）：只剥一层会让输出可能仍以 `<>` 包裹，那个值既不是合法的行、
  * 又会被写盘，形成「读→写不是不动点」的漂移。输出必为 `canonicalizeOverlayLine` 的不动点。
+ *
+ * 写路径**不做改写、只做收与拒**：这里每多一条「替用户猜他想要的地址」的变换，就多一处
+ * 「写进去的条目 ≠ 用户提交的条目」。`mailto:` 前缀因此归 `isAddableEntry` 拒（见那里的豁免⑤），
+ * 不在此剥掉——剥它会把 local part 真的叫 `mailto` 的发件人改写成另一个地址、静音错的人。
  */
 export function canonicalizeAddInput(raw: string): string | null {
   // 归一**之前**判：Unicode 小写会把 U+212A KELVIN 之类折成 ASCII `k`，归一后再查就查不出来了，
@@ -121,53 +131,73 @@ export function canonicalizeUserEntry(raw: string): string | null {
   return canonicalizeOverlayLine(s);
 }
 
-/** 非 ASCII（码位 > U+007F）；控制字符是它的子集，故一条断言即可。归一**之前**判——`K` 之类会小写成 ASCII。 */
+/** 非 ASCII（码位 > U+007F）。控制字符另有一条（它不是本条的子集）。归一**之前**判——`K` 之类会小写成 ASCII。 */
 const NON_ASCII_RE = /[^\u0000-\u007f]/;
 /** 控制字符（用码位转义写；绝不把控制字符本身贴进源码——它在编辑器/剪贴板/JSON 往返里会被静默吃掉）。 */
 const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
-/** 域名段：`[a-z0-9]` 起止、段内可含 `-`、≤63 字节。 */
-const DOMAIN_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
-/** mailbox local part 的 dot-atom：atext 段以 `.` 分隔——无前导点、无尾随点、无连续点。 */
-const LOCAL_DOT_ATOM_RE = /^[a-z0-9!#$%&'*+\-/=?^_`{|}~]+(?:\.[a-z0-9!#$%&'*+\-/=?^_`{|}~]+)*$/;
-
-/** 域名：≥2 段、每段合法、末段为 ≥2 位纯字母 TLD。 */
-function isValidDomain(s: string): boolean {
-  const labels = s.split('.');
-  if (labels.length < 2 || !/^[a-z]{2,}$/.test(labels[labels.length - 1]!)) {
-    return false;
-  }
-  return labels.every((l) => DOMAIN_LABEL_RE.test(l));
-}
+/**
+ * 匹配侧域名的字母表（`applySafetyRules` 的 `normalizeFromDomain` 产出 `[a-z0-9.-]+`）。
+ * 这里是它的两端锚定版——超出这个字母表的域名条目匹配侧永远比不中。
+ */
+const MATCHABLE_DOMAIN_RE = /^[a-z0-9.-]+$/;
+/** 匹配侧 local part 的字母表（`normalizeFromAddress` 的 `[^\s<>@]+`）。 */
+const MATCHABLE_LOCAL_RE = /^[^\s<>@]+$/;
 
 /**
- * 一个 canonical 串是否是**可加入**的条目——即匹配侧真能命中的形态（真正的邮箱或域名）。
- * 拒非 ASCII 是 IDN 裁决：匹配侧比的是 normalizer 产出的 `fromEmail`（只小写、不转 punycode），
- * 只归一写入侧会写进一个**永不命中**的条目 = false-green。
+ * 一个 canonical 串是否**可加入** —— 判据 = 匹配侧的不动点集**减去一个具名豁免集**（不是等式）。
+ *
+ * 基线抄自 `applySafetyRules` 的两条匹配谓词，两端锚定即得：
+ *   - 地址条目：`normalizeFromAddress` 的 `^[^\s<>@]+@[a-z0-9.-]+`，故本函数是它的不动点判定。
+ *     写进一个非不动点的串（`<a@x.com>`、`a b@x.com`）＝ 一条永不命中的规则 = false-green。
+ *   - 域名条目（无 `@`）：`matchesDomain` 按等值或后缀比 `normalizeFromDomain` 的产出，字母表同上。
+ *
+ * **五条刻意的偏离**（匹配侧产得出、本判据仍拒；rulesConfig.test 的性质用例逐条钉住，新增偏离必须变红）：
+ *   1. 非 ASCII local part（`é@x.com`）—— IDN 裁决：匹配侧比的是 normalizer 产出的 `fromEmail`
+ *      （只小写、不转 punycode），写入侧只归一会写进一个永不命中的条目 = false-green。
+ *   2. 控制字符 local part（`ctrl\u0001@x.com`）—— 地址来自邮件内容侧这个信任边界，控制字符会在
+ *      编辑器/剪贴板/日志往返里被静默吃掉，写进机器文件即不可复核。
+ *   3. 无点的纯域名条目（`nas` / `localhost` / `router`）—— 爆炸半径：`matchesDomain` 按后缀比，
+ *      一条就静音整个后缀。
+ *   4. 裸 TLD（`com`）—— 同 3，一条静音整个 .com。
+ *   5. `mailto:` 前缀（`mailto:a@x.com`，大小写不敏感）—— 带这个前缀的条目匹配侧永不命中，而把它改写成
+ *      `a@x.com` 是在替用户解析自然语言意图，本管道的契约禁止这么做（局部真叫 `mailto` 的发件人会被
+ *      改写成另一个地址、静音错的人）。故拒绝，让调用方自己提交裸地址。
+ *   （1/2/5 同时也挡住地址形态，3/4 只在域名形态出现。长度上限亦只在本函数 = add 侧，见 `checkEntry`。）
+ *
+ * **刻意不比匹配侧更严**：`root@nas`（无点域）、`admin@10.0.0.5`（数字 TLD）匹配侧本来就命中，
+ * 上一版按 RFC dot-atom + 纯字母 TLD 判，把 digest 里的 NAS/路由器/内网 cron 发件人整类挡在门外——
+ * 它们在 digest 表头被展示为可加入，加进去却报错。判据严于匹配侧就会产出这种缺口。
  */
 export function isAddableEntry(s: string): boolean {
-  if (s.length === 0 || s.length > MAX_ENTRY_LEN || NON_ASCII_RE.test(s) || CONTROL_CHAR_RE.test(s)) {
+  if (s.length === 0 || s.length > MAX_ENTRY_LEN) {
+    return false;
+  }
+  if (NON_ASCII_RE.test(s) || CONTROL_CHAR_RE.test(s)) {
+    return false;
+  }
+  if (s.slice(0, 7).toLowerCase() === 'mailto:') {
     return false;
   }
   const at = s.indexOf('@');
   if (at === -1) {
-    return isValidDomain(s);
+    return s.includes('.') && MATCHABLE_DOMAIN_RE.test(s);
   }
-  return LOCAL_DOT_ATOM_RE.test(s.slice(0, at)) && isValidDomain(s.slice(at + 1));
+  return MATCHABLE_LOCAL_RE.test(s.slice(0, at)) && MATCHABLE_DOMAIN_RE.test(s.slice(at + 1));
 }
 
 /**
  * 两腿共用的条目判据。**方向差异只存在这一处**，结构上无法只改一半。
- *   - `add`：必须已归一 **且**可加入（否则写进一个永不命中的条目）。
- *   - `remove`：只需已归一。删除永远是安全方向，且因 L = W，overlay 里的每一行按定义都满足它——
- *     这就是「存量条目不得结构性锁死」由构造保证、而非靠测试守。
+ *   - `add`：必须已归一 **且**可加入。
+ *   - `remove`：只需已归一——删除永远是安全方向，overlay 里的存量行不该因判据变严而无法移除。
  */
 export function checkEntry(item: unknown, direction: 'add' | 'remove'): item is string {
-  // 共用前置**只**判「是不是一个合法的行」。长度与控制字符属**可加入**判据，绝不能放这里：
-  // loader 对行长与控制字符不设限，放进来就会让 L ⊄ W，存量长行/含控制字符的行结构性锁死。
+  // ponytail: 长度闸**只在 add 侧**（在 isAddableEntry 里）。放到这个共用前缀上会让一条 256 字符的存量行
+  //           「loader 认得（正在静音邮件）、remove 却删不掉」——结构性锁死，而契约禁止手改机器文件。
+  //           remove 侧的有界性由**请求总字节**（MAX_REQUEST_BYTES，pipeline 两条腿各累加一次）承担。
   if (typeof item !== 'string' || canonicalizeOverlayLine(item) !== item) {
     return false;
   }
-  return direction === 'add' ? isAddableEntry(item) : true;
+  return direction === 'remove' || isAddableEntry(item);
 }
 
 /** 读 `input` 的**自有**键（`in` 会走原型链，被污染的 `Object.prototype` 能凭空造出请求）。缺键 → undefined。 */
@@ -181,39 +211,6 @@ export function readOwnKey(input: unknown, key: string): unknown {
 /** `input` 是否带该自有键（区分「缺键」与「键在但值为 undefined」）。 */
 export function hasOwnKey(input: unknown, key: string): boolean {
   return input !== null && typeof input === 'object' && Object.hasOwn(input, key);
-}
-
-/**
- * 两个文件是否**同一个**——问文件系统要 `dev`/`ino` 身份，而不是比路径字符串。
- * 词法比较挡不住软链父目录（k8s ConfigMap 的 `..data`、macOS `/tmp`→`/private/tmp`）与大小写不敏感盘，
- * 而这条判据守的是「绝不碰人工维护的 rules.yaml」这条硬 MUST。
- * 目标尚不存在时退化为「真实父目录 + basename」的比较（父目录亦不存在则退回词法）。
- */
-export function isSameFile(a: string, b: string): boolean {
-  // stat 抛的是 Node 原生错误，其 message 含绝对路径——本仓纪律是只回 kind。取不到就走退化分支。
-  const safeStat = (p: string): ReturnType<typeof statSync> | undefined => {
-    try {
-      return statSync(p, { throwIfNoEntry: false });
-    } catch {
-      return undefined;
-    }
-  };
-  const sa = safeStat(a);
-  const sb = safeStat(b);
-  if (sa !== undefined && sb !== undefined) {
-    return sa.dev === sb.dev && sa.ino === sb.ino;
-  }
-  // 退化分支（目标尚不存在）：basename **不区分大小写**地比。大小写不敏感盘上 `rules.yaml` 与
-  // `RULES.YAML` 是同一个文件，而两者都还不存在时拿不到 inode——保守判「同一个」是安全方向
-  // （多拒一次写，不会误伤：overlay 与 rules.yaml 本就该是不同文件名）。
-  const key = (p: string): string => {
-    try {
-      return join(realpathSync(dirname(p)), basename(p).toLowerCase());
-    } catch {
-      return resolve(p).toLowerCase();
-    }
-  };
-  return key(a) === key(b);
 }
 
 /** `readOverlayFile` 的读失败语义：loader 要 fail-open（读不到就不静音），写路径要 fail-closed。 */
