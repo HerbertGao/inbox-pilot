@@ -9,9 +9,6 @@
 //
 // 注入 seam：reloadRulesConfigForTest(path) 直调重载、startRulesConfigReload({statMtimeMs,setIntervalFn,...})
 // 注入假时钟/poller，均不依赖真 timing。
-//
-// TODO(组B): 域名轴/security 整集语义首选经 applySafetyRules 的可选 `rules` 参注入快照断言；
-// 组 B 改完 applySafetyRules 签名后，组 E 统一把这些断言收口到 applySafetyRules。此前部分断言走 loader 层。
 
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
