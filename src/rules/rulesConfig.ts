@@ -104,6 +104,15 @@ export function canonicalizeOverlayLine(raw: string): string | null {
  * 剥到不动点（`while` 而非 `if`）：只剥一层会让输出可能仍以 `<>` 包裹，那个值既不是合法的行、
  * 又会被写盘，形成「读→写不是不动点」的漂移。输出必为 `canonicalizeOverlayLine` 的不动点。
  */
+export function canonicalizeAddInput(raw: string): string | null {
+  // 归一**之前**判：Unicode 小写会把 U+212A KELVIN 之类折成 ASCII `k`，归一后再查就查不出来了，
+  // 用户输入的 `K.com` 会变成一条针对 `k.com` 的**域级**规则。
+  if (NON_ASCII_RE.test(raw) || CONTROL_CHAR_RE.test(raw)) {
+    return null;
+  }
+  return canonicalizeUserEntry(raw);
+}
+
 export function canonicalizeUserEntry(raw: string): string | null {
   let s = raw.trim();
   while (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
@@ -194,11 +203,14 @@ export function isSameFile(a: string, b: string): boolean {
   if (sa !== undefined && sb !== undefined) {
     return sa.dev === sb.dev && sa.ino === sb.ino;
   }
+  // 退化分支（目标尚不存在）：basename **不区分大小写**地比。大小写不敏感盘上 `rules.yaml` 与
+  // `RULES.YAML` 是同一个文件，而两者都还不存在时拿不到 inode——保守判「同一个」是安全方向
+  // （多拒一次写，不会误伤：overlay 与 rules.yaml 本就该是不同文件名）。
   const key = (p: string): string => {
     try {
-      return join(realpathSync(dirname(p)), basename(p));
+      return join(realpathSync(dirname(p)), basename(p).toLowerCase());
     } catch {
-      return resolve(p);
+      return resolve(p).toLowerCase();
     }
   };
   return key(a) === key(b);
@@ -221,14 +233,24 @@ export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
   // `throwIfNoEntry:false` **只**压制 ENOENT/ENOTDIR；EACCES/ELOOP/ENAMETOOLONG 照抛。而本函数在
   // 模块顶层 buildAndPublish 的调用链上——不捕获即 **import 期崩溃**，整个 pipeline 模块加载失败、
   // daemon 起不来。master 那里是 try/catch，去掉它是回归。
-  let stat: ReturnType<typeof statSync> | undefined;
+  // 用普通 statSync + errno 判定：`throwIfNoEntry:false` 会把 **ENOTDIR 也折成 undefined**，
+  // 于是一个非法路径会被当成「空文件」，让 fail-closed 的 remove 成功回执「本就不在名单」。
+  // 只有 ENOENT 才是真正的空集。
+  let stat: ReturnType<typeof statSync>;
   try {
-    stat = statSync(path, { throwIfNoEntry: false });
+    stat = statSync(path);
   } catch (err) {
-    return failOverlayRead(mode, (err as NodeJS.ErrnoException).code);
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return []; // 文件不存在：overlay 可选，这才是真正的空集（两种模式一致）。
+    }
+    return failOverlayRead(mode, code);
   }
-  if (stat === undefined) {
-    return []; // 文件不存在：overlay 可选，这才是真正的空集（两种模式一致）。
+  // ponytail: FIFO/字符设备的分支**无测试网** —— 守卫拿掉后测试不是变红而是挂死（同步读永久阻塞），
+  //           无法安全构造。目录形态由下面 readFileSync 的 EISDIR 兜住，此处只为不可测的那一类。
+  if (!stat.isFile()) {
+    // FIFO / 字符设备：size 可为 0 而同步读会永久阻塞，卡死单线程 daemon。
+    return failOverlayRead(mode, 'ENOTFILE');
   }
   if (stat.size > MAX_RULES_FILE_BYTES) {
     if (mode === 'fail-closed') {

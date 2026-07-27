@@ -21,6 +21,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { applySafetyRules } from './applySafetyRules.js';
 import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 import {
+  isSameFile,
   readOverlayFile,
   canonicalizeUserEntry,
   canonicalizeOverlayLine,
@@ -597,6 +598,33 @@ test('readOverlayFile：statSync 本身抛错（父目录不可搜索）时不�
     );
   } finally {
     chmodSync(sub, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('readOverlayFile：非法路径(ENOTDIR)与非普通文件不得被当作空文件', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-kind-'));
+  const file = join(dir, 'plain');
+  writeFileSync(file, 'a@b.com\n', 'utf8');
+  const throughFile = join(file, 'nested.overlay'); // 把普通文件当目录用 → ENOTDIR
+  try {
+    // ENOTDIR 曾被 throwIfNoEntry:false 折成 undefined → fail-closed 的 remove 会成功回执「本就不在」。
+    assert.deepEqual(readOverlayFile(throughFile, 'fail-open'), [], 'loader 侧降级为空集');
+    assert.throws(() => readOverlayFile(throughFile, 'fail-closed'), /overlay 读取失败/, '写路径必须抛错');
+    // 目录不是普通文件：size 不可信、同步读语义不定。
+    assert.deepEqual(readOverlayFile(dir, 'fail-open'), []);
+    assert.throws(() => readOverlayFile(dir, 'fail-closed'), /overlay 读取失败/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('isSameFile：两个目标都还不存在时，basename 大小写差异必须保守判为同一个', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'same-file-'));
+  try {
+    assert.equal(isSameFile(join(dir, 'ghost.yaml'), join(dir, 'GHOST.YAML')), true, '拿不到 inode 时保守（安全方向）');
+    assert.equal(isSameFile(join(dir, 'a.overlay'), join(dir, 'b.yaml')), false, '不同名仍判不同');
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

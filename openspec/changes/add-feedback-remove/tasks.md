@@ -56,3 +56,17 @@
 - [x] 6.2 全量 `pnpm test` 绿
 - [x] 6.3 `file(1)` 核对改动文件均为 UTF-8 text（无裸控制字节）
 - [x] 6.4 OpenSpec `--strict` 验证通过
+
+## 7. round-4 三 slot 的 blocker + Codex 的残余项
+
+- [x] 7.1 归一拆成两个问题（RC 选项 A）：行归一 `trim`+小写**不剥 `<>`**（与本能力生效前同语义 → 存量生效集不迁移）；用户输入归一剥到**不动点**。方向决定用哪个
+- [x] 7.2 `checkEntry` 共用前置去掉长度与控制字符（可加入的分量；混进来即 `L ⊄ W`）
+- [x] 7.3 `readOverlayFile` / `isSameFile` 的 `statSync` 包捕获（`throwIfNoEntry` 只压制 ENOENT，逃逸即 **import 期崩溃**）
+- [x] 7.4 `ENOTDIR` 不得折成空文件；非普通文件（FIFO/字符设备）拒绝——**该分支无测试网**，守卫拿掉后测试挂死而非变红，据实记账
+- [x] 7.5 `isSameFile` 退化分支 basename 大小写不敏感（两目标都不存在时保守判同一个）
+- [x] 7.6 add 侧非 ASCII 在**归一前**判（`K` 会小写成 ASCII `k` 穿过归一后的检查）
+- [x] 7.7 apply 的 input 外层必须是普通对象（`null`/标量/数组此前回四个空桶）
+- [x] 7.8 `{text}` 腿补路径闸 + present 差分 + 写预算，与结构化腿同纪律
+- [x] 7.9 tmp 随机名 + `O_EXCL`（固定名可被预置成 rules.yaml 硬链，`O_TRUNC` 会先截断它，`O_NOFOLLOW` 挡不住硬链）
+- [x] 7.10 新增**不动点性质断言**（穷举 ≤4 长度 4681 串）——不依赖语料；别名测试改硬链（此前在 CI 的 Linux 上零覆盖）
+- [x] 7.11 上述逐条 mutation：6/7 落网，`isFile` 那条据实记为无网

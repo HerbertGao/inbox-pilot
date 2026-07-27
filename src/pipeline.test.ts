@@ -1543,3 +1543,59 @@ test('nf㉖ 提案就是将写入的 diff：逼近 loader 字节上限时按字�
     assert.deepEqual(payloadOf(ca, 'feedback.applied').added, proposed.add);
   });
 });
+
+test('nf㉗ tmp 用 O_EXCL：预置成 rules.yaml 的硬链时，绝不截断 rules.yaml（O_NOFOLLOW 挡不住硬链）', async () => {
+  await withOverlay('keep@a.com\n', async (overlay, dir) => {
+    const rulesYaml = join(dir, 'rules.yaml');
+    const before = readFileSync(rulesYaml, 'utf8');
+    // 无法预知随机后缀 ⇒ 攻击面本身已消除；这里直接验「同名已存在即开失败、不截断」。
+    const squat = `${overlay}.${process.pid}.deadbeefdead.tmp`;
+    linkSync(rulesYaml, squat);
+    try {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = { add: ['new@x.com'] };
+      await run(ctx, {}); // 随机名绕开了蹲名，正常成功
+      assert.equal(readFileSync(rulesYaml, 'utf8'), before, 'rules.yaml 逐字节未变');
+      assert.equal(readFileSync(squat, 'utf8'), before, '被蹲的硬链也未被截断');
+    } finally {
+      rmSync(squat, { force: true });
+    }
+  });
+});
+
+test('nf㉘ apply 的 input 外层必须是普通对象：null / 标量 / 数组一律抛错，不得回四个空桶', async () => {
+  await withOverlay('keep@a.com\n', async () => {
+    for (const bad of [null, 42, 'x', ['a@x.com'], true]) {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = bad;
+      await assert.rejects(run(ctx, {}), /input 必须是/, `${JSON.stringify(bad)} 必须抛错`);
+    }
+  });
+});
+
+test('nf㉙ add 侧非 ASCII 在归一前判：U+212A KELVIN 不得小写成 ASCII 后穿过校验', async () => {
+  await withOverlay(null, async () => {
+    const kelvin = 'a@Kayak.com'; // 小写后是纯 ASCII 的 a@kayak.com
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { add: [kelvin] };
+    await run(ci, { repo: senderRepo([]) });
+    assert.deepEqual(payloadOf(ci, 'interpretation.proposed').add, [], '归一前即被非 ASCII 拒');
+
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: [kelvin] };
+    await assert.rejects(run(ca, {}), /含不合规项/, 'apply 侧同样拒');
+  });
+});
+
+test('nf㉚ {text} 腿与结构化腿同纪律：已在名单的候选不显示为「将加入」', async () => {
+  await withOverlay('noreply@taobao.com\n', async () => {
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { text: '把 taobao 加进降噪' };
+    await run(ci, { repo: senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]) });
+    assert.deepEqual(
+      payloadOf(ci, 'interpretation.proposed').add,
+      [],
+      '已在 overlay 里 → 不是「将加入」（提案就是将写入的 diff）',
+    );
+  });
+});

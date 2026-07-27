@@ -22,6 +22,7 @@
 // @hangar/core，此约束由命名纪律 + 本注释守（待解问题 R3 CR-n1）。
 
 import { closeSync, constants, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 import type { Logger } from 'pino';
 
@@ -29,7 +30,7 @@ import { loadConfig } from './config/config.js';
 import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
 import {
   canonicalizeOverlayLine,
-  canonicalizeUserEntry,
+  canonicalizeAddInput,
   checkEntry,
   hasOwnKey,
   isSameFile,
@@ -382,10 +383,25 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
   const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
   // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
   const matched = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
+  // 与结构化腿同一条纪律：路径闸 + 与 overlay 差分 + 写预算。缺了它，确认页会把已在名单里的候选
+  // 显示成「将加入」，overlay 不可读或逼近上限时还会给出一份 apply 必拒的提案。
+  let textPresent: Set<string>;
+  try {
+    const overlayPath = resolveNoiseOverlayPath();
+    if (isSameFile(overlayPath, resolveRulesPath())) {
+      throw new Error('overlay 路径指向 rules.yaml');
+    }
+    textPresent = new Set(readOverlayFile(overlayPath, 'fail-closed'));
+  } catch {
+    ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
+    ctx.emit('interpretation.proposed', { add: [], remove: [] });
+    return;
+  }
   // 候选已由 `normalizeSenderForCount`（mailRepo.ts）剥 `<>` + 小写，故此处**不做归一**（归一维度恒等）。
   // 这一层的唯一作用是**过滤**：不合可加入判据的候选（无点域 `root@nas`、数字 TLD `admin@10.0.0.5`）
   // 不进提案——否则确认后必在 apply 腿抛错。故本腿的 add 是变更前结果的**可加入子集**。
-  ctx.emit('interpretation.proposed', { add: keepValidEntries(matched, 'add'), remove: [] });
+  const textAdd = keepValidEntries(matched, 'add').filter((e) => !textPresent.has(e));
+  ctx.emit('interpretation.proposed', { add: fitWithinWriteBudget(textAdd, textPresent, []), remove: [] });
 }
 
 /**
@@ -441,7 +457,7 @@ function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
     }
     // 方向差异贯穿到归一：add 问「你指哪个地址」（剥 <> 得裸地址）；remove 问「你要删哪一行」
     // （不剥——存量行可能就长成 <x@y> 的样子，剥了就对不上文件里的那一行）。两者输出都是行的不动点。
-    const s = direction === 'add' ? canonicalizeUserEntry(item) : canonicalizeOverlayLine(item);
+    const s = direction === 'add' ? canonicalizeAddInput(item) : canonicalizeOverlayLine(item);
     if (s === null || seen.has(s) || !checkEntry(s, direction)) {
       continue;
     }
@@ -547,6 +563,11 @@ async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Pro
  *     `{added:[X], removed:[X]}` 在读者眼里是「加了又移了」、文件里却没有 X——回执说谎。
  */
 function normalizeFeedbackInput(input: unknown): { add: string[]; remove: string[] } {
+  // 缺 key 语义只对**普通对象**成立。null / 标量 / 数组此前被当成「两键皆缺」→ 成功回四个空桶，
+  // 而它们根本不符合 `{add?, remove?}` 的形状，属畸形 input，该走抛错那条。
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(`inbox pipeline: apply-feedback 的 input 必须是 { add?, remove? } 对象（收到 ${Array.isArray(input) ? 'array' : typeof input}）`);
+  }
   const add = readEntryList(input, 'add');
   const remove = readEntryList(input, 'remove');
   const removeSet = new Set(remove);
@@ -618,10 +639,12 @@ function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>)
         `写下去 loader 会整份忽略，等于所有降噪失效）`,
     );
   }
-  const tmp = `${overlayPath}.${process.pid}.tmp`;
+  // 随机名 + `O_EXCL`：固定名可被预置成 rules.yaml 的**硬链**，那时 `O_TRUNC` 会先把 rules.yaml 截断，
+  // 而 `O_NOFOLLOW` 只挡软链、挡不住硬链。`O_EXCL` 让「路径已存在」直接开失败，不可能截断任何东西。
+  const tmp = `${overlayPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
     // openSync 而非 writeFileSync 的 flag 选项：后者的类型只收字符串标志，收不了 O_NOFOLLOW。
-    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
     try {
       writeFileSync(fd, body, 'utf8');
       fsyncSync(fd); // rename 可能先于数据落盘：掉电会留下空/截断的 overlay = 整份名单丢失。
