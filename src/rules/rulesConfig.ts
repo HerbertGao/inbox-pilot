@@ -16,8 +16,8 @@
 //     脱敏日志（只 kind+项名+zod issue.path；禁 issue.message/received/解析节点/文件内容/任何解析值）；
 //     非 strict、未知键（含凭据形态键）静默丢弃；禁止枚举被丢弃键名（键本身可能是密钥）、至多记数量。
 
-import { readFileSync, statSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { parse as parseYaml } from 'yaml';
@@ -71,33 +71,170 @@ export function resolveNoiseOverlayPath(rulesPath: string = resolveRulesPath()):
   return join(dirname(rulesPath), 'noise_senders.overlay');
 }
 
+// ─────────────── overlay 格式的**唯一所有者**（本模块） ───────────────
+//
+// 同一份 `noise_senders.overlay`，关于它的五个语义问题——「一行是什么」「哪些条目合法」「多大算超限」
+// 「这个文件是哪个」「键存在吗」——此前各被 loader / 提案腿 / 应用腿独立回答 2–3 次。**成对一致不具传递性**：
+// 三个持有者时把 (A,B) 调平必然打破 (B,C)，于是每一次「让某一份让步」的修复都生产出下一处分歧。
+// 所以这些问题在本模块各只有一个答案，pipeline 侧是纯消费者。
+//
+// 由此得到一条构造性事实：设 L = loader 接受的行语言、W = 写路径能表达/删除的语言，因两者共用
+// `canonicalizeOverlayLine`，故 **L = W**——不存在「loader 眼里活着、写路径既造不出也删不掉」的条目。
+
+/** 条目总长上限（信任边界：调用方可绕过 UI 直调，无上限则单行可撑爆 overlay）。 */
+export const MAX_ENTRY_LEN = 254;
+/** 单侧条目数上限：`MAX_ENTRY_LEN` 只界住一行，不界住行数。 */
+export const MAX_ENTRIES_PER_KEY = 500;
+
 /**
- * 读机器生成的 noise overlay（apply-feedback 写、本 loader 读）：一行一个发件人，trim+lower+丢空归一
- * （同 rules.yaml noise_senders 的 ingest 纪律，使并集去重成立）。绝不崩/绝不泄露：≤256KB（超限忽略）；
- * 缺失→空（overlay 可选、缺失是常态，不记日志）；读错误→空 + 脱敏日志（只 kind、不记内容/路径）。
+ * **overlay 行归一的唯一实现**：`trim` → 去掉包裹的 `<>` → 转小写；空 → null。
+ * loader 读文件、两腿读用户输入，全部走这一个函数——两份实现必然漂移，而漂移的每一种形态都是一类
+ * 「回执说一套、磁盘是另一套」的 bug。
  */
-export function readNoiseOverlay(path: string): string[] {
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return []; // 不存在等：overlay 可选，缺失是常态（不记日志）。
+export function canonicalizeOverlayLine(raw: string): string | null {
+  let s = raw.trim();
+  if (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
+    s = s.slice(1, -1).trim();
   }
-  if (size > MAX_RULES_FILE_BYTES) {
+  s = s.toLowerCase();
+  return s.length > 0 ? s : null;
+}
+
+/** 非 ASCII（码位 > U+007F）；控制字符是它的子集，故一条断言即可。归一**之前**判——`K` 之类会小写成 ASCII。 */
+const NON_ASCII_RE = /[^\u0000-\u007f]/;
+/** 控制字符（用码位转义写；绝不把控制字符本身贴进源码——它在编辑器/剪贴板/JSON 往返里会被静默吃掉）。 */
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+/** 域名段：`[a-z0-9]` 起止、段内可含 `-`、≤63 字节。 */
+const DOMAIN_LABEL_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+/** mailbox local part 的 dot-atom：atext 段以 `.` 分隔——无前导点、无尾随点、无连续点。 */
+const LOCAL_DOT_ATOM_RE = /^[a-z0-9!#$%&'*+\-/=?^_`{|}~]+(?:\.[a-z0-9!#$%&'*+\-/=?^_`{|}~]+)*$/;
+
+/** 域名：≥2 段、每段合法、末段为 ≥2 位纯字母 TLD。 */
+function isValidDomain(s: string): boolean {
+  const labels = s.split('.');
+  if (labels.length < 2 || !/^[a-z]{2,}$/.test(labels[labels.length - 1]!)) {
+    return false;
+  }
+  return labels.every((l) => DOMAIN_LABEL_RE.test(l));
+}
+
+/**
+ * 一个 canonical 串是否是**可加入**的条目——即匹配侧真能命中的形态（真正的邮箱或域名）。
+ * 拒非 ASCII 是 IDN 裁决：匹配侧比的是 normalizer 产出的 `fromEmail`（只小写、不转 punycode），
+ * 只归一写入侧会写进一个**永不命中**的条目 = false-green。
+ */
+export function isAddableEntry(s: string): boolean {
+  if (s.length === 0 || s.length > MAX_ENTRY_LEN || NON_ASCII_RE.test(s) || CONTROL_CHAR_RE.test(s)) {
+    return false;
+  }
+  const at = s.indexOf('@');
+  if (at === -1) {
+    return isValidDomain(s);
+  }
+  return LOCAL_DOT_ATOM_RE.test(s.slice(0, at)) && isValidDomain(s.slice(at + 1));
+}
+
+/**
+ * 两腿共用的条目判据。**方向差异只存在这一处**，结构上无法只改一半。
+ *   - `add`：必须已归一 **且**可加入（否则写进一个永不命中的条目）。
+ *   - `remove`：只需已归一。删除永远是安全方向，且因 L = W，overlay 里的每一行按定义都满足它——
+ *     这就是「存量条目不得结构性锁死」由构造保证、而非靠测试守。
+ */
+export function checkEntry(item: unknown, direction: 'add' | 'remove'): item is string {
+  if (typeof item !== 'string' || CONTROL_CHAR_RE.test(item) || item.length > MAX_ENTRY_LEN) {
+    return false;
+  }
+  if (canonicalizeOverlayLine(item) !== item) {
+    return false; // 归一不幂等 ⇒ 调用方跳过了提案腿。
+  }
+  return direction === 'add' ? isAddableEntry(item) : true;
+}
+
+/** 读 `input` 的**自有**键（`in` 会走原型链，被污染的 `Object.prototype` 能凭空造出请求）。缺键 → undefined。 */
+export function readOwnKey(input: unknown, key: string): unknown {
+  if (input === null || typeof input !== 'object' || !Object.hasOwn(input, key)) {
+    return undefined;
+  }
+  return (input as Record<string, unknown>)[key];
+}
+
+/** `input` 是否带该自有键（区分「缺键」与「键在但值为 undefined」）。 */
+export function hasOwnKey(input: unknown, key: string): boolean {
+  return input !== null && typeof input === 'object' && Object.hasOwn(input, key);
+}
+
+/**
+ * 两个文件是否**同一个**——问文件系统要 `dev`/`ino` 身份，而不是比路径字符串。
+ * 词法比较挡不住软链父目录（k8s ConfigMap 的 `..data`、macOS `/tmp`→`/private/tmp`）与大小写不敏感盘，
+ * 而这条判据守的是「绝不碰人工维护的 rules.yaml」这条硬 MUST。
+ * 目标尚不存在时退化为「真实父目录 + basename」的比较（父目录亦不存在则退回词法）。
+ */
+export function isSameFile(a: string, b: string): boolean {
+  const sa = statSync(a, { throwIfNoEntry: false });
+  const sb = statSync(b, { throwIfNoEntry: false });
+  if (sa !== undefined && sb !== undefined) {
+    return sa.dev === sb.dev && sa.ino === sb.ino;
+  }
+  const key = (p: string): string => {
+    try {
+      return join(realpathSync(dirname(p)), basename(p));
+    } catch {
+      return resolve(p);
+    }
+  };
+  return key(a) === key(b);
+}
+
+/** `readOverlayFile` 的读失败语义：loader 要 fail-open（读不到就不静音），写路径要 fail-closed。 */
+export type OverlayReadMode = 'fail-open' | 'fail-closed';
+
+/**
+ * **overlay 读的唯一实现**：尺寸一律以 `statSync().size` 度量（决定这份文件是否被 loader 采纳的就是它；
+ * 若改量解码后的字节数，含无效 UTF-8 的文件会出现「loader 采纳、写路径拒绝」的分叉）。行归一走
+ * `canonicalizeOverlayLine`。
+ *
+ * 失败语义是**参数**而非第二份实现：
+ *   - `fail-open`（loader）：缺失/超限/读错误 → 空集，读不到就不静音，方向安全。
+ *   - `fail-closed`（写路径）：只有**文件不存在**才是空集；超限与读错误一律抛错——把「读不到」当「现有集为空」
+ *     会让随后的全量覆盖静默抹掉整份名单，或让 remove 回执谎报「本就不在」而地址仍在被静默已读。
+ */
+export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
+  const stat = statSync(path, { throwIfNoEntry: false });
+  if (stat === undefined) {
+    return []; // 文件不存在：overlay 可选，这才是真正的空集（两种模式一致）。
+  }
+  if (stat.size > MAX_RULES_FILE_BYTES) {
+    if (mode === 'fail-closed') {
+      throw new Error('inbox pipeline: overlay 已超过 loader 上限，拒绝据此改写名单（loader 正整份忽略它）');
+    }
     logSink.warn({ kind: 'noise-overlay-too-large' }, 'noise overlay 超限，忽略 overlay（用现有 noiseSenders）');
     return [];
   }
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
-  } catch {
+  } catch (err) {
+    if (mode === 'fail-closed') {
+      throw new Error(
+        `inbox pipeline: overlay 读取失败，拒绝据此改写名单（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`,
+      );
+    }
     logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
     return [];
   }
-  return text
-    .split(/\r?\n/)
-    .map((l) => l.trim().toLowerCase())
-    .filter((l) => l.length > 0);
+  const out: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const s = canonicalizeOverlayLine(line);
+    if (s !== null) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** loader 侧的 overlay 读（fail-open）。绝不崩/绝不泄露：只记 kind，不记内容/路径。 */
+export function readNoiseOverlay(path: string): string[] {
+  return readOverlayFile(path, 'fail-open');
 }
 
 // —— zod schema（每项独立校验，使「某项非法仅该项回落、其余生效」成立）——

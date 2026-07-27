@@ -6,9 +6,9 @@
 // spy 计到的真实 classify 调用数。
 
 import assert from 'node:assert/strict';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
 import type { Logger } from 'pino';
 
@@ -961,18 +961,31 @@ async function withOverlay(
     writeFileSync(overlay, seed, 'utf8');
   }
   const prevEnv = process.env.NOISE_OVERLAY_FILE;
+  const prevRules = process.env.RULES_FILE;
   process.env.NOISE_OVERLAY_FILE = overlay;
+  // **必须同时设 RULES_FILE**：否则 `resolveRulesPath()` 仍指向仓内真实 rules.yaml，沙箱里这份就是一个
+  // 生产代码从不命名的**诱饵**——那句哨兵断言无论生产代码做什么都不会红（round-3 的路径闸绕过就是从
+  // 这个缝里过的）。设了它，哨兵才真正守着「绝不碰人工维护的 rules.yaml」。
+  process.env.RULES_FILE = rulesYaml;
+  let sentinel: string | undefined;
   try {
     await fn(overlay, dir);
   } finally {
-    assert.equal(readFileSync(rulesYaml, 'utf8'), RULES_YAML_SENTINEL, '反馈闭环绝不碰人工维护的 rules.yaml');
+    sentinel = readFileSync(rulesYaml, 'utf8');
     if (prevEnv === undefined) {
       delete process.env.NOISE_OVERLAY_FILE;
     } else {
       process.env.NOISE_OVERLAY_FILE = prevEnv;
     }
+    if (prevRules === undefined) {
+      delete process.env.RULES_FILE;
+    } else {
+      process.env.RULES_FILE = prevRules;
+    }
     rmSync(dir, { recursive: true, force: true });
   }
+  // 断言放在 env 还原与清理**之后**：放 finally 头部时，哨兵一旦触发会把 env 与 tmp 目录泄漏给后续全部用例。
+  assert.equal(sentinel, RULES_YAML_SENTINEL, '反馈闭环绝不碰人工维护的 rules.yaml');
 }
 
 /** 取某 kind 事件的 payload，并断言该 kind **恰好 emit 一次**（view 数同 kind 个数，≠1 即失败）。 */
@@ -1290,14 +1303,15 @@ test('nf⑮ overlay 读失败 → 写路径 fail-closed：apply 抛错不覆盖�
       cRm.input = { remove: ['silenced@boss.com'] };
       await assert.rejects(run(cRm, {}), /overlay 读取失败/, 'remove 侧同样 fail-closed（否则回执谎报 not_present）');
 
-      // 提案腿不 throw，但也不得把读不到当「不在名单」而把 remove 提议吞掉。
+      // 提案腿不 throw，但**也不提议**：读不到就无法知道 diff，而提议一份 apply 必然拒绝的变更
+      // 会让用户确认后拿到 run.failed（契约两个字段表达不了「overlay 不可用」）。响亮失败由 apply 腿承担。
       const ci = makeCtx('interpret-feedback');
       ci.input = { remove: ['silenced@boss.com'] };
       await run(ci, { repo: senderRepo([]) });
       assert.deepEqual(
-        payloadOf(ci, 'interpretation.proposed').remove,
-        ['silenced@boss.com'],
-        '读不到时跳过 present 过滤，不显示「无可移出」',
+        payloadOf(ci, 'interpretation.proposed'),
+        { add: [], remove: [] },
+        '读不到时空提案（确认键置灰），绝不提议一份 apply 会拒的 diff',
       );
     } finally {
       chmodSync(overlay, 0o644);
@@ -1306,22 +1320,34 @@ test('nf⑮ overlay 读失败 → 写路径 fail-closed：apply 抛错不覆盖�
   });
 });
 
-test('nf⑯ 两腿与 loader 对「一行是什么」不得分歧：存量 <a@b> 行不被改写成合法存在项', async () => {
-  await withOverlay('<alice@example.com>\n', async (overlay, dir) => {
+test('nf⑯ L = W：loader 与两腿共用同一归一，故 overlay 里的每一行都能经产品路径移除', async () => {
+  // 存量行的两种历史形态：`<>` 包裹（旧 writer 可写出）与不合新可加入判据的裸串（旧 writer 亦可写出）。
+  await withOverlay('<alice@example.com>\nroot@nas\nkeep@a.com\n', async (overlay, dir) => {
     try {
       reloadRulesConfigForTest(join(dir, 'rules.yaml'));
-      assert.deepEqual(getActiveRules().noiseSenders, ['<alice@example.com>'], 'loader 视其为独立死行');
+      assert.deepEqual(
+        getActiveRules().noiseSenders,
+        ['alice@example.com', 'root@nas', 'keep@a.com'],
+        'loader 与写路径同域：`<>` 在 loader 侧也被剥掉，不存在只有一方认得的行',
+      );
 
+      // 产品路径：interpret 提案 → 把提案**逐字**喂进 apply（不手工构造 apply 输入）。
       const ci = makeCtx('interpret-feedback');
-      ci.input = { add: ['alice@example.com'] };
+      ci.input = { remove: ['alice@example.com', 'root@nas'] };
       await run(ci, { repo: senderRepo([]) });
-      assert.deepEqual(payloadOf(ci, 'interpretation.proposed').add, ['alice@example.com'], '应提议新增，而非「已在名单」');
+      const proposed = payloadOf(ci, 'interpretation.proposed');
+      assert.deepEqual(proposed.remove.sort(), ['alice@example.com', 'root@nas'], '两种存量形态都进得了提案');
 
       const ca = makeCtx('apply-feedback');
-      ca.input = { add: ['alice@example.com'] };
+      ca.input = { add: proposed.add, remove: proposed.remove };
       await run(ca, {});
-      assert.deepEqual(payloadOf(ca, 'feedback.applied').added, ['alice@example.com']);
-      assert.equal(readFileSync(overlay, 'utf8'), '<alice@example.com>\nalice@example.com\n', '真正落盘');
+      assert.deepEqual(payloadOf(ca, 'feedback.applied').removed.sort(), ['alice@example.com', 'root@nas']);
+      assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n', '真的删掉了');
+
+      // 反向：同样的串走 add 仍被拒（只处理真正的邮箱）。
+      const bad = makeCtx('apply-feedback');
+      bad.input = { add: ['root@nas'] };
+      await assert.rejects(run(bad, {}), /含不合规项/, 'add 侧仍要求可加入');
     } finally {
       resetRulesConfigForTest();
     }
@@ -1330,11 +1356,19 @@ test('nf⑯ 两腿与 loader 对「一行是什么」不得分歧：存量 <a@b>
 
 test('nf⑰ 存量条目可移除：master 期写进去的不合新规条目不得结构性锁死', async () => {
   await withOverlay('root@nas\nadmin@10.0.0.5\nkeep@a.com\n', async (overlay) => {
+    // 产品路径：interpret → 取提案 → **逐字**喂进 apply。手工构造 apply 输入会绕过 interpret，
+    // 那正是 round-3 让这条假绿的原因（提案腿当时把存量项静默丢了，而本用例没走它）。
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { remove: ['root@nas', 'admin@10.0.0.5'] };
+    await run(ci, { repo: senderRepo([]) });
+    const proposed = payloadOf(ci, 'interpretation.proposed');
+    assert.deepEqual(proposed.remove.sort(), ['admin@10.0.0.5', 'root@nas'], '提案腿不得把存量项丢掉');
+
     const ctx = makeCtx('apply-feedback');
-    ctx.input = { remove: ['root@nas', 'admin@10.0.0.5'] };
+    ctx.input = { add: proposed.add, remove: proposed.remove };
     await run(ctx, {});
     const p = payloadOf(ctx, 'feedback.applied');
-    assert.deepEqual(p.removed.sort(), ['admin@10.0.0.5', 'root@nas'], 'remove 只要求归一幂等，不要求合法');
+    assert.deepEqual(p.removed.sort(), ['admin@10.0.0.5', 'root@nas'], 'remove 只要求归一幂等，不要求可加入');
     assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n');
 
     // 反向：同样的串走 add 仍必须被拒（只处理真正的邮箱）。
@@ -1414,5 +1448,91 @@ test('nf㉑ 字节闸：写下去会越过 loader 上限 → 抛错不写（越�
     ctx.input = { add: Array.from({ length: 10 }, (_, i) => `extra${i}@example.com`) };
     await assert.rejects(run(ctx, {}), /将超过 loader 上限/);
     assert.equal(readFileSync(overlay, 'utf8'), before, '拒绝时不写');
+  });
+});
+
+test('nf㉒ 路径闸认文件身份而非路径字符串：软链别名与大小写别名都必须被拒', async () => {
+  await withOverlay(null, async (_overlay, dir) => {
+    const prevOverlay = process.env.NOISE_OVERLAY_FILE;
+    // dir 在 macOS 上是 /var/folders/...（/private/var 的软链），realpath 与词法路径不等 —— 这正是
+    // round-3 绕过路径闸的构造：resolve() 比较不出来，dev+ino 比得出来。
+    const aliasDir = realpathSync(dir) === dir ? join(dirname(dir), basename(dir)) : realpathSync(dir);
+    process.env.NOISE_OVERLAY_FILE = join(aliasDir, 'rules.yaml');
+    try {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = { add: ['a@x.com'] };
+      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '软链/别名路径同样必须被拒');
+    } finally {
+      process.env.NOISE_OVERLAY_FILE = prevOverlay;
+    }
+  });
+});
+
+test('nf㉓ 提案腿也不得从原型链取键（此前只有 apply 腿挡住）', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
+    const mtimeBefore = statSync(overlay).mtimeMs;
+    const polluted = Object.create({ add: ['attacker@evil.com'] }) as Record<string, unknown>;
+    polluted.text = 'taobao';
+    const ci = makeCtx('interpret-feedback');
+    ci.input = polluted;
+    await run(ci, { repo: senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]) });
+    const p = payloadOf(ci, 'interpretation.proposed');
+    assert.ok(!p.add.includes('attacker@evil.com'), '原型链上的 add 不得凭空造出提案');
+    assert.deepEqual(p.add, ['noreply@taobao.com'], '自有的 text 才是这条 input 的真实意图');
+    assert.equal(statSync(overlay).mtimeMs, mtimeBefore, '提案腿无写');
+  });
+});
+
+test('nf㉔ 提案就是将写入的 diff：超条数/超字节时截断而非提议一份 apply 会拒的变更', async () => {
+  await withOverlay(null, async () => {
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { add: Array.from({ length: 600 }, (_, i) => `u${i}@example.com`) };
+    await run(ci, { repo: senderRepo([]) });
+    const proposed = payloadOf(ci, 'interpretation.proposed');
+    assert.equal(proposed.add.length, 500, '截断到 apply 的条数上限');
+
+    // 把提案逐字喂进 apply —— 必须被接受（这正是「提案 == 将写入的」这条契约）。
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: proposed.add, remove: proposed.remove };
+    await run(ca, {});
+    assert.equal(payloadOf(ca, 'feedback.applied').added.length, 500);
+  });
+});
+
+test('nf㉕ 路径闸：大小写别名（APFS 默认大小写不敏感）—— realpath 也解不掉，只有 dev+ino 认得出', async () => {
+  await withOverlay(null, async (_overlay, dir) => {
+    const upper = join(dir, 'RULES.YAML'); // 与 rules.yaml 同一 inode（大小写不敏感盘）
+    if (!existsSync(upper)) {
+      return; // 大小写敏感盘上此别名不成立，跳过（该盘上词法比较本就够）
+    }
+    const prev = process.env.NOISE_OVERLAY_FILE;
+    process.env.NOISE_OVERLAY_FILE = upper;
+    try {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = { add: ['a@x.com'] };
+      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '大小写别名必须被 dev+ino 认出');
+    } finally {
+      process.env.NOISE_OVERLAY_FILE = prev;
+    }
+  });
+});
+
+test('nf㉖ 提案就是将写入的 diff：逼近 loader 字节上限时按字节截断（非只按条数）', async () => {
+  const line = 'u000000000000@example.com'; // 25B + 换行
+  const rows = Math.floor((256 * 1024) / (line.length + 1)) - 6;
+  const seed = Array.from({ length: rows }, (_, i) => `u${String(i).padStart(12, '0')}@example.com`).join('\n') + '\n';
+  await withOverlay(seed, async () => {
+    // 只要 20 条（远低于 500 条上限），但字节预算只放得下少数几条。
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { add: Array.from({ length: 20 }, (_, i) => `extra${String(i).padStart(8, '0')}@example.com`) };
+    await run(ci, { repo: senderRepo([]) });
+    const proposed = payloadOf(ci, 'interpretation.proposed');
+    assert.ok(proposed.add.length < 20, `字节预算应截断提案（实际提议 ${proposed.add.length} 条）`);
+
+    // 提案逐字喂进 apply 必须被接受 —— 这就是「提案 == 将写入的」。
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: proposed.add, remove: proposed.remove };
+    await run(ca, {});
+    assert.deepEqual(payloadOf(ca, 'feedback.applied').added, proposed.add);
   });
 });

@@ -19,6 +19,10 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { applySafetyRules } from './applySafetyRules.js';
 import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 import {
+  canonicalizeOverlayLine,
+  checkEntry,
+  isAddableEntry,
+  readNoiseOverlay,
   getActiveRules,
   reloadRulesConfigForTest,
   resetRulesConfigForTest,
@@ -467,3 +471,65 @@ function captureLogs(fn: () => void): string[] {
   }
   return lines;
 }
+
+// ─────────────── overlay 格式所有权：L ⊆ W 的性质测试 ───────────────
+//
+// 「loader 接受的每一行，写路径都必须能删掉」——这条性质此前靠两处手抄的归一维持，三轮 review 里
+// 因它破裂产生过三类缺陷（谎报 already_present / 静默激活死行 / 存量条目结构性锁死）。
+// 现在 loader 与写路径共用 canonicalizeOverlayLine，故它是构造性事实；本用例是它的回归网。
+
+test('L ⊆ W：readNoiseOverlay 读出的每一行，remove 侧判据必须接受', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-lang-'));
+  const file = join(dir, 'noise_senders.overlay');
+  try {
+    writeFileSync(
+      file,
+      [
+        '<a@b.com>', // 尖括号包裹（旧 writer 可写出）
+        '  A@B.COM  ', // 前后空白 + 大写
+        'root@nas', // 无点域（不可加入，但必须可移除）
+        'admin@10.0.0.5', // 数字 TLD
+        'mailto:a@b.com', // 匹配侧永不命中的形态
+        'plain.domain.example', // 裸域名
+        '', // 空行
+        '   ', // 纯空白行
+        'dup@x.com',
+        'DUP@X.COM', // 归一后重复
+      ].join('\r\n') + '\r\n', // CRLF
+      'utf8',
+    );
+    const lines = readNoiseOverlay(file);
+    assert.ok(lines.length > 0, '语料应产出条目');
+    for (const line of lines) {
+      assert.ok(checkEntry(line, 'remove'), `loader 读出的行必须可被 remove 接受：${JSON.stringify(line)}`);
+      assert.equal(canonicalizeOverlayLine(line), line, `loader 读出的行必须已是归一形态：${JSON.stringify(line)}`);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('可加入判据：dot-atom 点位规则与域标签长度（拒不可投递形态）', () => {
+  for (const bad of [
+    '.a@x.com', // 前导点
+    'a.@x.com', // 尾随点
+    'a..b@x.com', // 连续点
+    'mailto:a@x.com',
+    'a@x.1', // 数字 TLD
+    'a@x.c', // TLD 不足 2 位
+    'root@nas', // 无点域
+    `a@${'x'.repeat(64)}.com`, // 域标签 > 63
+  ]) {
+    assert.equal(isAddableEntry(bad), false, `${bad} 必须不可加入`);
+  }
+  for (const ok of [
+    'a@x.com',
+    'bounces+1=user.com@sendgrid.net', // VERP
+    'srs0=a=b=user@fwd.net', // SRS
+    'ops!tag@x.com',
+    'first.last@company.com',
+    'plain.domain.example',
+  ]) {
+    assert.equal(isAddableEntry(ok), true, `${ok} 必须可加入`);
+  }
+});

@@ -1,73 +1,58 @@
-## 1. canonical 归一与合法性（两个入口共用同一函数）
+## 1. overlay 格式的唯一所有者（`src/rules/rulesConfig.ts`）
 
-- [x] 1.1 `src/pipeline.ts`：`canonicalizeEntry`（`trim` → 去包裹 `<>` → 小写 → 丢空），**interpret 与 apply 共用**
-- [x] 1.2 `isValidEntry`：归一后判空 / 超长 / 控制字符 / 非 ASCII / 域名（末段 ≥2 位纯字母 TLD）/ mailbox（local 非空且不含空白与 `@,;<>"`）
-- [x] 1.3 控制字符与非 ASCII 正则**用码位转义写**（`\u0000-\u001f`、`\u007f`、`^\u0000-\u007f`）；`file(1)` 核对源文件仍是 UTF-8 text 而非 data
-- [x] 1.4 `isCanonicalEntry`：`canonicalizeEntry(raw) === raw && isValidEntry(raw)`——归一幂等性即「调用方走过提案腿」的结构证据
+同一份 overlay 的五个语义问题此前各被 loader / 提案腿 / 应用腿独立回答 2–3 次。**成对一致不具传递性**：三个持有者时把 (A,B) 调平必然打破 (B,C)。故这些答案在本模块各只有一份，`pipeline.ts` 是纯消费者。
 
-## 2. interpret-feedback：新增结构化入口，NL 路径不动
+- [x] 1.1 `canonicalizeOverlayLine(raw): string | null` —— **行归一的唯一实现**（`trim` → 去包裹 `<>` → 小写；空 → null）。loader 读文件与两腿读用户输入全部走它
+- [x] 1.2 `isAddableEntry(s)` —— 可加入判据：非 ASCII/控制字符（**归一前判**，`K` 之类会小写成 ASCII）· 长度 ≤254 · 域名 ≥2 段且每段 ≤63 字节、末段为 ≥2 位纯字母 TLD · local 为 **dot-atom**（atext 段以 `.` 分隔，无前导/尾随/连续点）
+- [x] 1.3 `checkEntry(item, direction)` —— **两腿共用**，方向差异只存在这一处：`add` 要求已归一 **∧** 可加入；`remove` 只要求已归一
+- [x] 1.4 `readOverlayFile(path, mode)` —— **读的唯一实现**，尺寸一律以 `statSync().size` 度量（与 loader 同量；改量解码后字节数会让含无效 UTF-8 的文件出现「loader 采纳、写路径拒绝」的分叉）。失败语义是**参数**：`fail-open`（loader）/ `fail-closed`（写路径与提案腿）
+- [x] 1.5 `isSameFile(a, b)` —— 问文件系统要 `dev`/`ino` 身份。词法比较挡不住软链父目录（k8s `..data`、macOS `/tmp`→`/private/tmp`）与大小写不敏感盘
+- [x] 1.6 `hasOwnKey` / `readOwnKey` —— 自有键读取（`in` 走原型链，被污染的 `Object.prototype` 能凭空造出请求）
+- [x] 1.7 正则一律用码位转义写；`file(1)` 核对源文件为 UTF-8 text 而非 data
 
-- [x] 2.1 `readStructuredFeedback`：input 带 `add`/`remove` 任一键 → 结构化分支；两键都缺 → 既有 `{text}` 路径
-- [x] 2.2 `keepValidEntries`：归一 + 校验 + 按归一后的值去重；非法项 / 非串 / 非数组**静默丢弃，不抛错**
-- [x] 2.3 结构化分支与 overlay 比对（`readNoiseOverlay`，**只读**）：`add` 只提议真会新增的、`remove` 只提议真在名单里的；同项冲突从两侧同时剔除
-- [x] 2.4 `{text}` 路径：`matchNoiseCandidates` **一行未改**，只对其输出做 canonical 化（normalizer 不小写 `fromEmail`，原样 emit 会在应用腿撞上「非 canonical → 抛错」）
-- [x] 2.5 两分支都 emit `interpretation.proposed { add, remove }`——两字段恒在、恰好一次
-- [x] 2.6 删除上一版的 NL 解析器（`parseExplicitEntries` / `looksLikeDomain` / `TOKEN_SPLIT_RE` / `isRemoveIntent` / `REMOVE_MARKERS`）
+## 2. `src/pipeline.ts` 降级为纯消费者
 
-## 3. apply-feedback：集合运算 + 独立校验
+- [x] 2.1 删除本地的 `canonicalizeEntry` / `isValidEntry` / `isCanonicalEntry` / `isCanonicalForm` / `readOverlayStrict` 及五条本地正则、`MAX_ENTRY_LEN`、读侧 `Buffer.byteLength`、`resolve()` 路径比较（净 −99 行）
+- [x] 2.2 `runInterpretFeedback` 结构化分支：`readOverlayFile(..., 'fail-closed')` 读 → `keepValidEntries(raw, direction)` 归一 + 按方向判据 + 去重 → 同项两侧剔除 → 与 overlay 比对
+- [x] 2.3 **提案就是将写入的 diff**：提案腿镜像应用腿的条数闸与序列化字节闸（`fitWithinWriteBudget`），超预算**截断**而非报错——干跑腿不能 throw，但也不能提议一份 apply 必拒的变更
+- [x] 2.4 overlay 读不到时**两侧皆空**：干跑腿此时无法知道 diff，提议出去会让用户确认后拿到 `run.failed`；契约只有两个字段、表达不了「overlay 不可用」。响亮失败由应用腿承担
+- [x] 2.5 `{text}` 腿：`matchNoiseCandidates` **一行未改**；其输出过 `keepValidEntries(_, 'add')`——候选已由 `normalizeSenderForCount` 剥 `<>` + 小写，故**归一维度恒等**，这一层的唯一作用是**过滤**掉不可加入的候选（否则确认后必在应用腿抛错）
+- [x] 2.6 `runApplyFeedback`：`isSameFile` 路径闸 → `readOverlayFile(..., 'fail-closed')` → `(existing ∪ add) \ remove` → 一次原子发布 → 恰好 emit 一次四字段
+- [x] 2.7 `readEntryList`：缺键 → `[]`（不抛）；键在（含值为 `undefined`）但非数组 / 条数超限 / `checkEntry` 不过 → 抛错；错误只回类型 + 长度，不回地址值
+- [x] 2.8 `writeNoiseOverlayAtomic`：写前字节闸（与 loader 同一常量）· tmp 名带 pid · `O_NOFOLLOW` · `mode 0o600` · fs 错误只回 kind（Node 的 message 自带绝对路径）
+- [x] 2.9 `readFeedbackText` 亦改用自有键读取
 
-- [x] 3.1 `readEntryList`：缺 key → `[]`（**不抛错**）；key 存在但非数组 → 抛错；逐项 `isCanonicalEntry` 不过 → 抛错；保序去重
-- [x] 3.2 错误消息**只回形状不回值**（类型 + 长度），地址不进 run trace
-- [x] 3.3 同项同时在两侧 → 抛错（只报条数，不报地址）
-- [x] 3.4 `(existing ∪ add) \ remove` → **一次** `writeNoiseOverlayAtomic`；`added`/`removed` 皆空时跳过写
-- [x] 3.5 `existing` 读入时过同一个 `canonicalizeEntry`，使两个入口的集合同域（否则历史 `<a@b.com>` 行提案说能移出、apply 说 `not_present`）
-- [x] 3.6 emit `feedback.applied` 四字段——恒在、恰好一次
-- [x] 3.7 `rulesConfig.ts` 的 `resolveNoiseOverlayPath` / `readNoiseOverlay` **只读复用不改**；`applySafetyRules.ts` 匹配侧**不改**
+## 3. self-check（`src/pipeline.test.ts` / `src/rules/rulesConfig.test.ts`）
 
-## 4. self-check（`src/pipeline.test.ts`，不铺新框架）
+- [x] 3.1 `withOverlay` **同时设 `RULES_FILE`** —— 否则 `resolveRulesPath()` 仍指向仓内真实 rules.yaml，沙箱那份是生产代码从不命名的**诱饵**，哨兵断言无论生产代码做什么都不会红
+- [x] 3.2 哨兵断言放在 env 还原与 `rmSync` **之后**（放 finally 头部时，哨兵一旦触发会把 env 与 tmp 目录泄漏给后续全部用例）
+- [x] 3.3 **所有反馈用例走产品路径**：interpret 提案 → 把提案**逐字**喂进 apply。手工构造 apply 输入只出现在显式对抗用例里
+- [x] 3.4 `payloadOf` 断言同 kind **恰好一次**；`assertReceiptPartition` 断言四桶与请求配分且两两不交
+- [x] 3.5 nf④–㉖ 覆盖：可逆性（canonical 文件字节回滚 / 人工编辑文件集合等价）· 两向幂等 · 四字段恒在 · canonical 同函数 · 拒非 canonical · 拒非法与畸形 · 同项冲突 · 提案腿不抛错 · 归一后去重 · `not_present` · 规则引擎生效且敏感邮件不降温 · 混合 add+remove · 读失败 fail-closed · **L=W 存量可移除（走产品路径）** · 只认真邮箱 · 写侧三闸 · 原型链（**两腿各一条**）· 字节闸 · 路径闸（软链别名 + 大小写别名）· 提案的条数与字节截断
+- [x] 3.6 `rulesConfig.test.ts` 增 **L ⊆ W 性质测试**：对含 `<>` / 大写 / CRLF / 空行 / 重复 / 无点域 / 数字 TLD 的语料，断言 `readNoiseOverlay` 读出的每一行都被 `checkEntry(_, 'remove')` 接受且已是归一形态
+- [x] 3.7 `rulesConfig.test.ts` 增可加入判据的正反例（dot-atom 点位、域标签 63 字节、VERP/SRS/atext 特殊字符）
 
-- [x] 4.1 `withOverlay` 沙箱：tmp overlay + 同目录 `rules.yaml` 哨兵，哨兵断言放 **`finally`**（放 try 内会在 `fn` 抛出时被静默跳过）
-- [x] 4.2 `payloadOf` 断言该 kind **恰好一次**；`assertReceiptPartition` 断言四桶与请求配分且两两不交
-- [x] 4.3 既有 NL 路径零回退（nf①–③ 未改动仍绿）
-- [x] 4.4 nf④ 可逆性（核心）：canonical 文件 → 字节回滚；人工编辑过的存量文件 → 集合等价
-- [x] 4.5 nf⑤ add/add 与 remove/remove 各自幂等；四字段恒在、无变更不写（mtime 不动）
-- [x] 4.6 nf⑥ canonical 是同一个函数：interpret 的 emit 原样投 apply 通过，写入 bytes 与 emit 逐字相同
-- [x] 4.7 nf⑦ apply 拒非 canonical（4 种未归一形态），overlay 内容与 mtime 均未变
-- [x] 4.8 nf⑧ apply 拒 13 类非法项 + 3 类畸形 shape；缺 `remove` key 正常应用
-- [x] 4.9 nf⑨ 同项冲突 → 抛错、不写
-- [x] 4.10 nf⑩ interpret 不抛错：非法项/冲突项/畸形 shape → 不出现在 emit、无写、run 正常结束
-- [x] 4.11 nf⑪ 归一后去重（interpret 侧 `A@X.com` 与 `a@x.com` 一项）
-- [x] 4.12 nf⑫ remove 不在名单 → `not_present`、`removed` 空、文件未变
-- [x] 4.13 nf⑬ 集成：apply 后经 `reloadRulesConfigForTest` 生效 → 非敏感 P2 落 P3；**敏感邮件不被降温、仍不自动已读**
+## 4. mutation 验证（守卫删了必须有断言挂）
 
-## 5. mutation 验证（对 4.6/4.7/4.9/4.8 四条守卫）
+- [x] 4.1 `canonicalizeOverlayLine` 不再剥 `<>` → `pipeline.test` 挂 4 条（证明 pipeline **真的在用** rulesConfig 那一份，而不是又抄了一份）
+- [x] 4.2 `checkEntry` 方向差异被抹平 → 两个测试文件各挂
+- [x] 4.3 `readOverlayFile` 的 fail-closed 改回空集 → 挂
+- [x] 4.4 `hasOwnKey` 退回 `in` → 挂
+- [x] 4.5 `isSameFile` **完全**退回词法 `resolve()` → 挂（首次变异只删 `dev/ino` 分支，剩下的 realpath fallback 仍能挡软链，故那次回绿是变异无效而非守卫多余）
+- [x] 4.6 提案腿**字节**预算截断被删 → 挂（首次变异连条数一起删，而条数在 `keepValidEntries` 里另有一道，故那次回绿同因）
+- [x] 4.7 写侧三闸、非数组抛错、`{add:undefined}` 抛错逐条挂
 
-- [x] 5.1 去掉 `isCanonicalEntry` 的幂等判据 → 测试挂
-- [x] 5.2 删掉同项冲突守卫 → 测试挂
-- [x] 5.3 `readEntryList` 的非数组抛错改成 `return []` → 测试挂（首次变异误命中了 `keepValidEntries` 的同形行，重打后确认）
-- [x] 5.4 让 `canonicalizeEntry` 不再剥 `<>`（归一漂一个字符）→ 测试挂
+## 5. 运维与卫生
 
-## 6. 验证与收尾
+- [x] 5.1 `.gitignore` 加 `rules/noise_senders.overlay` —— 线上它在部署 checkout 里以未跟踪状态躺着：一个 `git clean -fd` 会抹掉 operator 攒的整份名单，误提交则把真实发件人地址推进仓库
+- [ ] 5.2 上线后通知 hangar 侧再放 view（**部署序：inbox 先、view 后**；且需等 hangar 侧自己的验证轮完成）
+- [ ] 5.3 生产验收（**两步都要，只验第一步会必然通过而用户的邮件照旧被降噪**）：
+      ① 加一个地址 → 移出同一地址 → overlay 字节回到原内容；忙时重发 apply 幂等
+      ② **重启 hangar daemon**，再确认该发件人的邮件确实不再被静默标已读——overlay 由 CLI 进程写，而规则快照在常驻 daemon 启动时读一次、生产未接热重载（见 design 已知残留）
+
+## 6. 验证
 
 - [x] 6.1 `pnpm build`（tsc）clean
-- [x] 6.2 全量 `pnpm test` 绿（459）
-- [x] 6.3 `file(1)` 核对 `src/pipeline.ts` / `src/pipeline.test.ts` / spec delta 均为 UTF-8 text（无裸控制字节）
-- [ ] 6.4 上线后通知 hangar 侧再放 view（**部署序：inbox 先、view 后**）
-- [ ] 6.5 生产验一遍：加一个地址 → 移出同一地址 → overlay 回到原内容；忙时重发 apply 幂等
-
-## 7. round-2 对抗 review 的修复（三 slot + 冷读 + ASE 收敛）
-
-- [x] 7.1 **写路径 fail-closed**：新增 `readOverlayStrict`——只把 `ENOENT` 视为空集，其余读错误与「已超 loader 上限」抛错；提案腿读失败时跳过 overlay 比对而非把 remove 提议吞空
-- [x] 7.2 **两腿与 loader 同域**：删掉两处 `.map(canonicalizeEntry)`，逐行归一严格等于 loader 的 trim+lower（初稿在 loader 之上再叠一层，导致对存量 `<a@b>` 行谎报 `already_present`、不写盘、邮件不降噪）
-- [x] 7.3 **local 换 RFC atext 白名单**：黑名单放行 `mailto:`/`()`/`[]`/`\` → 写进永不命中的条目 = false-green；白名单同时保住 VERP/SRS 与 `ops!tag`
-- [x] 7.4 **remove 侧只要求归一幂等**：否则本能力生效前写入的存量条目结构性不可移除，而契约禁止手改机器文件
-- [x] 7.5 **写侧三闸**：字节数 > loader 上限 → 抛错；单侧条目数 > 500 → 抛错；overlay 路径 == 当前配置的 `rules.yaml` → 抛错（硬 MUST 此前零结构约束）
-- [x] 7.6 **写入加固**：tmp 名带 pid、`O_NOFOLLOW`、`mode 0o600`；fs 错误只回 kind（Node 的 message 自带绝对路径）
-- [x] 7.7 **`Object.hasOwn` 取代 `in`**；`{add: undefined}` 归入「键在但非 `string[]`」→ 抛错
-- [x] 7.8 **干跑腿的 O(n·m) 改 Set**（32000 条实测同步阻塞 9.2 秒，而 40 行之下同一运算本就用 Set）
-- [x] 7.9 `withOverlay` 的哨兵断言挪到 env 还原与 `rmSync` 之后（此前哨兵一旦触发会把 env 与 tmp 目录泄漏给全部后续用例）
-- [x] 7.10 新增 self-check nf⑭–㉑：混合 add+remove 的核心表达式 · 读失败 fail-closed · loader 同域 · 存量可移除 · 只认真邮箱 · 写侧三闸 · 原型链与 `undefined` · 字节闸
-- [x] 7.11 对上述 8 条新守卫逐条 mutation 验证（删掉守卫 → 对应断言必挂），全部通过
-- [x] 7.12 规范补洞：合法性表补「长度」行与「域名 ≥2 段」· 定义 `existing`（来源/归一/读失败）· 可逆性改述为「字节是有序条目集的纯函数」（原措辞可被 `add X→add Y→remove X` 字面证伪）· `{text}` 腿场景改为「合法子集」· input 形态路由与 `{add:undefined}` 入规范
-- [x] 7.13 design ⑥ 的理由更正（候选经 `normalizeSenderForCount` 已 canonical，该层作用是过滤不是归一）；新增决策 ⑧⑨；残留清单据实重写
-- [x] 7.14 `proposal.md` 行为变更补「移出后需重启 daemon 才实际解静音」与「只处理真正的邮箱」；非目标里「不新增裸域名显式入口」改为据实措辞
+- [x] 6.2 全量 `pnpm test` 绿
+- [x] 6.3 `file(1)` 核对改动文件均为 UTF-8 text（无裸控制字节）
+- [x] 6.4 OpenSpec `--strict` 验证通过
