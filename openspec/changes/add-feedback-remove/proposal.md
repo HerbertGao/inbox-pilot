@@ -34,13 +34,16 @@
 - **代码**：`src/pipeline.ts`（结构化入口、共用 canonicalize、集合运算与四态回执、应用腿收紧）、`src/pipeline.test.ts`（self-check）。`src/rules/rulesConfig.ts` 的 `resolveNoiseOverlayPath` / `readNoiseOverlay` **只读复用、不改**；`src/rules/applySafetyRules.ts` 匹配侧**不改**；`matchNoiseCandidates` **一行不改**。
 - **规范**：`rules-config`、`processing-pipeline`。
 - **跨仓部署序**：**inbox 先上线、view 后上线**。反序时提案阶段即契约不符，**此时无写**。
-- **行为变更（须知）**：应用腿对非法项与**非 canonical 项**从「静默归一/丢弃」改为**抛错**。这是把「确认页显示的 == 实际写入的」从纪律变成结构保证的代价——调用方必须先走提案腿。
+- **行为变更（须知）**：
+  1. 应用腿对非法项与**非 canonical 项**从「静默归一/丢弃」改为**抛错**——调用方必须先走提案腿。
+  2. **「移出」后需重启 daemon 才实际解静音**：overlay 由 CLI 进程写，而规则快照在常驻 daemon 启动时读一次、生产未接热重载（见 design 的已知残留）。回执报的是**文件已改**，不是**已生效**。
+  3. 只处理**真正的邮箱**：`mailto:` 前缀、带括号/方括号/反斜杠的 local、无点域（`root@nas`）、数字 TLD（`admin@10.0.0.5`）一律拒——它们在匹配侧永不命中，写进去是 false-green。既有 `{text}` 路径命中这类候选时会**静默不进提案**。
 
 ## 非目标
 
 - **不新增 trigger、不改 hangar core、不加 Approval/PARK/新 Run 状态、不接 Pi/MCP、不加 `intents:`**。
 - **不在 pilot 里做 NL 意图解析**（定型决策：NL→结构化归调用方）。
-- **不新增裸域名显式入口**；overlay 允许域名条目是 `rules-config` 的既有行为，本变更不引入新的匹配侧风险。
+- **不新增裸域名专用入口 / 不加区分展示**：结构化 `add` 与 overlay 既有行为一致地接受域名条目，而匹配侧对域名是**后缀匹配（含全部子域）**——确认页上 `taobao.com` 与一个普通地址视觉同构、作用域却差一个量级，由人工确认兜底。区分展示属跨仓 UX，另开一条。
 - **不做 IDN 支持**（需写入侧与匹配侧同时改 + 存量 overlay 迁移，单独一条）。
 - **不做 overlay → `rules.yaml` 固化 / 清理工具**。
 - **不改**「不追溯历史邮件」「敏感邮件不降温、不自动已读」的既有语义。

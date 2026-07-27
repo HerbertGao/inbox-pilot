@@ -41,9 +41,25 @@
 
 不静默任选一边：`(existing ∪ add) \ remove` 会让 remove 悄悄胜出，而回执 `{added:[X], removed:[X]}` 在读者眼里是「加了又移了」、文件里却没有 X——回执说谎，且 view 的跨桶检查会判它失败。提案腿则把该项从两侧同时剔除（它不抛错）。
 
-### ⑥ `{text}` 路径的输出做 canonical 化
+### ⑥ `{text}` 路径的输出过一次合法性过滤（不是归一）
 
-`matchNoiseCandidates` **一行未改**（匹配集不变），但其输出要过一次归一：normalizer **不**小写 `fromEmail`，原样 emit 会让混合大小写的候选在应用腿撞上决策 ③ 的「非 canonical → 抛错」而断腿。对已是小写的候选（绝大多数）这是逐字节的恒等变换。
+`matchNoiseCandidates` **一行未改**（匹配集不变），其输出过一遍 `keepValidEntries`。
+
+**这一层的作用是过滤，不是归一。** 候选来自 `repo.countRecentSenders`，其 `fromEmail` 已由 `mailRepo.ts` 的 `normalizeSenderForCount` 剥 `<>` + trim + 小写，所以归一维度上这层是恒等的。真正的效果是把不合本能力合法性规则的候选（无点域 `root@nas`、数字 TLD `admin@10.0.0.5`、引号 local `"a,b"@x.com`）挡在提案之外——否则用户确认后必在应用腿撞上决策 ③ 抛错，回路当场断掉。
+
+代价诚实记下：这批发件人在**匹配侧本来是生效的**（`normalizeFromAddress` 产出同一串），本能力生效后它们**无法**再经反馈闭环加入，且提案腿静默丢弃、用户只看到空提案。这是「只处理真正的邮箱」这条定型决策的直接后果，规范场景已按「合法子集」而非「逐项相同」措辞。
+
+（本节初稿写的理由是「normalizer 不小写 fromEmail，原样 emit 会撞上非 canonical 抛错」——**该理由为假**：候选不经 `normalizeEmail`，经的是 `normalizeSenderForCount`。两轮 review 各自独立指出并实测。）
+
+### ⑧ loader 是「一行是什么」的唯一权威
+
+两腿读 overlay 时**不得**在 loader 的逐行归一（trim + 小写）之上再叠一层（如剥 `<>`）。初稿为了消除「提案腿剥 `<>`、应用腿不剥」的不对称，在两腿都加了一层 `canonicalizeEntry`——两腿是一致了，却和 loader 分道扬镳：存量行 `<alice@example.com>` 在 loader 眼里是一条独立死行，在两腿眼里是 `alice@example.com`，于是用户想加这个地址时得到「已在名单里」的回执、文件没动、邮件照旧不降噪。**同一份文件被两个消费者读成不同的集合，是比两腿不对称更坏的一类 bug。**
+
+### ⑨ 读的失败语义按方向分：loader fail-open，写路径 fail-closed
+
+同一个「读不到 overlay」，两侧要相反的默认。loader 读不到 → 空集是对的（不静音，安全方向）。写路径读不到 → **绝不能**当空集：add 侧会全量覆盖抹掉整份名单并回绿；remove 侧会回执 `not_present`，而地址其实还在名单里、还在被静默已读——用户以为已撤销、不会重试，而这正是本变更存在的理由。故写路径只把 `ENOENT` 视为空集，其余一律抛错。
+
+跨仓契约把这块明确委托给了本侧：view 的四桶校验**不是**「回执与磁盘一致」，后者只能由 pilot 侧 self-check 兑现。初稿把它记成「已知残留」，等于没接住这个委托。
 
 ### ⑦ 无实际变更时不写文件
 
@@ -61,11 +77,12 @@
 
 ## 已知残留（本变更不修，明确记账）
 
-- **写路径复用了读路径的 fail-open**：`readNoiseOverlay` 对 loader 是正确的（读不到→不静音，安全方向），但应用腿把 `[]` 当「现有集为空」后会全量覆盖。实测 overlay `chmod 000` 或超过 loader 的 256KB 上限时，一次 apply 会静默抹掉整份名单并回绿。属既有缺口（add 路径上早已存在），修法是写路径改用只把 `ENOENT` 视为空的严格读取。
-- **overlay 改动在常驻 daemon 内不生效**：`startRulesConfigReload` 全仓只有测试调用，生产 `buildAndPublish` 只在模块加载时跑一次；hangar daemon 长驻 + ESM 模块缓存 ⇒ 移出后需重启 daemon 才实际解静音。属既有缺口（`rules-config` 规范的「改即生效」在生产未接线）。
-- **校验不过的历史 overlay 行仍被 loader 消费**：如一行 `com` 会让所有 `.com` 发件人命中降噪，而新校验器不允许经反馈路径移除它（提案腿会把它过滤掉）。修法是让 loader 与应用腿共用同一套合法性过滤。
+- **overlay 改动在常驻 daemon 内不立即生效**：`startRulesConfigReload` 全仓只有测试调用，生产 `buildAndPublish` 只在模块加载时跑一次；hangar daemon 长驻 + ESM 模块缓存 ⇒ **移出后需重启 daemon 才实际解静音**。属既有缺口（`rules-config` 规范的「改即生效」在生产未接线），修它要动 rules-config 的生命周期接线，越出本变更范围。
+  **这条必须对用户可见**，否则本变更的用户可见目标在生产上不成立而全套验收仍会绿：已同步写入 `proposal.md` 的「行为变更（须知）」与 `tasks.md` 的生产验收步骤。
+- **校验不过的历史 overlay 行仍被 loader 消费**：如一行 `com` 会让所有 `.com` 发件人命中降噪。本变更已让这类行**可经 remove 删除**（决策见 `rules-config` 的「两侧合规判据不同」），但 loader 仍会消费它们直到被删。让 loader 与写侧共用同一套合法性过滤属 loader 侧改动，另开一条。
+- **跨进程并发写丢更新**：进程内 read-modify-write 全程同步、不可交错；跨进程无锁。tmp 文件名已带 pid（消除互踩与软链预置），但两个进程同时 apply 仍可能后写覆盖先写，而先写那次的回执是成功的。单容器部署下触发面 = 滚动重启窗口，概率低；真要闭合需锁文件或 CAS。
 
-三条都不是本变更引入的，且修法都会越出「只动反馈闭环」的范围，故记账不修。
+原先记在此处的另两条（**写路径复用读路径的 fail-open**、**归一分歧导致谎报 `already_present`**）已在本轮修掉——前者是跨仓契约明确委托给本侧的磁盘真相，不该记成残留；后者是初稿自己引入的。
 
 ## 风险
 

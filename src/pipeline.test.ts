@@ -6,7 +6,7 @@
 // spy 计到的真实 classify 调用数。
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -1115,7 +1115,7 @@ test('nf⑦ apply 拒非 canonical：未归一串直投 apply → throw、overla
     for (const raw of ['  <FOO@Example.COM>  ', 'A@X.com', ' a@x.com', '<a@x.com>']) {
       const ctx = makeCtx('apply-feedback');
       ctx.input = { add: [raw] };
-      await assert.rejects(run(ctx, {}), /非 canonical 或非法项/, `未归一串 ${JSON.stringify(raw)} 必须 throw`);
+      await assert.rejects(run(ctx, {}), /含不合规项/, `未归一串 ${JSON.stringify(raw)} 必须 throw`);
     }
     assert.equal(readFileSync(overlay, 'utf8'), before, 'overlay 内容未变');
     assert.equal(statSync(overlay).mtimeMs, mtimeBefore, 'overlay 未被写（校验先于写）');
@@ -1145,7 +1145,7 @@ test('nf⑧ apply 拒非法项与畸形 input；缺 key 视作 []（部署窗口
     for (const item of illegal) {
       const ctx = makeCtx('apply-feedback');
       ctx.input = { add: [item] };
-      await assert.rejects(run(ctx, {}), /非 canonical 或非法项/, `非法项 ${String(item)} 必须 throw`);
+      await assert.rejects(run(ctx, {}), /含不合规项/, `非法项 ${String(item)} 必须 throw`);
     }
 
     // key 存在但不是 string[] → throw（当空集会让「忽略畸形输入并回四个空桶」走成功路径）。
@@ -1256,5 +1256,163 @@ test('nf⑬ apply 后即生效于规则引擎：非敏感 → P3；敏感邮件�
     } finally {
       resetRulesConfigForTest(); // 隔离：不把本用例的名单泄漏给同文件后续用例
     }
+  });
+});
+
+// ─────────────── round-2 review 补的守卫（每条对应一处实测缺陷） ───────────────
+
+test('nf⑭ 集合运算：一次 apply 同时含非空 add 与非空 remove（核心表达式，此前无人守）', async () => {
+  await withOverlay('a@x.com\nb@x.com\nc@x.com\n', async (overlay) => {
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { add: ['new@x.com', 'a@x.com'], remove: ['b@x.com', 'ghost@x.com'] };
+    await run(ctx, {});
+    const p = payloadOf(ctx, 'feedback.applied');
+    assert.deepEqual(p.added, ['new@x.com']);
+    assert.deepEqual(p.already_present, ['a@x.com']);
+    assert.deepEqual(p.removed, ['b@x.com']);
+    assert.deepEqual(p.not_present, ['ghost@x.com']);
+    assertReceiptPartition(p, ['new@x.com', 'a@x.com'], ['b@x.com', 'ghost@x.com']);
+    assert.equal(readFileSync(overlay, 'utf8'), 'a@x.com\nc@x.com\nnew@x.com\n', '(existing ∪ add) \\ remove 一次原子写');
+  });
+});
+
+test('nf⑮ overlay 读失败 → 写路径 fail-closed：apply 抛错不覆盖；提案腿不把「读不到」当「不在名单」', async () => {
+  await withOverlay('silenced@boss.com\nkeep@a.com\n', async (overlay) => {
+    const before = readFileSync(overlay, 'utf8');
+    chmodSync(overlay, 0o000);
+    try {
+      // 写路径：读不到就拒绝改写，绝不把 [] 当「现有集为空」后全量覆盖。
+      const cAdd = makeCtx('apply-feedback');
+      cAdd.input = { add: ['new@d.com'] };
+      await assert.rejects(run(cAdd, {}), /overlay 读取失败/, 'apply 必须 fail-closed');
+
+      const cRm = makeCtx('apply-feedback');
+      cRm.input = { remove: ['silenced@boss.com'] };
+      await assert.rejects(run(cRm, {}), /overlay 读取失败/, 'remove 侧同样 fail-closed（否则回执谎报 not_present）');
+
+      // 提案腿不 throw，但也不得把读不到当「不在名单」而把 remove 提议吞掉。
+      const ci = makeCtx('interpret-feedback');
+      ci.input = { remove: ['silenced@boss.com'] };
+      await run(ci, { repo: senderRepo([]) });
+      assert.deepEqual(
+        payloadOf(ci, 'interpretation.proposed').remove,
+        ['silenced@boss.com'],
+        '读不到时跳过 present 过滤，不显示「无可移出」',
+      );
+    } finally {
+      chmodSync(overlay, 0o644);
+    }
+    assert.equal(readFileSync(overlay, 'utf8'), before, '全程未被改写');
+  });
+});
+
+test('nf⑯ 两腿与 loader 对「一行是什么」不得分歧：存量 <a@b> 行不被改写成合法存在项', async () => {
+  await withOverlay('<alice@example.com>\n', async (overlay, dir) => {
+    try {
+      reloadRulesConfigForTest(join(dir, 'rules.yaml'));
+      assert.deepEqual(getActiveRules().noiseSenders, ['<alice@example.com>'], 'loader 视其为独立死行');
+
+      const ci = makeCtx('interpret-feedback');
+      ci.input = { add: ['alice@example.com'] };
+      await run(ci, { repo: senderRepo([]) });
+      assert.deepEqual(payloadOf(ci, 'interpretation.proposed').add, ['alice@example.com'], '应提议新增，而非「已在名单」');
+
+      const ca = makeCtx('apply-feedback');
+      ca.input = { add: ['alice@example.com'] };
+      await run(ca, {});
+      assert.deepEqual(payloadOf(ca, 'feedback.applied').added, ['alice@example.com']);
+      assert.equal(readFileSync(overlay, 'utf8'), '<alice@example.com>\nalice@example.com\n', '真正落盘');
+    } finally {
+      resetRulesConfigForTest();
+    }
+  });
+});
+
+test('nf⑰ 存量条目可移除：master 期写进去的不合新规条目不得结构性锁死', async () => {
+  await withOverlay('root@nas\nadmin@10.0.0.5\nkeep@a.com\n', async (overlay) => {
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { remove: ['root@nas', 'admin@10.0.0.5'] };
+    await run(ctx, {});
+    const p = payloadOf(ctx, 'feedback.applied');
+    assert.deepEqual(p.removed.sort(), ['admin@10.0.0.5', 'root@nas'], 'remove 只要求归一幂等，不要求合法');
+    assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n');
+
+    // 反向：同样的串走 add 仍必须被拒（只处理真正的邮箱）。
+    const bad = makeCtx('apply-feedback');
+    bad.input = { add: ['root@nas'] };
+    await assert.rejects(run(bad, {}), /含不合规项/, 'add 侧仍要求完整合法性');
+  });
+});
+
+test('nf⑱ 只处理真正的邮箱：mailto:/comment/括号一律拒；VERP 与 SRS 收', async () => {
+  await withOverlay(null, async () => {
+    for (const bad of ['mailto:alice@example.com', 'a(b)c@x.com', 'a[b]@x.com', 'a\\b@x.com']) {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = { add: [bad] };
+      await assert.rejects(run(ctx, {}), /含不合规项/, `${bad} 在匹配侧永不命中，必须拒`);
+    }
+    const ok = makeCtx('apply-feedback');
+    ok.input = { add: ['bounces+1=user.com@sendgrid.net', 'srs0=a=b=user@fwd.net', 'ops!tag@x.com'] };
+    await run(ok, {});
+    assert.equal(payloadOf(ok, 'feedback.applied').added.length, 3, 'VERP/SRS/atext 特殊字符照收');
+  });
+});
+
+test('nf⑲ 写侧闸门：条数上限、字节上限、NOISE_OVERLAY_FILE 指向 rules.yaml 一律拒', async () => {
+  await withOverlay(null, async (_overlay, dir) => {
+    const many = makeCtx('apply-feedback');
+    many.input = { add: Array.from({ length: 501 }, (_, i) => `u${i}@x.com`) };
+    await assert.rejects(run(many, {}), /条目数超上限/);
+
+    // 路径闸：把 NOISE_OVERLAY_FILE 指到**当前配置的** rules.yaml（故 RULES_FILE 同步指过去）。
+    // 无此闸时实测会把人工 YAML 按 overlay 平铺格式整体重写、缩进结构毁掉，而 run 仍是绿的。
+    const prevOverlay = process.env.NOISE_OVERLAY_FILE;
+    const prevRules = process.env.RULES_FILE;
+    process.env.NOISE_OVERLAY_FILE = join(dir, 'rules.yaml');
+    process.env.RULES_FILE = join(dir, 'rules.yaml');
+    try {
+      const evil = makeCtx('apply-feedback');
+      evil.input = { add: ['a@x.com'] };
+      await assert.rejects(run(evil, {}), /指向了 rules.yaml/, '硬 MUST 要有结构约束，不能只靠注释');
+    } finally {
+      process.env.NOISE_OVERLAY_FILE = prevOverlay;
+      if (prevRules === undefined) {
+        delete process.env.RULES_FILE;
+      } else {
+        process.env.RULES_FILE = prevRules;
+      }
+    }
+  });
+});
+
+test('nf⑳ {add:undefined} 属「键在但非 string[]」→ throw（两腿不得对同一 input 给相反语义）', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
+    const before = readFileSync(overlay, 'utf8');
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { add: undefined, remove: ['keep@a.com'] };
+    await assert.rejects(run(ctx, {}), /必须是 string\[\]/);
+    assert.equal(readFileSync(overlay, 'utf8'), before, '拒绝时不写');
+
+    // 原型链上的 add 不得被当成请求（apply 自称不信调用方）。
+    const polluted = Object.create({ add: ['attacker@evil.com'] }) as Record<string, unknown>;
+    const proto = makeCtx('apply-feedback');
+    proto.input = polluted;
+    await run(proto, {});
+    assert.deepEqual(payloadOf(proto, 'feedback.applied').added, [], '原型链属性不参与');
+    assert.equal(readFileSync(overlay, 'utf8'), before, '未写入');
+  });
+});
+
+test('nf㉑ 字节闸：写下去会越过 loader 上限 → 抛错不写（越限后 loader 会整份忽略 = 所有降噪失效）', async () => {
+  // 种一份逼近 loader 上限的 overlay（每行 24B），再 add 到越限。
+  const line = 'u000000000000@example.com';
+  const rows = Math.floor((256 * 1024) / (line.length + 1)) - 2;
+  const seed = Array.from({ length: rows }, (_, i) => `u${String(i).padStart(12, '0')}@example.com`).join('\n') + '\n';
+  await withOverlay(seed, async (overlay) => {
+    const before = readFileSync(overlay, 'utf8');
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { add: Array.from({ length: 10 }, (_, i) => `extra${i}@example.com`) };
+    await assert.rejects(run(ctx, {}), /将超过 loader 上限/);
+    assert.equal(readFileSync(overlay, 'utf8'), before, '拒绝时不写');
   });
 });

@@ -21,13 +21,14 @@
 // STATE_BY_KIND（events.ts）——否则 appendEvent 遇生命周期 kind 会误移状态。外部 pilot 不 import
 // @hangar/core，此约束由命名纪律 + 本注释守（待解问题 R3 CR-n1）。
 
-import { renameSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import type { Logger } from 'pino';
 
 import { loadConfig } from './config/config.js';
 import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
-import { readNoiseOverlay, resolveNoiseOverlayPath } from './rules/rulesConfig.js';
+import { MAX_RULES_FILE_BYTES, resolveNoiseOverlayPath, resolveRulesPath } from './rules/rulesConfig.js';
 import { loadEnabledAccounts } from './accounts/accountRegistry.js';
 import type { Account } from './providers/provider.js';
 import { ProviderReauthRequired } from './providers/provider.js';
@@ -329,13 +330,21 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
   if (structured !== null) {
     // 与 overlay 比对（只读，无写副作用）：add 只提议真会新增的、remove 只提议真在名单里的，
     // 使确认页展示的即实际会发生的变更；重发/绕过 UI 直调 apply 的幂等回执由 apply 的四态兜住。
-    const present = new Set(readNoiseOverlay(resolveNoiseOverlayPath()).map(canonicalizeEntry));
+    // **读不到时 present 为 null → 跳过这层过滤**，绝不把「读不到」当「不在名单」：那会让确认页显示
+    // 「无可移出」而用户以为已撤销。干跑腿不 throw，响亮失败留给 apply 腿的严格读。
+    let present: Set<string> | null;
+    try {
+      present = new Set(readOverlayStrict(resolveNoiseOverlayPath()));
+    } catch {
+      present = null;
+    }
     const addAll = keepValidEntries(structured.add);
     const removeAll = keepValidEntries(structured.remove);
-    const conflicting = new Set(addAll.filter((s) => removeAll.includes(s))); // 同项两侧 → 两边都剔除
+    const removeSet = new Set(removeAll); // Set 而非 Array.includes：干跑腿是最不设防的入口，O(n·m) 会同步卡死 daemon
+    const conflicting = new Set(addAll.filter((s) => removeSet.has(s))); // 同项两侧 → 两边都剔除
     ctx.emit('interpretation.proposed', {
-      add: addAll.filter((s) => !conflicting.has(s) && !present.has(s)),
-      remove: removeAll.filter((s) => !conflicting.has(s) && present.has(s)),
+      add: addAll.filter((s) => !conflicting.has(s) && !present?.has(s)),
+      remove: removeAll.filter((s) => !conflicting.has(s) && (present === null || present.has(s))),
     });
     return;
   }
@@ -347,8 +356,10 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
   const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
   // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
   const matched = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
-  // 匹配集不变（matchNoiseCandidates 一行未改），只把输出转成 canonical 形态：normalizer **不**小写
-  // `fromEmail`，原样 emit 会让混合大小写的候选在 apply 侧撞上「非 canonical → throw」而断腿。
+  // 候选已由 `normalizeSenderForCount`（mailRepo.ts）剥 `<>` + 小写，故此处**不做归一**（归一维度恒等）。
+  // `keepValidEntries` 在这条腿上的唯一作用是**过滤**：不合本能力合法性规则的候选（如无点域 `root@nas`、
+  // 数字 TLD `admin@10.0.0.5`）不进提案——否则确认后必在 apply 腿抛错。故本腿的 add 是变更前结果的
+  // **canonical 子集**，规范场景已按此措辞（不是逐项相同）。
   ctx.emit('interpretation.proposed', { add: keepValidEntries(matched), remove: [] });
 }
 
@@ -448,8 +459,14 @@ const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 const NON_ASCII_RE = /[^\u0000-\u007f]/;
 /** 域名：段以 `[a-z0-9]` 起止、段内可含 `-`，**末段必须是 ≥2 位纯字母 TLD**（挡掉 `x.1`/`x.c`）。 */
 const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$/;
-/** mailbox local part 的禁用字符：空白与 `@,;<>"`（黑名单，不误拒 `ops!tag@x.com` 这类合法写法）。 */
-const LOCAL_FORBIDDEN_RE = /[\s@,;<>"]/;
+/**
+ * mailbox local part：RFC 5322 atext + `.` 的**白名单**。收 VERP/SRS（`bounces+1=user.com@x.net`、
+ * `srs0=a=b=user@fwd.net`）与 `ops!tag@x.com`；拒 `:`、`()`、`[]`、`\`、`,`、空白。
+ * **不用黑名单**：黑名单会放行 `mailto:alice@example.com` 这类串——它过校验、过四桶配分、确认页如实显示，
+ * 但匹配侧 `normalizeFromAddress` 产出的是 `alice@example.com`，该条目**永不命中** = false-green，
+ * 与本能力拒绝 IDN 的理由是同一条。只处理真正的邮箱。
+ */
+const LOCAL_RE = /^[a-z0-9!#$%&'*+\-/=?^_`{|}~.]+$/;
 /** 条目总长上限（信任边界护栏：调用方可绕过 UI 直调 apply，无上限则单行可撑爆 overlay）。 */
 const MAX_ENTRY_LEN = 254;
 
@@ -475,8 +492,37 @@ function isValidEntry(s: string): boolean {
   if (at === -1) {
     return DOMAIN_RE.test(s);
   }
-  const local = s.slice(0, at);
-  return local.length > 0 && !LOCAL_FORBIDDEN_RE.test(local) && DOMAIN_RE.test(s.slice(at + 1));
+  // local 取首个 `@` 之前；多 `@` 时余下的 `@` 落进 domain 段，被 DOMAIN_RE 的字符类拒掉。
+  return LOCAL_RE.test(s.slice(0, at)) && DOMAIN_RE.test(s.slice(at + 1));
+}
+
+/**
+ * **写路径与提案腿共用的严格读**：与 loader 的 `readNoiseOverlay` 逐行归一一致（`trim` + 小写 + 丢空，
+ * **不剥 `<>`**——loader 是 overlay 行语义的唯一权威，在其之上再归一会让两个消费者把同一份文件读成
+ * 不同的集合，进而谎报 `already_present`）。
+ *
+ * 与 loader 的**唯一**差别是失败语义：loader 读不到→空集是正确的 fail-open（读不到就不静音，安全方向）；
+ * 写路径**必须 fail-closed**——把「读不到」当「现有集为空」会让随后的全量覆盖静默抹掉整份名单，
+ * 或让 remove 回执谎报 `not_present`（地址其实还在名单里、还在被静默已读）。
+ */
+function readOverlayStrict(overlayPath: string): string[] {
+  let text: string;
+  try {
+    text = readFileSync(overlayPath, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return []; // 文件不存在是常态（首次 apply），这才是真正的空集。
+    }
+    throw new Error(`inbox pipeline: overlay 读取失败，拒绝据此改写名单（kind=${code ?? 'unknown'}）`);
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_RULES_FILE_BYTES) {
+    throw new Error('inbox pipeline: overlay 已超过 loader 上限，拒绝据此改写名单（loader 正整份忽略它）');
+  }
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim().toLowerCase())
+    .filter((l) => l.length > 0);
 }
 
 /**
@@ -484,7 +530,15 @@ function isValidEntry(s: string): boolean {
  * 这条让「确认页显示的 == 实际写入的」从纪律变成结构保证（apply 侧据此 throw）。
  */
 function isCanonicalEntry(raw: unknown): raw is string {
-  return typeof raw === 'string' && canonicalizeEntry(raw) === raw && isValidEntry(raw);
+  return isCanonicalForm(raw) && isValidEntry(raw);
+}
+
+/**
+ * 只判**归一幂等**（不判合法性），供 remove 侧使用：要删的东西可能是 master 期写进去的存量条目，
+ * 它不合新的合法性规则，但它确实在文件里、确实在静音邮件，必须能被删掉。
+ */
+function isCanonicalForm(raw: unknown): raw is string {
+  return typeof raw === 'string' && raw.length > 0 && canonicalizeEntry(raw) === raw;
 }
 
 /**
@@ -507,7 +561,12 @@ function isCanonicalEntry(raw: unknown): raw is string {
 async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Promise<void> {
   const { add, remove } = normalizeFeedbackInput(ctx.input);
   const overlayPath = resolveNoiseOverlayPath();
-  const existing = new Set<string>(readNoiseOverlay(overlayPath).map(canonicalizeEntry));
+  // 「绝不碰 rules.yaml」是硬 MUST，此前只由注释与纪律守着：`NOISE_OVERLAY_FILE` 是 operator 可控 env，
+  // 指错即把人工维护的 YAML 按 overlay 的平铺格式整体重写（缩进结构直接毁掉、无备份、run 还是绿的）。
+  if (resolve(overlayPath) === resolve(resolveRulesPath())) {
+    throw new Error('inbox pipeline: NOISE_OVERLAY_FILE 指向了 rules.yaml，拒绝写入（overlay 必须是独立机器文件）');
+  }
+  const existing = new Set<string>(readOverlayStrict(overlayPath));
   const added: string[] = [];
   const alreadyPresent: string[] = [];
   const removed: string[] = [];
@@ -555,26 +614,40 @@ function normalizeFeedbackInput(input: unknown): { add: string[]; remove: string
   return { add, remove };
 }
 
-/** 读 `input[key]`：缺键 → []；非数组 / 非串项 / 非 canonical 项 → throw；保序去重。 */
+/** 单侧条目数上限：`MAX_ENTRY_LEN` 只界住一行，不界住行数——无此闸时一次调用即可把 overlay 顶过 loader 上限。 */
+const MAX_ENTRIES_PER_KEY = 500;
+
+/**
+ * 读 `input[key]`：**键不存在** → `[]`；键在（含值为 `undefined`）但非数组、条数超限、或含不合规项 → throw；
+ * 保序去重。用 `Object.hasOwn` 而非 `in`：`in` 走原型链，被污染的 `Object.prototype.add` 会让一个 `{}`
+ * 变成带条目的写请求——本腿自称「不信调用方、重新校验」，就不该从原型链取值。
+ *
+ * **两侧的合规判据不同**：`add` 要求完整 `isCanonicalEntry`（归一幂等 ∧ 合法）；`remove` 只要求**归一幂等**，
+ * 不要求合法。否则 master 期写进 overlay 的存量条目（当时只 trim+lower，任何非空串都能进）在新校验器下
+ * 变得**结构性不可移除**——apply 抛错、提案腿静默丢，而契约禁止手改机器文件。删除永远是安全方向。
+ */
 function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
-  const raw =
-    input !== null && typeof input === 'object' && key in input
-      ? (input as Record<string, unknown>)[key]
-      : undefined;
-  if (raw === undefined) {
+  if (input === null || typeof input !== 'object' || !Object.hasOwn(input, key)) {
     return []; // 缺 key = 该方向无变更（部署窗口里旧 view 只发 add）。
   }
+  const raw = (input as Record<string, unknown>)[key];
   if (!Array.isArray(raw)) {
     throw new Error(`inbox pipeline: apply-feedback 的 ${key} 必须是 string[]（收到 ${typeof raw}）`);
+  }
+  if (raw.length > MAX_ENTRIES_PER_KEY) {
+    throw new Error(
+      `inbox pipeline: apply-feedback 的 ${key} 条目数超上限（${raw.length} > ${MAX_ENTRIES_PER_KEY}）`,
+    );
   }
   const out: string[] = [];
   const seen = new Set<string>();
   for (const item of raw) {
-    if (!isCanonicalEntry(item)) {
+    const ok = key === 'add' ? isCanonicalEntry(item) : isCanonicalForm(item);
+    if (!ok) {
       // 只回形状不回值：地址属邮件内容侧，run trace 与邮件 DB 是不同保留策略/访问路径的存储。
       throw new Error(
-        `inbox pipeline: apply-feedback 的 ${key} 含非 canonical 或非法项（须为已归一的 local@domain 或 domain，` +
-          `ASCII、无控制字符）：类型=${typeof item}、长度=${typeof item === 'string' ? item.length : 0}`,
+        `inbox pipeline: apply-feedback 的 ${key} 含不合规项（${key === 'add' ? '须为已归一的合法 local@domain 或 domain' : '须为已归一形态'}）：` +
+          `类型=${typeof item}、长度=${typeof item === 'string' ? item.length : 0}`,
       );
     }
     if (!seen.has(item)) {
@@ -586,15 +659,37 @@ function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
 }
 
 /**
- * 原子写 overlay（同盘 tmp+rename 原子发布）：写 `<overlay>.tmp` 再 renameSync 覆盖 overlay。
+ * 原子写 overlay（同盘 tmp+rename 原子发布）：写 `<overlay>.<pid>.tmp` 再 renameSync 覆盖 overlay。
  * 一行一个发件人（无注释纯机器文件）；空集 → 空文件。**绝不碰 rules.yaml**。
+ *
+ * 三处护栏：**写前对序列化后的字节数设闸**（与 loader 同一常量——越限后 loader 会把**整份** overlay
+ * 静默丢弃，等于所有降噪一次性失效，而 run 仍是绿的）；tmp 名带 pid（固定名会让并发写互踩，且可被预置
+ * 成软链把写入引到别的文件）；`O_NOFOLLOW` + `mode 0o600`（不跟随软链、不把 operator 的 chmod 抹掉）。
+ * 错误只回 kind：Node 的 fs 错误 message 自带绝对路径，而本仓日志纪律是「只 kind、不记路径/内容」。
  */
 function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>): void {
   const list = [...entries];
   const body = list.length > 0 ? list.join('\n') + '\n' : '';
-  const tmp = overlayPath + '.tmp';
-  writeFileSync(tmp, body, 'utf8');
-  renameSync(tmp, overlayPath);
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > MAX_RULES_FILE_BYTES) {
+    throw new Error(
+      `inbox pipeline: overlay 将超过 loader 上限，拒绝写入（${bytes} > ${MAX_RULES_FILE_BYTES} 字节；` +
+        `写下去 loader 会整份忽略，等于所有降噪失效）`,
+    );
+  }
+  const tmp = `${overlayPath}.${process.pid}.tmp`;
+  try {
+    // openSync 而非 writeFileSync 的 flag 选项：后者的类型只收字符串标志，收不了 O_NOFOLLOW。
+    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeFileSync(fd, body, 'utf8');
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, overlayPath);
+  } catch (err) {
+    throw new Error(`inbox pipeline: overlay 原子写失败（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`);
+  }
 }
 
 /**

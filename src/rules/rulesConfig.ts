@@ -51,9 +51,9 @@ export type ActiveRules = {
 const DEFAULT_RULES_PATH = fileURLToPath(new URL('../../rules/rules.yaml', import.meta.url));
 
 // ponytail: 256KB cap on operator-local rules.yaml — bounds sync parse cost; over-limit → carry-forward; raise or stream-parse if operators need huge lists
-const MAX_RULES_FILE_BYTES = 256 * 1024;
+export const MAX_RULES_FILE_BYTES = 256 * 1024;
 
-function resolveRulesPath(): string {
+export function resolveRulesPath(): string {
   const fromEnv = process.env.RULES_FILE;
   return fromEnv !== undefined && fromEnv !== '' ? fromEnv : DEFAULT_RULES_PATH;
 }

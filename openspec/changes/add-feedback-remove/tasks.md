@@ -54,3 +54,20 @@
 - [x] 6.3 `file(1)` 核对 `src/pipeline.ts` / `src/pipeline.test.ts` / spec delta 均为 UTF-8 text（无裸控制字节）
 - [ ] 6.4 上线后通知 hangar 侧再放 view（**部署序：inbox 先、view 后**）
 - [ ] 6.5 生产验一遍：加一个地址 → 移出同一地址 → overlay 回到原内容；忙时重发 apply 幂等
+
+## 7. round-2 对抗 review 的修复（三 slot + 冷读 + ASE 收敛）
+
+- [x] 7.1 **写路径 fail-closed**：新增 `readOverlayStrict`——只把 `ENOENT` 视为空集，其余读错误与「已超 loader 上限」抛错；提案腿读失败时跳过 overlay 比对而非把 remove 提议吞空
+- [x] 7.2 **两腿与 loader 同域**：删掉两处 `.map(canonicalizeEntry)`，逐行归一严格等于 loader 的 trim+lower（初稿在 loader 之上再叠一层，导致对存量 `<a@b>` 行谎报 `already_present`、不写盘、邮件不降噪）
+- [x] 7.3 **local 换 RFC atext 白名单**：黑名单放行 `mailto:`/`()`/`[]`/`\` → 写进永不命中的条目 = false-green；白名单同时保住 VERP/SRS 与 `ops!tag`
+- [x] 7.4 **remove 侧只要求归一幂等**：否则本能力生效前写入的存量条目结构性不可移除，而契约禁止手改机器文件
+- [x] 7.5 **写侧三闸**：字节数 > loader 上限 → 抛错；单侧条目数 > 500 → 抛错；overlay 路径 == 当前配置的 `rules.yaml` → 抛错（硬 MUST 此前零结构约束）
+- [x] 7.6 **写入加固**：tmp 名带 pid、`O_NOFOLLOW`、`mode 0o600`；fs 错误只回 kind（Node 的 message 自带绝对路径）
+- [x] 7.7 **`Object.hasOwn` 取代 `in`**；`{add: undefined}` 归入「键在但非 `string[]`」→ 抛错
+- [x] 7.8 **干跑腿的 O(n·m) 改 Set**（32000 条实测同步阻塞 9.2 秒，而 40 行之下同一运算本就用 Set）
+- [x] 7.9 `withOverlay` 的哨兵断言挪到 env 还原与 `rmSync` 之后（此前哨兵一旦触发会把 env 与 tmp 目录泄漏给全部后续用例）
+- [x] 7.10 新增 self-check nf⑭–㉑：混合 add+remove 的核心表达式 · 读失败 fail-closed · loader 同域 · 存量可移除 · 只认真邮箱 · 写侧三闸 · 原型链与 `undefined` · 字节闸
+- [x] 7.11 对上述 8 条新守卫逐条 mutation 验证（删掉守卫 → 对应断言必挂），全部通过
+- [x] 7.12 规范补洞：合法性表补「长度」行与「域名 ≥2 段」· 定义 `existing`（来源/归一/读失败）· 可逆性改述为「字节是有序条目集的纯函数」（原措辞可被 `add X→add Y→remove X` 字面证伪）· `{text}` 腿场景改为「合法子集」· input 形态路由与 `{add:undefined}` 入规范
+- [x] 7.13 design ⑥ 的理由更正（候选经 `normalizeSenderForCount` 已 canonical，该层作用是过滤不是归一）；新增决策 ⑧⑨；残留清单据实重写
+- [x] 7.14 `proposal.md` 行为变更补「移出后需重启 daemon 才实际解静音」与「只处理真正的邮箱」；非目标里「不新增裸域名显式入口」改为据实措辞
