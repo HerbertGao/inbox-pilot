@@ -87,17 +87,29 @@ export const MAX_ENTRY_LEN = 254;
 export const MAX_ENTRIES_PER_KEY = 500;
 
 /**
- * **overlay 行归一的唯一实现**：`trim` → 去掉包裹的 `<>` → 转小写；空 → null。
- * loader 读文件、两腿读用户输入，全部走这一个函数——两份实现必然漂移，而漂移的每一种形态都是一类
- * 「回执说一套、磁盘是另一套」的 bug。
+ * **overlay「一行是什么」的唯一实现**：`trim` → 转小写；空 → null。**刻意不剥 `<>`**——它与 master 的
+ * loader 逐字节同语义，故存量 overlay 的生效集不因本能力变化（不存在「死行转活、开始静默已读」的迁移）。
+ *
+ * 它是**幂等**的，这是 `L = W` 的前提：`checkEntry` 用「是本函数的不动点」判定一个串是不是合法的行，
+ * 而 loader 输出按定义都是不动点，故 overlay 里的每一行都可被 remove。**这条性质由 rulesConfig.test 的
+ * 不动点断言守着，而不是由「只有一份实现」论证出来**——单一实现只保证不漂移，不保证性质成立。
  */
 export function canonicalizeOverlayLine(raw: string): string | null {
+  const s = raw.trim().toLowerCase();
+  return s.length > 0 ? s : null;
+}
+
+/**
+ * **用户输入的归一**（与「一行是什么」是两个问题）：`trim` → 剥掉**所有**包裹层 `<>` → 转小写。
+ * 剥到不动点（`while` 而非 `if`）：只剥一层会让输出可能仍以 `<>` 包裹，那个值既不是合法的行、
+ * 又会被写盘，形成「读→写不是不动点」的漂移。输出必为 `canonicalizeOverlayLine` 的不动点。
+ */
+export function canonicalizeUserEntry(raw: string): string | null {
   let s = raw.trim();
-  if (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
+  while (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
     s = s.slice(1, -1).trim();
   }
-  s = s.toLowerCase();
-  return s.length > 0 ? s : null;
+  return canonicalizeOverlayLine(s);
 }
 
 /** 非 ASCII（码位 > U+007F）；控制字符是它的子集，故一条断言即可。归一**之前**判——`K` 之类会小写成 ASCII。 */
@@ -141,11 +153,10 @@ export function isAddableEntry(s: string): boolean {
  *     这就是「存量条目不得结构性锁死」由构造保证、而非靠测试守。
  */
 export function checkEntry(item: unknown, direction: 'add' | 'remove'): item is string {
-  if (typeof item !== 'string' || CONTROL_CHAR_RE.test(item) || item.length > MAX_ENTRY_LEN) {
+  // 共用前置**只**判「是不是一个合法的行」。长度与控制字符属**可加入**判据，绝不能放这里：
+  // loader 对行长与控制字符不设限，放进来就会让 L ⊄ W，存量长行/含控制字符的行结构性锁死。
+  if (typeof item !== 'string' || canonicalizeOverlayLine(item) !== item) {
     return false;
-  }
-  if (canonicalizeOverlayLine(item) !== item) {
-    return false; // 归一不幂等 ⇒ 调用方跳过了提案腿。
   }
   return direction === 'add' ? isAddableEntry(item) : true;
 }
@@ -170,8 +181,16 @@ export function hasOwnKey(input: unknown, key: string): boolean {
  * 目标尚不存在时退化为「真实父目录 + basename」的比较（父目录亦不存在则退回词法）。
  */
 export function isSameFile(a: string, b: string): boolean {
-  const sa = statSync(a, { throwIfNoEntry: false });
-  const sb = statSync(b, { throwIfNoEntry: false });
+  // stat 抛的是 Node 原生错误，其 message 含绝对路径——本仓纪律是只回 kind。取不到就走退化分支。
+  const safeStat = (p: string): ReturnType<typeof statSync> | undefined => {
+    try {
+      return statSync(p, { throwIfNoEntry: false });
+    } catch {
+      return undefined;
+    }
+  };
+  const sa = safeStat(a);
+  const sb = safeStat(b);
   if (sa !== undefined && sb !== undefined) {
     return sa.dev === sb.dev && sa.ino === sb.ino;
   }
@@ -199,7 +218,15 @@ export type OverlayReadMode = 'fail-open' | 'fail-closed';
  *     会让随后的全量覆盖静默抹掉整份名单，或让 remove 回执谎报「本就不在」而地址仍在被静默已读。
  */
 export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
-  const stat = statSync(path, { throwIfNoEntry: false });
+  // `throwIfNoEntry:false` **只**压制 ENOENT/ENOTDIR；EACCES/ELOOP/ENAMETOOLONG 照抛。而本函数在
+  // 模块顶层 buildAndPublish 的调用链上——不捕获即 **import 期崩溃**，整个 pipeline 模块加载失败、
+  // daemon 起不来。master 那里是 try/catch，去掉它是回归。
+  let stat: ReturnType<typeof statSync> | undefined;
+  try {
+    stat = statSync(path, { throwIfNoEntry: false });
+  } catch (err) {
+    return failOverlayRead(mode, (err as NodeJS.ErrnoException).code);
+  }
   if (stat === undefined) {
     return []; // 文件不存在：overlay 可选，这才是真正的空集（两种模式一致）。
   }
@@ -214,13 +241,7 @@ export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    if (mode === 'fail-closed') {
-      throw new Error(
-        `inbox pipeline: overlay 读取失败，拒绝据此改写名单（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`,
-      );
-    }
-    logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
-    return [];
+    return failOverlayRead(mode, (err as NodeJS.ErrnoException).code);
   }
   const out: string[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -230,6 +251,15 @@ export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
     }
   }
   return out;
+}
+
+/** 读失败的两种收场（fail-closed 抛、fail-open 记 kind 并降级为空集）。只回 kind，不回路径/内容。 */
+function failOverlayRead(mode: OverlayReadMode, code: string | undefined): string[] {
+  if (mode === 'fail-closed') {
+    throw new Error(`inbox pipeline: overlay 读取失败，拒绝据此改写名单（kind=${code ?? 'unknown'}）`);
+  }
+  logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
+  return [];
 }
 
 /** loader 侧的 overlay 读（fail-open）。绝不崩/绝不泄露：只记 kind，不记内容/路径。 */

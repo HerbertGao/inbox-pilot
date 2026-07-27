@@ -6,7 +6,7 @@
 // spy 计到的真实 classify 调用数。
 
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -1320,28 +1320,33 @@ test('nf⑮ overlay 读失败 → 写路径 fail-closed：apply 抛错不覆盖�
   });
 });
 
-test('nf⑯ L = W：loader 与两腿共用同一归一，故 overlay 里的每一行都能经产品路径移除', async () => {
-  // 存量行的两种历史形态：`<>` 包裹（旧 writer 可写出）与不合新可加入判据的裸串（旧 writer 亦可写出）。
-  await withOverlay('<alice@example.com>\nroot@nas\nkeep@a.com\n', async (overlay, dir) => {
+test('nf⑯ L = W：loader 认得的每一行都能经产品路径移除，且生效集不因本能力迁移', async () => {
+  // 存量行的三种历史形态：`<>` 包裹、嵌套 `<>`、不合可加入判据的裸串——旧 writer 三种都写得出。
+  await withOverlay('<alice@example.com>\n<<nested@example.com>>\nroot@nas\nkeep@a.com\n', async (overlay, dir) => {
     try {
       reloadRulesConfigForTest(join(dir, 'rules.yaml'));
       assert.deepEqual(
         getActiveRules().noiseSenders,
-        ['alice@example.com', 'root@nas', 'keep@a.com'],
-        'loader 与写路径同域：`<>` 在 loader 侧也被剥掉，不存在只有一方认得的行',
+        ['<alice@example.com>', '<<nested@example.com>>', 'root@nas', 'keep@a.com'],
+        '行归一是 trim+lower、**不剥 <>**：与 master 逐字节同语义，存量惰性行不因本能力转活',
       );
 
       // 产品路径：interpret 提案 → 把提案**逐字**喂进 apply（不手工构造 apply 输入）。
+      // 产品路径：提案 → 逐字喂进 apply。三种存量形态都必须删得掉（L = W）。
       const ci = makeCtx('interpret-feedback');
-      ci.input = { remove: ['alice@example.com', 'root@nas'] };
+      ci.input = { remove: ['<alice@example.com>', '<<nested@example.com>>', 'root@nas'] };
       await run(ci, { repo: senderRepo([]) });
       const proposed = payloadOf(ci, 'interpretation.proposed');
-      assert.deepEqual(proposed.remove.sort(), ['alice@example.com', 'root@nas'], '两种存量形态都进得了提案');
+      assert.deepEqual(
+        proposed.remove.sort(),
+        ['<<nested@example.com>>', '<alice@example.com>', 'root@nas'],
+        '三种存量形态都进得了提案',
+      );
 
       const ca = makeCtx('apply-feedback');
       ca.input = { add: proposed.add, remove: proposed.remove };
       await run(ca, {});
-      assert.deepEqual(payloadOf(ca, 'feedback.applied').removed.sort(), ['alice@example.com', 'root@nas']);
+      assert.equal(payloadOf(ca, 'feedback.applied').removed.length, 3);
       assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n', '真的删掉了');
 
       // 反向：同样的串走 add 仍被拒（只处理真正的邮箱）。
@@ -1451,17 +1456,18 @@ test('nf㉑ 字节闸：写下去会越过 loader 上限 → 抛错不写（越�
   });
 });
 
-test('nf㉒ 路径闸认文件身份而非路径字符串：软链别名与大小写别名都必须被拒', async () => {
+test('nf㉒ 路径闸认文件身份而非路径字符串：硬链别名必须被拒（词法/realpath 都识别不出）', async () => {
   await withOverlay(null, async (_overlay, dir) => {
     const prevOverlay = process.env.NOISE_OVERLAY_FILE;
-    // dir 在 macOS 上是 /var/folders/...（/private/var 的软链），realpath 与词法路径不等 —— 这正是
-    // round-3 绕过路径闸的构造：resolve() 比较不出来，dev+ino 比得出来。
-    const aliasDir = realpathSync(dir) === dir ? join(dirname(dir), basename(dir)) : realpathSync(dir);
-    process.env.NOISE_OVERLAY_FILE = join(aliasDir, 'rules.yaml');
+    // **硬链**别名：路径字符串完全不同、realpath 也不同，只有 dev+ino 认得出是同一个 inode。
+    // 两个平台都成立——此前用 realpath 差异构造，在 Linux 上 aliasDir 退化为 dir 自身，CI 里零覆盖。
+    const alias = join(dir, 'alias.overlay');
+    linkSync(join(dir, 'rules.yaml'), alias);
+    process.env.NOISE_OVERLAY_FILE = alias;
     try {
       const ctx = makeCtx('apply-feedback');
       ctx.input = { add: ['a@x.com'] };
-      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '软链/别名路径同样必须被拒');
+      await assert.rejects(run(ctx, {}), /指向了 rules.yaml/, '硬链别名必须被 dev+ino 认出（词法与 realpath 都比不出来）');
     } finally {
       process.env.NOISE_OVERLAY_FILE = prevOverlay;
     }
@@ -1503,7 +1509,8 @@ test('nf㉕ 路径闸：大小写别名（APFS 默认大小写不敏感）——
   await withOverlay(null, async (_overlay, dir) => {
     const upper = join(dir, 'RULES.YAML'); // 与 rules.yaml 同一 inode（大小写不敏感盘）
     if (!existsSync(upper)) {
-      return; // 大小写敏感盘上此别名不成立，跳过（该盘上词法比较本就够）
+      // 大小写敏感盘（CI 的 Linux）上此别名不成立。硬链版本由 nf㉒ 覆盖，两平台都有网。
+      return;
     }
     const prev = process.env.NOISE_OVERLAY_FILE;
     process.env.NOISE_OVERLAY_FILE = upper;

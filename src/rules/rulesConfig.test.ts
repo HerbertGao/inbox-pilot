@@ -11,7 +11,9 @@
 // 注入假时钟/poller，均不依赖真 timing。
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  chmodSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
@@ -19,6 +21,8 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { applySafetyRules } from './applySafetyRules.js';
 import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 import {
+  readOverlayFile,
+  canonicalizeUserEntry,
   canonicalizeOverlayLine,
   checkEntry,
   isAddableEntry,
@@ -495,6 +499,9 @@ test('L ⊆ W：readNoiseOverlay 读出的每一行，remove 侧判据必须接�
         '   ', // 纯空白行
         'dup@x.com',
         'DUP@X.COM', // 归一后重复
+        '<<nested@x.com>>', // 嵌套尖括号 —— 曾是唯一的不幂等族
+        'a'.repeat(300) + '@x.com', // 超长（loader 不设行长限，remove 必须收）
+        'a\u0009b@x.com', // 内部控制字符（同上）
       ].join('\r\n') + '\r\n', // CRLF
       'utf8',
     );
@@ -531,5 +538,65 @@ test('可加入判据：dot-atom 点位规则与域标签长度（拒不可投�
     'plain.domain.example',
   ]) {
     assert.equal(isAddableEntry(ok), true, `${ok} 必须可加入`);
+  }
+});
+
+test('不动点性质：canonicalizeOverlayLine 的输出恒为自身的不动点（穷举短串，不依赖语料选得好不好）', () => {
+  // 这条是 L = W 的真正的网。上一轮只有「语料 → 逐行断言」，而语料恰好绕开了唯一的不幂等族
+  // （嵌套尖括号），于是 474 个用例全绿而性质是破的。**性质要被断言，不能被论证。**
+  const alphabet = ['<', '>', ' ', 'a', 'A', '	', '@', '.'];
+  let checked = 0;
+  const walk = (prefix: string, depth: number): void => {
+    if (depth === 0) {
+      const once = canonicalizeOverlayLine(prefix);
+      if (once !== null) {
+        assert.equal(canonicalizeOverlayLine(once), once, `非不动点：${JSON.stringify(prefix)} → ${JSON.stringify(once)}`);
+        assert.ok(checkEntry(once, 'remove'), `行归一的输出必须可被 remove 接受：${JSON.stringify(once)}`);
+      }
+      checked++;
+      return;
+    }
+    for (const c of alphabet) {
+      walk(prefix + c, depth - 1);
+    }
+  };
+  for (let len = 0; len <= 4; len++) {
+    walk('', len);
+  }
+  assert.ok(checked > 4000, `穷举规模应足够（实际 ${checked}）`);
+});
+
+test('不动点性质：canonicalizeUserEntry 的输出恒为行归一的不动点（剥到底，不是只剥一层）', () => {
+  for (const raw of ['<<a@b.com>>', '<<<a@b.com>>>', '< <a@b.com> >', '  <A@B.COM>  ', '<>', '<a', 'a>']) {
+    const out = canonicalizeUserEntry(raw);
+    if (out === null) continue;
+    assert.equal(canonicalizeOverlayLine(out), out, `用户输入归一的输出必须是行的不动点：${JSON.stringify(raw)} → ${JSON.stringify(out)}`);
+  }
+  assert.equal(canonicalizeUserEntry('<<a@b.com>>'), 'a@b.com', '剥到不动点，而非只剥一层');
+});
+
+test('readOverlayFile：statSync 本身抛错（父目录不可搜索）时不得逃逸 —— fail-open 降级、fail-closed 抛受控错误', () => {
+  // 这条守的是 import 期崩溃：readOverlayFile 在模块顶层 buildAndPublish 的调用链上，
+  // 而 `throwIfNoEntry:false` **只**压制 ENOENT/ENOTDIR，EACCES/ELOOP 照抛。不捕获即整个模块 import 失败。
+  // 注意必须让 **stat 本身**失败（chmod 父目录），chmod 文件只会让 readFileSync 失败，测不到这条路径。
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-stat-'));
+  const sub = join(dir, 'locked');
+  mkdirSync(sub);
+  const file = join(sub, 'noise_senders.overlay');
+  writeFileSync(file, 'keep@a.com\n', 'utf8');
+  chmodSync(sub, 0o000);
+  try {
+    if (readOverlayFile(file, 'fail-open').length !== 0) {
+      return; // root 或该平台不强制目录搜索权限 → 构造不成立，跳过
+    }
+    assert.deepEqual(readOverlayFile(file, 'fail-open'), [], 'loader 侧降级为空集，绝不崩');
+    assert.throws(
+      () => readOverlayFile(file, 'fail-closed'),
+      /overlay 读取失败/,
+      '写路径抛受控错误（只回 kind），而非让原生 fs 错误带着绝对路径逃逸',
+    );
+  } finally {
+    chmodSync(sub, 0o755);
+    rmSync(dir, { recursive: true, force: true });
   }
 });

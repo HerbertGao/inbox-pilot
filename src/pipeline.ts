@@ -21,7 +21,7 @@
 // STATE_BY_KIND（events.ts）——否则 appendEvent 遇生命周期 kind 会误移状态。外部 pilot 不 import
 // @hangar/core，此约束由命名纪律 + 本注释守（待解问题 R3 CR-n1）。
 
-import { closeSync, constants, openSync, renameSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 
 import type { Logger } from 'pino';
 
@@ -29,6 +29,7 @@ import { loadConfig } from './config/config.js';
 import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
 import {
   canonicalizeOverlayLine,
+  canonicalizeUserEntry,
   checkEntry,
   hasOwnKey,
   isSameFile,
@@ -347,8 +348,16 @@ async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): 
     // 响亮失败由 apply 腿承担（它对同一路径会抛错）。
     let present: Set<string>;
     try {
-      present = new Set(readOverlayFile(resolveNoiseOverlayPath(), 'fail-closed'));
+      const overlayPath = resolveNoiseOverlayPath();
+      // 路径闸也要在提案腿问一次：否则 NOISE_OVERLAY_FILE 误指到 rules.yaml 时，提案腿会把 YAML 文本行
+      // 当 overlay 条目算出一份 apply 必拒的 diff（还构成对人工 YAML 内容的成员探测）。
+      if (isSameFile(overlayPath, resolveRulesPath())) {
+        throw new Error('overlay 路径指向 rules.yaml');
+      }
+      present = new Set(readOverlayFile(overlayPath, 'fail-closed'));
     } catch {
+      // 只记 kind 不记路径/内容。零日志是上一轮的缺陷：这条路径此前既不抛也不记，整条链路无可观测性。
+      ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
       ctx.emit('interpretation.proposed', { add: [], remove: [] });
       return;
     }
@@ -390,6 +399,7 @@ function fitWithinWriteBudget(add: readonly string[], present: ReadonlySet<strin
   const out: string[] = [];
   for (const s of add) {
     const next = bytes + Buffer.byteLength(s, 'utf8') + 1;
+    // 条数一项在此不可达（keepValidEntries 已封顶）——保留为与写侧闸门的对齐复述，字节一项才是有效闸。
     if (out.length >= MAX_ENTRIES_PER_KEY || next > MAX_RULES_FILE_BYTES) {
       break;
     }
@@ -429,7 +439,9 @@ function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
     if (typeof item !== 'string') {
       continue;
     }
-    const s = canonicalizeOverlayLine(item);
+    // 方向差异贯穿到归一：add 问「你指哪个地址」（剥 <> 得裸地址）；remove 问「你要删哪一行」
+    // （不剥——存量行可能就长成 <x@y> 的样子，剥了就对不上文件里的那一行）。两者输出都是行的不动点。
+    const s = direction === 'add' ? canonicalizeUserEntry(item) : canonicalizeOverlayLine(item);
     if (s === null || seen.has(s) || !checkEntry(s, direction)) {
       continue;
     }
@@ -490,6 +502,8 @@ function matchNoiseCandidates(text: string, candidates: readonly string[]): stri
  * 命中的地址「移出」后**仍会被降噪**（人工规则要人工改）；「不在名单」也只是不在机器 overlay。
  */
 async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Promise<void> {
+  // ponytail: 读→写之间**必须无 await** —— 这是单进程内 read-modify-write 原子性的全部依据（无锁）。
+  //           将来在此插入任何 await 会静默打开丢更新窗口而回执照报 added；跨进程并发驱动需 O_EXCL lockfile。
   const { add, remove } = normalizeFeedbackInput(ctx.input);
   const overlayPath = resolveNoiseOverlayPath();
   // 「绝不碰 rules.yaml」是硬 MUST，此前只由注释与纪律守着：`NOISE_OVERLAY_FILE` 是 operator 可控 env，
@@ -610,11 +624,17 @@ function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>)
     const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
     try {
       writeFileSync(fd, body, 'utf8');
+      fsyncSync(fd); // rename 可能先于数据落盘：掉电会留下空/截断的 overlay = 整份名单丢失。
     } finally {
       closeSync(fd);
     }
     renameSync(tmp, overlayPath);
   } catch (err) {
+    try {
+      unlinkSync(tmp); // 失败时不留含地址名单的孤儿 tmp。
+    } catch {
+      /* best-effort */
+    }
     throw new Error(`inbox pipeline: overlay 原子写失败（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`);
   }
 }
