@@ -22,8 +22,7 @@
     "start": "node dist/main.js",
     "postinstall": "prisma generate",
     "migrate": "prisma migrate dev",
-    "migrate:deploy": "prisma migrate deploy",
-    "reload": "docker compose up -d --force-recreate"
+    "migrate:deploy": "prisma migrate deploy"
   },
   "dependencies": {
     "@prisma/client": "^6.1.0",
