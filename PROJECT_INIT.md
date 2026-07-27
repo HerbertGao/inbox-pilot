@@ -460,7 +460,6 @@ inbox-pilot/
 ├── prisma/
 │   └── schema.prisma
 ├── docker-compose.yml
-├── Dockerfile
 ├── .env.example
 ├── package.json
 ├── tsconfig.json
@@ -817,7 +816,7 @@ Claude Code 应按以下顺序生成代码：
 14. `src/digest/buildDigest.ts`；
 15. `src/jobs/scheduler.ts`；
 16. `src/main.ts`；
-17. Dockerfile 和 docker-compose.yml；
+17. docker-compose.yml（现只剩 postgres 一个服务；app 已改由 hangar 原生托管，见 docs/DEPLOY.md）；
 18. README。
 
 ### 17.3 重要约束

@@ -32,42 +32,38 @@ OpenRouter（OpenAI 兼容 SDK）· node-cron · zod · pino · fastify。
 
 ## 快速开始
 
-P0 必需变量仅 `DATABASE_URL`（须为合法 `postgresql://` / `postgres://` 连接串）；
-缺失或 scheme 非法即 fail-fast 退出。`.env.example` 里的后续阶段变量（OPENROUTER /
-GMAIL / TELEGRAM / BARK / POLL / DIGEST）P0 可留空。宿主侧命令一律用 `localhost`
-形态的 `DATABASE_URL`；docker compose 下 app 容器会自动覆盖为 `@postgres:5432`。
+必需变量仅 `DATABASE_URL`（须为合法 `postgresql://` / `postgres://` 连接串）；缺失或
+scheme 非法即 fail-fast。`.env.example` 里的其余变量（OPENROUTER / GMAIL / TELEGRAM /
+`RULES_FILE` / `TZ`）按需填。`DATABASE_URL` 一律用 `localhost` 形态——postgres 只绑宿主
+loopback。
 
-### 一键起（docker compose）
+### 部署形态
 
-```bash
-cp .env.example .env        # P0 只需 DATABASE_URL；其余阶段变量可留空
-docker compose up -d        # 起 postgres + inbox-pilot，entrypoint 自动 migrate deploy
-curl localhost:3000/health  # 两容器就绪后返 {"status":"ok"}（200）
-```
-
-> 若宿主 5432 已被占用，用 `POSTGRES_HOST_PORT` 覆盖 postgres 的宿主端口：
-> `POSTGRES_HOST_PORT=55432 docker compose up -d`（app 容器内部仍连 `postgres:5432`，不受影响）。
-> 同理宿主 3000 被占时用 `APP_HOST_PORT`（默认 `3000`）覆盖 app 的宿主端口：
-> `APP_HOST_PORT=33000 docker compose up -d`（容器内部仍监听 3000，不受影响）。
-> 完整部署 / 运维 runbook（配置生效语义、`reload`、远程 DB 隧道等）见 **[docs/DEPLOY.md](./docs/DEPLOY.md)**。
+pilot 由 **hangar** 以原生 node 进程托管（launchd 常驻 daemon 加载 `dist/pipeline.js`），
+**不跑在 docker 里**；docker 只剩 `docker-compose.yml` 里的 postgres。轮询与摘要的定时在
+仓根 `app.yaml` 的 cron 触发器上。完整部署 / 运维 runbook（三类配置的生效语义、部署一次
+代码改动、远程 DB 隧道等）见 **[docs/DEPLOY.md](./docs/DEPLOY.md)**。
 
 ### 本地开发（宿主直跑）
 
 ```bash
-nvm use                      # 仓库带 .nvmrc，固定 Node 24（Active LTS）
+nvm use                       # 仓库带 .nvmrc，固定 Node 24（Active LTS）
 pnpm install
-cp .env.example .env         # 确认 DATABASE_URL 指向本机可达的 postgres（localhost 形态）
-docker compose up -d postgres # 仅起 postgres（宿主 5432 被占时加 POSTGRES_HOST_PORT 前缀，并同步改 .env 的端口）
+cp .env.example .env          # 确认 DATABASE_URL 指向本机可达的 postgres（localhost 形态）
+docker compose up -d postgres # 起本地 postgres（宿主 5432 被占时加 POSTGRES_HOST_PORT 前缀，并同步改 .env 的端口）
 pnpm migrate                  # = prisma migrate dev，建 5 张表
-pnpm dev                      # tsx 起服务；或 pnpm build && pnpm start 跑生产 ESM 路径
+pnpm test                     # 全量自测
 ```
+
+> pilot 没有 standalone 服务入口——`run(ctx)` 由 hangar 加载 `dist/pipeline.js` 调用；
+> 本地只读预检用 `node dist/cli/inbox-pilot.js doctor`（需先 `pnpm build`）。
 
 > 完整需求、数据模型、目录结构、分类 Prompt 与验收标准见
 > **[PROJECT_INIT.md](./PROJECT_INIT.md)**；开发约定见 **[CLAUDE.md](./CLAUDE.md)**。
 
 ## 开发阶段（详见 [ROADMAP.md](./ROADMAP.md)）
 
-- **P0** 项目骨架（服务启动 + DB + docker）
+- **P0** 项目骨架（服务启动 + DB）
 - **P1** 邮件模型 + AI 分类内核（`NormalizedEmail` + OpenRouter 分类，离线可测）
 - **P2** 规则引擎 + 处理流水线 + 通知
 - **P3** IMAP 端到端

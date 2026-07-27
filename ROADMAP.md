@@ -26,6 +26,10 @@
   logger；`Dockerfile` + `docker-compose.yml`；`src/main.ts`（fastify + `/health`）。
 - **验收**：`docker compose up` 起来，`/health` 返 200，`prisma migrate` 成功，5 张表存在。
 
+> 上面是 P0 当时的交付与验收记录。**该容器化形态已退役**：pilot 现由 hangar 以原生 node
+> 进程托管（launchd），`Dockerfile` 已删、docker 只剩 postgres。现状见
+> [docs/DEPLOY.md](./docs/DEPLOY.md)。
+
 ## P1 · 邮件模型 + AI 分类内核
 
 - **目标**：给一封邮件 JSON，稳定产出校验过的分类结果。

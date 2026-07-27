@@ -1,3 +1,8 @@
+# 本 compose 工程现在只提供一样东西：inbox-pilot 用的那个 PostgreSQL 实例。
+# app 本身**不再跑在 docker 里**——pilot 由 hangar 以原生 node 进程托管（launchd 常驻 daemon），
+# 经 `127.0.0.1:${POSTGRES_HOST_PORT:-5432}`（线上为 5433）连这个库。部署与运维见 docs/DEPLOY.md。
+# 后续可能把这个库改由 hangar 统一持有（inbox 以独立 DB 用户接入），届时本文件才会再动。
+
 services:
   postgres:
     image: postgres:16
@@ -14,30 +19,8 @@ services:
       start_period: 30s
     ports:
       # 仅绑 127.0.0.1（loopback）：postgres **不对外、不上网络**（Tailscale/LAN 不可达），仅宿主本机可连
-      # （local dev 的宿主侧 migrate/dev 用）；容器化 app 经 @postgres:5432 **内网**连库、不走此映射。
+      # （hangar 托管的 pilot 与宿主侧 migrate/dev 都经此映射连库；远程访问走 ssh 隧道，见 docs/DEPLOY.md）。
       # 宿主端口可被 POSTGRES_HOST_PORT 覆盖以绕开本机端口冲突。
       - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-
-  inbox-pilot:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      # 容器内 DNS：覆盖 .env 的 localhost 形态为 @postgres:5432。
-      DATABASE_URL: postgresql://mail_router:mail_router_password@postgres:5432/mail_router
-      # 容器时区：每日摘要定点（DIGEST_TIMES）依赖时区，随 env_file (.env) 透传；compose 不注入默认值，
-      # 使未设置 / 为空的 TZ 抵达应用回退分支（兜底 Asia/Shanghai）、tz-fallback-default 告警可观测。
-    ports:
-      # 默认 3000:3000；宿主端口可被 APP_HOST_PORT 覆盖以绕开本机端口冲突（与 POSTGRES_HOST_PORT 同模式，多主机部署用）。
-      - "${APP_HOST_PORT:-3000}:3000"
-    volumes:
-      # rules.yaml bind-mount：提供宿主可编辑的 rules.yaml（改内容即被 mtime 热加载、实时生效），
-      # 存在时遮蔽镜像内烘焙拷贝（Dockerfile COPY rules）；无挂载时回落到该烘焙拷贝。
-      # rw 是因为降噪反馈闭环要往同目录写机器文件 noise_senders.overlay（apply-feedback 的唯一写者）；
-      # app 仍不写 rules.yaml —— 那条硬 MUST 由写路径自己的撞名闸守，不靠挂载权限守。
-      - ./rules:/app/rules:rw

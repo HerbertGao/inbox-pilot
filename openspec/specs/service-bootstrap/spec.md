@@ -38,7 +38,7 @@ P0 必需变量集必须**仅**为：`DATABASE_URL`（无默认值，缺失即 f
 - **那么** 必须复用同一个客户端实例，禁止每次创建新连接池
 
 ### 需求:健康检查端点
-服务必须提供一个 fastify HTTP 服务，监听 `HOST:PORT`（容器内必须绑定 `0.0.0.0` 以便从宿主访问），并暴露 `/health` 端点。`/health` 只做存活与数据库连通性检查（liveness），不校验业务就绪度或 schema 完整性。
+服务必须提供一个 fastify HTTP 服务，监听 `HOST:PORT`（默认绑定 `0.0.0.0`，不写死回环），并暴露 `/health` 端点。`/health` 只做存活与数据库连通性检查（liveness），不校验业务就绪度或 schema 完整性。
 
 #### 场景:依赖正常时返回健康
 - **当** 服务运行且数据库可达，请求 `GET /health`
@@ -59,14 +59,18 @@ P0 必需变量集必须**仅**为：`DATABASE_URL`（无默认值，缺失即 f
 - **当** 数据库连接或查询出错（错误信息可能内嵌 `DATABASE_URL` 口令）
 - **那么** 写入日志的内容禁止包含连接串或口令明文，禁止直接记录原始 Prisma 错误对象或连接串
 
-### 需求:容器化运行
-项目必须提供 Dockerfile 与 docker-compose.yml，一键启动 inbox-pilot 与 postgres 两个服务（不含 Redis，不含已废弃的 `version:` 键）。app 容器必须发布端口供宿主访问；postgres 必须配置 healthcheck（`pg_isready`），app 必须 `depends_on: condition: service_healthy`；容器 entrypoint 必须先执行 `prisma migrate deploy`（fail-fast）再启动服务。
+### 需求:运行载体与迁移前置
+pilot 必须以 **hangar 托管的原生 node 进程**运行：仓根提供 `app.yaml`（executor + cron 触发器定义），构建产物 `dist/pipeline.js` 由 hangar 常驻 daemon（macOS launchd 服务）in-process 加载并调用其 `run(ctx)`。项目不再提供 app 容器镜像。
 
-#### 场景:一键启动
-- **当** 在配置好 `.env` 的环境执行 `docker compose up`（迁移可成功的前提下）
-- **那么** inbox-pilot 与 postgres 容器必须于合理时间内进入 running（非 restarting）状态，迁移成功，5 张表存在，且从宿主请求 `/health` 返回 200（迁移持续失败属下一场景的 crash-loop，不计入本场景）
+数据库仍由本仓 `docker-compose.yml` 的 `postgres` 服务提供：必须配置 healthcheck（`pg_isready`）、只发布到宿主 loopback、数据落在持久卷上（不含 Redis，不含已废弃的 `version:` 键）。
 
-#### 场景:迁移失败时不以半启动状态对外服务
-- **当** `prisma migrate deploy` 在 entrypoint 中失败
-- **那么** app 容器必须以非零退出码终止（crash-loop），禁止在未迁移的数据库上启动并对外提供服务
+「先迁移、后服务」这一前置不得因载体变更而失效——容器形态曾由 entrypoint 的 `prisma migrate deploy`（fail-fast）承担，原生形态下必须由部署流程在重启 daemon **之前**执行 `prisma migrate deploy`，失败即中止部署。app 容器专属的 `depends_on: condition: service_healthy`（启动前等 postgres 健康门）随容器退役、**无对应物**：原生形态下数据库不可达表现为运行期失败与 `inbox-pilot doctor` 报 `unreachable`，而不是启动编排。
+
+#### 场景:部署后 pilot 被 hangar 加载并按触发器运行
+- **当** 在配置好 `.env` 的 checkout 上完成构建与迁移，并重启 launchd daemon（迁移可成功的前提下）
+- **那么** 5 张表必须存在，hangar 必须按 `app.yaml` 的 cron 触发器加载并调用 pilot，且 `inbox-pilot doctor` 的关键检查（配置校验 + 数据库可达）通过
+
+#### 场景:迁移失败时不让 pilot 在未迁移的库上运行
+- **当** `prisma migrate deploy` 以非零退出码失败
+- **那么** 部署必须中止，禁止重启 daemon 把 pilot 放到未迁移的数据库上运行
 
