@@ -278,7 +278,8 @@ export async function run(ctx: RunContext, overrides?: RunOverrides): Promise<vo
     await runPoll(ctx, overrides);
     return;
   }
-  // noise-feedback 反馈闭环（跨 repo 契约 add-view-command-path）：interpret 干跑解析（无写）、apply 幂等落 overlay。
+  // noise-feedback 反馈闭环（跨 repo 契约 add-view-command-path + add-view-feedback-remove）：interpret 干跑解析
+  // （无写）、apply 幂等落 overlay。加入与移出**共用同一对 trigger**（撤销是同一意图的反向，不新增 trigger）。
   if (ctx.trigger === 'interpret-feedback') {
     await runInterpretFeedback(ctx, overrides);
     return;
@@ -311,20 +312,70 @@ async function runDigest(ctx: RunContext, overrides?: RunOverrides): Promise<voi
 }
 
 /**
- * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何写、不 throw**。
- * 取最近高频发件人候选（复用 buildDigest 同源的 `repo.countRecentSenders`，窗口 = now - NOISE_TOPN_WINDOW_DAYS，
- * **并同 digest 只取计数降序 TOP-N**），对用户自然语言 text 做**确定性子串匹配**（无 LLM）→ 命中候选地址原文 add，emit interpretation.proposed。
- * 输出恒为候选集子集（零幻觉）；误命中由后续 apply 前的**人工确认**兜住（interpret 只提议、不落地）。
+ * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何域写**。emit `interpretation.proposed
+ * { add, remove }`——**两个字段恒在**（无变更即 `[]`，view 逐字段校验 `string[]`，缺一个即 contract_mismatch）。
+ *
+ * 方向（加入 / 移出）由**确定性关键词**判定（`REMOVE_MARKERS`，无 LLM）：两侧候选集不同但高度重叠
+ * （刚加进 overlay 的发件人仍在最近高频 TOP-N 里），若不先定方向、两侧同跑，同一地址会同时落 add 与 remove
+ * → 撞「同址两侧」裁决而 throw，正常用法全炸。故一次 interpret 只解一个方向。
+ *   - 移出：候选集 = **当前 overlay 内容**（`readNoiseOverlay`，只读）——要移出的必然已在名单里，故 remove
+ *     恒为 overlay 子集（零幻觉性质对两侧都成立）。
+ *   - 加入：候选集 = 最近高频发件人 TOP-N（同 digest 展示的那几个）+ 文本里的**显式地址**。
+ *
+ * 显式地址（带 `@` 或形如域名的 token）经确定性解析 + 校验：合法即入候选（**不要求**在 TOP-N 内——加一个
+ * 从未见过的地址是可逆低风险操作）；非法则 **throw**（→ `run.failed`）。**文本里出现显式地址时跳过子串匹配**：
+ * 用户点名了确切地址，再跑模糊匹配只会引入 `com` 这类通用 token 的误命中。
  */
 async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
+  const text = readFeedbackText(ctx.input);
+  const explicit = parseExplicitEntries(text); // 非法显式项 → throw（响亮失败，见 canonical 校验）。
+
+  if (isRemoveIntent(text)) {
+    const overlay = readNoiseOverlay(resolveNoiseOverlayPath()); // 只读（无写副作用）。
+    const present = new Set(overlay);
+    const fuzzy = explicit.length > 0 ? [] : matchNoiseCandidates(text, overlay);
+    // 显式项 ∩ overlay：保 remove ⊆ overlay（不在名单的地址不进提案；直发 apply 者由 not_present 兜住）。
+    const remove = canonicalizeLoose([...fuzzy, ...explicit.filter((e) => present.has(e))]);
+    ctx.emit('interpretation.proposed', { add: [], remove });
+    return;
+  }
+
   const repo: MailRepo = overrides?.repo ?? new PrismaMailRepo();
   const now: () => number = overrides?.now ?? (() => Date.now());
-  const text = readFeedbackText(ctx.input);
   const since = new Date(now() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
   const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
   // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
-  const add = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
-  ctx.emit('interpretation.proposed', { add });
+  const fuzzy =
+    explicit.length > 0 ? [] : matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
+  const add = canonicalizeLoose([...fuzzy, ...explicit]);
+  ctx.emit('interpretation.proposed', { add, remove: [] });
+}
+
+/**
+ * 「移出」方向的确定性判定（无 LLM）：整串小写后对撤销类动词做 `includes`。中文不分词，故直接子串匹配。
+ * 未命中任何标记 → 视为「加入」（默认方向，与本闭环上线时的唯一语义一致）。
+ * // ponytail: 一次 interpret 一个方向；「既加又移」的复合句需分两次说——apply 侧本就支持同 input 双向
+ */
+const REMOVE_MARKERS = [
+  '移出',
+  '移除',
+  '去掉',
+  '删掉',
+  '删除',
+  '取消',
+  '撤销',
+  '恢复',
+  '解除',
+  'remove',
+  'delete',
+  'undo',
+  'unmute',
+  'restore',
+] as const;
+
+function isRemoveIntent(text: string): boolean {
+  const lower = text.toLowerCase();
+  return REMOVE_MARKERS.some((m) => lower.includes(m));
 }
 
 /** 从 ctx.input 读反馈自然语言（`{ text: string }`）；非对象/缺 text/非串 → 空串（当空处理）。 */
@@ -364,24 +415,132 @@ function matchNoiseCandidates(text: string, candidates: readonly string[]): stri
   return out;
 }
 
+// ─────────────── canonical 归一与入口校验（反馈闭环两个入口共用） ───────────────
+//
+// 契约要求「确认页展示的 == 实际写入的」：interpret emit 的 add/remove 必须**已是**即将写入 overlay 的
+// canonical 形态。归一与 rules.yaml/overlay 的既有 ingest 纪律一致：trim → 去包裹 `<>` → 小写 → 丢空。
+//
+// 校验只认**可打印 ASCII**。非 ASCII 域名（IDN）v1 **直接拒绝**而非单侧归一：overlay 若存 punycode，
+// 匹配侧 `applySafetyRules` 比的是 `email.fromEmail`（normalizer 只小写、不转 punycode）→ 用户以为加了
+// 降噪、实则永不命中 = false-green。要支持 IDN 必须两侧同时改，另开一条。控制字符同路拒绝。
+
+/** 可打印 ASCII：一次性挡掉全部控制字符（U+0000–U+001F、U+007F）与全部非 ASCII（含 IDN）。 */
+const PRINTABLE_ASCII_RE = /^[\x20-\x7e]+$/;
+/** 域名：≥2 段、每段 `[a-z0-9]` 起止、段内可含 `-`、无空段。 */
+const DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+/** mailbox local part（未加引号的常见字符集，够覆盖真实地址；更怪的写法宁可响亮拒绝）。 */
+const LOCAL_RE = /^[a-z0-9._%+-]+$/;
+const MAX_ENTRY_LEN = 254;
+
+/** trim → 去包裹的 `<>` → 小写（不做校验；校验见 isValidEntry）。 */
+function canonicalizeEntry(raw: string): string {
+  let s = raw.trim();
+  if (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
+    s = s.slice(1, -1).trim();
+  }
+  return s.toLowerCase();
+}
+
+/** canonical 串是否为合法 mailbox 或域名（空/超长/非 ASCII/控制字符/形态不符 → false）。 */
+function isValidEntry(s: string): boolean {
+  if (s.length === 0 || s.length > MAX_ENTRY_LEN || !PRINTABLE_ASCII_RE.test(s)) {
+    return false;
+  }
+  const at = s.indexOf('@');
+  if (at === -1) {
+    return DOMAIN_RE.test(s);
+  }
+  return at === s.lastIndexOf('@') && LOCAL_RE.test(s.slice(0, at)) && DOMAIN_RE.test(s.slice(at + 1));
+}
+
 /**
- * apply-feedback 触发（noise-feedback 契约）：把确认后的 add **幂等**并入 overlay 机器文件、**只写 overlay**。
- * add 过滤为字符串（非串丢弃）+ trim+lower+丢空归一（同 loader ingest，使并集去重成立）；读现有 overlay
- * （缺失/读错误→空，overlay 机器可再生）；`added` = 不在现有集的、`already_present` = 已在的（set-union 幂等）；
- * 原子写 tmp+rename（**绝不碰 rules.yaml**）；emit feedback.applied。重发安全：同一 add 再 apply → added=[]。
+ * **用户显式入口**的归一 + 校验：非法 → throw（→ `run.failed`）。用于 NL 里点名的地址与 apply 收到的
+ * 结构化项——apply 是独立入口，**不信** view 回传的结果，重新归一 + 重新校验（很便宜）。
+ * // ponytail: 失败原因只回 CLI trace（view 只投影声明字段）；要在页面显示拒绝原因得加 interpretation.rejected
+ * //           字段并同步改 view 白名单，另开一条
+ */
+function requireEntry(raw: unknown, where: string): string {
+  const s = typeof raw === 'string' ? canonicalizeEntry(raw) : '';
+  if (!isValidEntry(s)) {
+    throw new Error(
+      `inbox pipeline: ${where} 含非法 mailbox/domain（须为非空可打印 ASCII 的 local@domain 或 domain；` +
+        `控制字符与非 ASCII 域名 v1 不支持）：${JSON.stringify(String(raw)).slice(0, 64)}`,
+    );
+  }
+  return s;
+}
+
+/**
+ * **非用户输入**（DB 高频候选 / overlay 现有项）的归一 + 去重：畸形项**静默丢弃**而非 throw——
+ * 一条手写坏进 overlay 的旧数据不该让整条命令失败。保序（候选顺序 = digest 展示顺序 / overlay 行序）。
+ * // ponytail: 校验不过的历史 overlay 行无法经 NL 移出，直接编辑该文件即可
+ */
+function canonicalizeLoose(entries: readonly string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const e of entries) {
+    const s = canonicalizeEntry(e);
+    if (!isValidEntry(s) || seen.has(s)) {
+      continue;
+    }
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/** 断词：只切绝不可能出现在地址里的空白/标点；`<>` 不切（包裹形态由 canonicalizeEntry 去壳）。 */
+const TOKEN_SPLIT_RE = /[\s,，、;；:：!！?？"'“”‘’()（）【】[\]{}。]+/;
+
+/**
+ * 从 NL 摘**显式** mailbox/domain token：含 `@`、或末段为纯字母（≥2 位）的带点 token（排除 `v1.2`/`1.2.3.4`
+ * 这类版本号/IP）。命中即校验，非法 → throw（响亮失败优于静默忽略一个用户点了名的地址）。
+ */
+function parseExplicitEntries(text: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const rawTok of text.split(TOKEN_SPLIT_RE)) {
+    const tok = rawTok.replace(/\.+$/, ''); // 句末句点不属地址
+    if (tok.length === 0 || (!tok.includes('@') && !looksLikeDomain(tok))) {
+      continue;
+    }
+    const s = requireEntry(tok, 'interpret-feedback 显式地址');
+    if (!seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** 带点且末段 ≥2 位、不含数字 → 当域名看待（`v1.2`/`1.2.3.4` 末段含数字，不误判为域名）。 */
+function looksLikeDomain(tok: string): boolean {
+  const dot = tok.lastIndexOf('.');
+  if (dot === -1) {
+    return false;
+  }
+  const tld = tok.slice(dot + 1);
+  return tld.length >= 2 && !/[0-9]/.test(tld);
+}
+
+/**
+ * apply-feedback 触发（noise-feedback 契约）：把确认后的 `{ add, remove }` **幂等**落 overlay 机器文件、
+ * **只写 overlay**。读现有 overlay（缺失/读错误→空，overlay 机器可再生）→ 求 `existing ∪ add \ remove`
+ * → **一次** tmp+rename 原子发布（**绝不碰人工维护的 rules.yaml**）→ emit `feedback.applied` 四字段。
+ *
+ * 回执语义：`added`/`removed` = 本次真改了 overlay 的；`already_present`/`not_present` = 请求但本就已在/
+ * 本就不在的。重发同一 apply 安全——两者退化为空、overlay 内容不变（set-union 与 set-difference 各自幂等）。
+ * 可逆性：add 后再 remove 同一地址，overlay **字节内容**回到 add 之前（Set 保插入序，删除不扰动其余行序）。
  */
 async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Promise<void> {
-  const add = normalizeFeedbackAdd(ctx.input);
+  const { add, remove } = normalizeFeedbackInput(ctx.input);
   const overlayPath = resolveNoiseOverlayPath();
   const existing = new Set<string>(readNoiseOverlay(overlayPath));
   const added: string[] = [];
   const alreadyPresent: string[] = [];
-  const seenInput = new Set<string>();
+  const removed: string[] = [];
+  const notPresent: string[] = [];
   for (const s of add) {
-    if (seenInput.has(s)) {
-      continue; // 同一 add 内去重（避免同一地址重复计入 added/already_present）。
-    }
-    seenInput.add(s);
     if (existing.has(s)) {
       alreadyPresent.push(s);
     } else {
@@ -389,23 +548,59 @@ async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Pro
       added.push(s);
     }
   }
-  writeNoiseOverlayAtomic(overlayPath, existing);
-  ctx.emit('feedback.applied', { added, already_present: alreadyPresent });
+  for (const s of remove) {
+    if (existing.delete(s)) {
+      removed.push(s);
+    } else {
+      notPresent.push(s);
+    }
+  }
+  if (added.length > 0 || removed.length > 0) {
+    writeNoiseOverlayAtomic(overlayPath, existing); // 无实际变更不写：重发 apply 连 mtime 都不动。
+  }
+  ctx.emit('feedback.applied', { added, already_present: alreadyPresent, removed, not_present: notPresent });
 }
 
-/** 从 ctx.input 读确认后的 add（`{ add: string[] }`）：非数组→空；过滤非串；trim+lower+丢空归一。 */
-function normalizeFeedbackAdd(input: unknown): string[] {
+/**
+ * 从 ctx.input 读确认后的 `{ add, remove }`：**两侧各自**归一 + 校验 + 去重（apply 是独立入口，不信 view
+ * 回传的结构化结果）。缺键 → 该侧 `[]`（无变更）；键在但非数组、或含非法项 → **throw**（契约漂移响亮失败）。
+ * 同一地址同时出现在两侧 → **throw**：不静默任选一边、不互相抵消成无操作。
+ */
+function normalizeFeedbackInput(input: unknown): { add: string[]; remove: string[] } {
+  const add = readEntryList(input, 'add');
+  const remove = readEntryList(input, 'remove');
+  const removeSet = new Set(remove);
+  const both = add.filter((s) => removeSet.has(s));
+  if (both.length > 0) {
+    throw new Error(
+      `inbox pipeline: apply-feedback 同一地址同时出现在 add 与 remove（拒绝静默裁决）：${both.join(', ')}`,
+    );
+  }
+  return { add, remove };
+}
+
+/** 读并校验 `input[key]` 为 canonical 条目数组（缺键 → []；非数组/含非法项 → throw；保序去重）。 */
+function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
   const raw =
-    input !== null && typeof input === 'object' && 'add' in input
-      ? (input as { add: unknown }).add
+    input !== null && typeof input === 'object' && key in input
+      ? (input as Record<string, unknown>)[key]
       : undefined;
-  if (!Array.isArray(raw)) {
+  if (raw === undefined) {
     return [];
   }
-  return raw
-    .filter((s): s is string => typeof s === 'string')
-    .map((s) => s.trim().toLowerCase())
-    .filter((s) => s.length > 0);
+  if (!Array.isArray(raw)) {
+    throw new Error(`inbox pipeline: apply-feedback 的 ${key} 必须是 string[]（收到 ${typeof raw}）`);
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of raw) {
+    const s = requireEntry(item, `apply-feedback ${key}`);
+    if (!seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
 }
 
 /**
