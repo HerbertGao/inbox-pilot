@@ -936,69 +936,18 @@ test('nf③ interpret-feedback: input 非对象/缺 text/非串 → 当空、add
   }
 });
 
-test('nf④ apply-feedback: set-union 幂等 + 原子写产文件 + added/already_present + 归一/去重/非串丢弃', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'noise-overlay-'));
-  const overlay = join(dir, 'noise_senders.overlay');
-  const prevEnv = process.env.NOISE_OVERLAY_FILE;
-  process.env.NOISE_OVERLAY_FILE = overlay;
-  try {
-    // 首次 apply：全部新增、原子写产文件。
-    const ctx1 = makeCtx('apply-feedback');
-    ctx1.input = { add: ['a@x.com', 'b@y.com'] };
-    await run(ctx1, {});
-    const p1 = ctx1.events.find((e) => e.kind === 'feedback.applied')!.payload as {
-      added: string[];
-      already_present: string[];
-    };
-    assert.deepEqual(p1.added, ['a@x.com', 'b@y.com'], '首次全部 added');
-    assert.deepEqual(p1.already_present, [], '首次无 already_present');
-    assert.deepEqual(readFileSync(overlay, 'utf8').trim().split('\n').sort(), ['a@x.com', 'b@y.com'], 'overlay 文件含并集');
 
-    // 重发同一 add：幂等 → added=[]、already_present=全部、文件不变。
-    const ctx2 = makeCtx('apply-feedback');
-    ctx2.input = { add: ['a@x.com', 'b@y.com'] };
-    await run(ctx2, {});
-    const p2 = ctx2.events.find((e) => e.kind === 'feedback.applied')!.payload as {
-      added: string[];
-      already_present: string[];
-    };
-    assert.deepEqual(p2.added, [], '重发 → added=[]（set-union 幂等）');
-    assert.deepEqual(p2.already_present.sort(), ['a@x.com', 'b@y.com'], '重发 → already_present=全部');
-    assert.deepEqual(readFileSync(overlay, 'utf8').trim().split('\n').sort(), ['a@x.com', 'b@y.com'], '文件不变');
-
-    // 增量 apply：部分新增、部分已在；C@Z.COM 归一后与 c 去重。
-    const ctx3 = makeCtx('apply-feedback');
-    ctx3.input = { add: ['b@y.com', 'c@z.com', 'C@Z.COM'] };
-    await run(ctx3, {});
-    const p3 = ctx3.events.find((e) => e.kind === 'feedback.applied')!.payload as {
-      added: string[];
-      already_present: string[];
-    };
-    assert.deepEqual(p3.added, ['c@z.com'], '仅 c 新增（大小写归一去重）');
-    assert.deepEqual(p3.already_present, ['b@y.com'], 'b 已在');
-    assert.deepEqual(
-      readFileSync(overlay, 'utf8').trim().split('\n').sort(),
-      ['a@x.com', 'b@y.com', 'c@z.com'],
-      'overlay 增量并集',
-    );
-  } finally {
-    if (prevEnv === undefined) {
-      delete process.env.NOISE_OVERLAY_FILE;
-    } else {
-      process.env.NOISE_OVERLAY_FILE = prevEnv;
-    }
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ─────────────── remove 路径 + 入口校验（跨 repo 契约 add-view-feedback-remove） ───────────────
+// ─────────────── 结构化 remove 路径 + 入口校验（跨仓契约 add-view-feedback-remove） ───────────────
+//
+// 定型决策：**pilot 不做自然语言意图解析**。方向与地址由调用方给结构化 JSON，pilot 只做归一、校验、
+// 集合运算。既有 `{text}` → add 路径（nf①–③）一行未改，本节只覆盖新增的结构化入口与 apply 侧收紧。
 
 /** 沙箱里陪跑的 rules.yaml：反馈闭环**任何**路径都不许碰它，withOverlay 收尾逐字节断言。 */
 const RULES_YAML_SENTINEL = 'noise_senders: []\n';
 
 /**
- * 临时 overlay 沙箱：env 指向 tmp 文件、同目录放一份 rules.yaml 哨兵，跑完断言 rules.yaml 未被写、
- * 再还原 env 并清理。`seed` 为 null 表示 overlay 文件不存在（首次 apply 的常态）。
+ * 临时 overlay 沙箱：env 指向 tmp 文件、同目录放一份 rules.yaml 哨兵。`seed` 为 null 表示 overlay 文件
+ * 不存在（首次 apply 的常态）。哨兵断言放在 `finally` 里——放 try 内会在 `fn` 抛出时被静默跳过。
  */
 async function withOverlay(
   seed: string | null,
@@ -1015,8 +964,8 @@ async function withOverlay(
   process.env.NOISE_OVERLAY_FILE = overlay;
   try {
     await fn(overlay, dir);
-    assert.equal(readFileSync(rulesYaml, 'utf8'), RULES_YAML_SENTINEL, '反馈闭环绝不碰人工维护的 rules.yaml');
   } finally {
+    assert.equal(readFileSync(rulesYaml, 'utf8'), RULES_YAML_SENTINEL, '反馈闭环绝不碰人工维护的 rules.yaml');
     if (prevEnv === undefined) {
       delete process.env.NOISE_OVERLAY_FILE;
     } else {
@@ -1026,11 +975,19 @@ async function withOverlay(
   }
 }
 
-/** 取某 kind 事件的 payload（断言其存在）。 */
+/** 取某 kind 事件的 payload，并断言该 kind **恰好 emit 一次**（view 数同 kind 个数，≠1 即失败）。 */
 function payloadOf(ctx: { events: Array<{ kind: string; payload?: object }> }, kind: string): Record<string, string[]> {
-  const ev = ctx.events.find((e) => e.kind === kind);
-  assert.ok(ev, `emit ${kind}`);
-  return ev.payload as Record<string, string[]>;
+  const hits = ctx.events.filter((e) => e.kind === kind);
+  assert.equal(hits.length, 1, `${kind} 必须恰好 emit 一次（实际 ${hits.length} 次）`);
+  return hits[0].payload as Record<string, string[]>;
+}
+
+/** 回执四桶必须与请求配分：added∪already_present == dedup(add)、removed∪not_present == dedup(remove)、四桶两两不交。 */
+function assertReceiptPartition(p: Record<string, string[]>, add: string[], remove: string[]): void {
+  assert.deepEqual([...p.added, ...p.already_present].sort(), [...new Set(add)].sort(), 'added ∪ already_present == add');
+  assert.deepEqual([...p.removed, ...p.not_present].sort(), [...new Set(remove)].sort(), 'removed ∪ not_present == remove');
+  const all = [...p.added, ...p.already_present, ...p.removed, ...p.not_present];
+  assert.equal(new Set(all).size, all.length, '四桶两两不交');
 }
 
 function nfEmail(overrides: Partial<NormalizedEmail> = {}): NormalizedEmail {
@@ -1062,12 +1019,39 @@ function nfClassification(overrides: Partial<Classification> = {}): Classificati
   };
 }
 
-test('nf⑤ apply-feedback: 四字段恒在 + add/remove 各自幂等 + add→remove 后 overlay 字节回滚（可逆）', async () => {
+test('nf④ 可逆性（核心）：空 overlay 起 → add → remove 同一地址 → 文件字节回到 add 之前', async () => {
   await withOverlay('keep@a.com\nnoise@b.com\n', async (overlay) => {
     const before = readFileSync(overlay, 'utf8');
+
+    const c1 = makeCtx('apply-feedback');
+    c1.input = { add: ['new@c.com'], remove: [] };
+    await run(c1, {});
+    assert.deepEqual(payloadOf(c1, 'feedback.applied').added, ['new@c.com']);
+    assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\nnoise@b.com\nnew@c.com\n', '追加在末行');
+
+    const c2 = makeCtx('apply-feedback');
+    c2.input = { add: [], remove: ['new@c.com'] };
+    await run(c2, {});
+    assert.deepEqual(payloadOf(c2, 'feedback.applied').removed, ['new@c.com']);
+    assert.equal(readFileSync(overlay, 'utf8'), before, 'add→remove 后 overlay 字节内容回到 add 之前');
+  });
+
+  // 字节等价只对 writeNoiseOverlayAtomic 写出的文件成立；人工编辑过的存量文件只保证集合等价。
+  await withOverlay('KEEP@A.COM\n\nkeep@a.com', async (overlay) => {
+    const c1 = makeCtx('apply-feedback');
+    c1.input = { add: ['new@c.com'] };
+    await run(c1, {});
+    const c2 = makeCtx('apply-feedback');
+    c2.input = { remove: ['new@c.com'] };
+    await run(c2, {});
+    assert.equal(readFileSync(overlay, 'utf8'), 'keep@a.com\n', '非 canonical 存量文件：集合等价（归一 + 去重），非字节等价');
+  });
+});
+
+test('nf⑤ apply-feedback: add/add 与 remove/remove 各自幂等；四字段恒在（无变更也 emit []、且恰好一次）', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
     const mtimeBefore = statSync(overlay).mtimeMs;
 
-    // 无变更也 emit 四字段（deepEqual 整个 payload → 既证恒在、也证没多带字段）。
     const c0 = makeCtx('apply-feedback');
     c0.input = {};
     await run(c0, {});
@@ -1078,149 +1062,177 @@ test('nf⑤ apply-feedback: 四字段恒在 + add/remove 各自幂等 + add→re
     );
     assert.equal(statSync(overlay).mtimeMs, mtimeBefore, '无变更不写');
 
-    // add 新地址。
     const c1 = makeCtx('apply-feedback');
-    c1.input = { add: ['new@c.com'], remove: [] };
+    c1.input = { add: ['x@y.com'] };
     await run(c1, {});
-    assert.deepEqual(payloadOf(c1, 'feedback.applied').added, ['new@c.com']);
-    const afterAdd = readFileSync(overlay, 'utf8');
-    assert.equal(afterAdd, 'keep@a.com\nnoise@b.com\nnew@c.com\n', '追加在末行');
+    assert.deepEqual(payloadOf(c1, 'feedback.applied').added, ['x@y.com']);
 
-    // 重发同一 add → 幂等。
     const c2 = makeCtx('apply-feedback');
-    c2.input = { add: ['new@c.com'], remove: [] };
+    c2.input = { add: ['x@y.com'] };
     await run(c2, {});
     const p2 = payloadOf(c2, 'feedback.applied');
     assert.deepEqual(p2.added, [], '重发 add → added=[]');
-    assert.deepEqual(p2.already_present, ['new@c.com'], '退化为 already_present');
-    assert.equal(readFileSync(overlay, 'utf8'), afterAdd, 'overlay 不变');
+    assert.deepEqual(p2.already_present, ['x@y.com'], '退化为 already_present');
+    assertReceiptPartition(p2, ['x@y.com'], []);
 
-    // remove 同一地址 → 字节回到 add 之前（本任务的核心断言）。
     const c3 = makeCtx('apply-feedback');
-    c3.input = { add: [], remove: ['new@c.com'] };
+    c3.input = { remove: ['x@y.com'] };
     await run(c3, {});
-    const p3 = payloadOf(c3, 'feedback.applied');
-    assert.deepEqual(p3.removed, ['new@c.com']);
-    assert.deepEqual(p3.not_present, []);
-    assert.equal(readFileSync(overlay, 'utf8'), before, 'add→remove 后 overlay 字节内容回到 add 之前');
+    assert.deepEqual(payloadOf(c3, 'feedback.applied').removed, ['x@y.com']);
 
-    // 重发同一 remove → 幂等（退化为 not_present、不写）。
     const c4 = makeCtx('apply-feedback');
-    c4.input = { remove: ['new@c.com'] };
+    c4.input = { remove: ['x@y.com'] };
     await run(c4, {});
     const p4 = payloadOf(c4, 'feedback.applied');
     assert.deepEqual(p4.removed, [], '重发 remove → removed=[]');
-    assert.deepEqual(p4.not_present, ['new@c.com'], '退化为 not_present');
-    assert.equal(readFileSync(overlay, 'utf8'), before, 'overlay 不变（不在名单的 remove 不产生写）');
+    assert.deepEqual(p4.not_present, ['x@y.com'], '退化为 not_present');
+    assertReceiptPartition(p4, [], ['x@y.com']);
   });
 });
 
-test('nf⑥ apply-feedback: "  <FOO@Example.COM>  " → canonical foo@example.com，写入 bytes == emit 的项', async () => {
+test('nf⑥ canonical 是同一个函数：同一未归一串，interpret 的 emit 与 apply 的写入逐字相同', async () => {
   await withOverlay(null, async (overlay) => {
-    const ctx = makeCtx('apply-feedback');
-    ctx.input = { add: ['  <FOO@Example.COM>  '], remove: [] };
-    await run(ctx, {});
-    assert.deepEqual(payloadOf(ctx, 'feedback.applied').added, ['foo@example.com'], 'trim → 去 <> → 小写');
-    assert.equal(readFileSync(overlay, 'utf8'), 'foo@example.com\n', '确认页展示的 == 实际写入的');
+    // interpret 收未归一串 → emit canonical 形态、不 throw。
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { add: ['  <FOO@Example.COM>  '] };
+    await run(ci, { repo: senderRepo([]) });
+    const proposed = payloadOf(ci, 'interpretation.proposed').add;
+    assert.deepEqual(proposed, ['foo@example.com'], 'trim → 去 <> → 小写');
+
+    // 把 interpret 的输出原样投给 apply → 通过，且写入 bytes 与 emit 逐字相同。
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: proposed };
+    await run(ca, {});
+    assert.deepEqual(payloadOf(ca, 'feedback.applied').added, proposed, '回执与提案逐字相同');
+    assert.equal(readFileSync(overlay, 'utf8'), `${proposed[0]}\n`, '确认页展示的 == 实际写入的');
   });
 });
 
-test('nf⑦ apply-feedback: 非法项 → throw，overlay 内容与 mtime 均未变（校验先于写）', async () => {
+test('nf⑦ apply 拒非 canonical：未归一串直投 apply → throw、overlay 未变（interpret 收同一串则不 throw）', async () => {
   await withOverlay('keep@a.com\n', async (overlay) => {
     const before = readFileSync(overlay, 'utf8');
     const mtimeBefore = statSync(overlay).mtimeMs;
-    const bad: unknown[] = [
-      '', // 空
-      '   ', // 全空白
-      'ctrl\u0001@x.com', // 控制字符
-      '用户@例子.com', // 非 ASCII（IDN v1 拒绝：单侧归一会 false-green）
-      'a@', // 空域名
-      '@b.com', // 空 local
-      'a@@b.com', // 双 @
-      'no-dot', // 无点的裸串不是域名
-      'has space@x.com',
-      'x'.repeat(300) + '@y.com', // 超长
-      42,
-      null,
-    ];
-    for (const item of bad) {
+    for (const raw of ['  <FOO@Example.COM>  ', 'A@X.com', ' a@x.com', '<a@x.com>']) {
       const ctx = makeCtx('apply-feedback');
-      ctx.input = { add: [item] };
-      await assert.rejects(run(ctx, {}), /非法 mailbox\/domain/, `非法项 ${String(item)} 必须 throw`);
+      ctx.input = { add: [raw] };
+      await assert.rejects(run(ctx, {}), /非 canonical 或非法项/, `未归一串 ${JSON.stringify(raw)} 必须 throw`);
     }
-    // 声明字段在但类型不符（契约漂移）→ 同样响亮失败，不当空处理。
-    const ctxShape = makeCtx('apply-feedback');
-    ctxShape.input = { add: 'a@b.com' };
-    await assert.rejects(run(ctxShape, {}), /必须是 string\[\]/, '非数组 add → throw');
-
     assert.equal(readFileSync(overlay, 'utf8'), before, 'overlay 内容未变');
-    assert.equal(statSync(overlay).mtimeMs, mtimeBefore, 'overlay 未被写（mtime 不变）');
+    assert.equal(statSync(overlay).mtimeMs, mtimeBefore, 'overlay 未被写（校验先于写）');
   });
 });
 
-test('nf⑧ apply-feedback: 同一地址同时 add+remove → throw（不静默任选一边、不抵消成无操作）', async () => {
-  await withOverlay('x@y.com\n', async (overlay) => {
+test('nf⑧ apply 拒非法项与畸形 input；缺 key 视作 []（部署窗口里旧 view 只发 add）', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
+    const before = readFileSync(overlay, 'utf8');
+    const mtimeBefore = statSync(overlay).mtimeMs;
+
+    const illegal: unknown[] = [
+      '', // 空
+      'foo@', // 空域名
+      '@b.com', // 空 local
+      'a@@b.com', // 域名段含 @
+      'no-dot', // 无点的裸串不是域名
+      'a@x.1', // TLD 非纯字母
+      'a@x.c', // TLD 不足 2 位
+      'a b@x.com', // local 含空白
+      'a@例子.com', // 非 ASCII（IDN v1 拒绝）
+      'ctrl\u0001@x.com', // 控制字符（码位转义写，绝不贴字符本身）
+      'x'.repeat(300) + '@y.com', // 超长
+      1, // 非串
+      null,
+    ];
+    for (const item of illegal) {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = { add: [item] };
+      await assert.rejects(run(ctx, {}), /非 canonical 或非法项/, `非法项 ${String(item)} 必须 throw`);
+    }
+
+    // key 存在但不是 string[] → throw（当空集会让「忽略畸形输入并回四个空桶」走成功路径）。
+    for (const shape of [{ add: 'x' }, { remove: 42 }, { add: null }]) {
+      const ctx = makeCtx('apply-feedback');
+      ctx.input = shape;
+      await assert.rejects(run(ctx, {}), /必须是 string\[\]/, `畸形 ${JSON.stringify(shape)} → throw`);
+    }
+
+    assert.equal(readFileSync(overlay, 'utf8'), before, 'overlay 内容未变');
+    assert.equal(statSync(overlay).mtimeMs, mtimeBefore, 'overlay 未被写');
+
+    // 缺 remove key → 正常应用，removed/not_present 为 []。
+    const ok = makeCtx('apply-feedback');
+    ok.input = { add: ['a@x.com'] };
+    await run(ok, {});
+    const p = payloadOf(ok, 'feedback.applied');
+    assert.deepEqual(p.added, ['a@x.com']);
+    assert.deepEqual(p.removed, [], '缺 remove key → []');
+    assert.deepEqual(p.not_present, [], '缺 remove key → []');
+  });
+});
+
+test('nf⑨ apply 拒同项冲突：add ∩ remove ≠ ∅ → throw、overlay 未变', async () => {
+  await withOverlay('a@x.com\n', async (overlay) => {
     const before = readFileSync(overlay, 'utf8');
     const ctx = makeCtx('apply-feedback');
-    ctx.input = { add: ['  <X@Y.com>  '], remove: ['x@y.com'] }; // 归一后同址
-    await assert.rejects(run(ctx, {}), /同一地址同时出现在 add 与 remove/);
+    ctx.input = { add: ['a@x.com'], remove: ['a@x.com'] };
+    await assert.rejects(run(ctx, {}), /同一项同时出现在 add 与 remove/);
     assert.equal(readFileSync(overlay, 'utf8'), before, '拒绝时不写');
   });
 });
 
-test('nf⑨ interpret-feedback: 移出方向 → 候选集 = 当前 overlay（remove ⊆ overlay、add=[]、无写）', async () => {
-  await withOverlay('noreply@taobao.com\npush@weibo.com\n', async (overlay) => {
+test('nf⑩ interpret 不 throw：非法项/冲突项只是不出现在 emit 里，无写、run 正常结束', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
     const mtimeBefore = statSync(overlay).mtimeMs;
-    const repo = senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]);
-
     const ctx = makeCtx('interpret-feedback');
-    ctx.input = { text: '把 taobao 从降噪名单移出' };
-    await run(ctx, { repo });
+    ctx.input = {
+      add: ['foo@', 'ctrl\u0001@x.com', 'a@例子.com', 'both@x.com', 'good@x.com', 1, null],
+      remove: ['both@x.com', 'keep@a.com'],
+    };
+    await run(ctx, { repo: senderRepo([]) });
     const p = payloadOf(ctx, 'interpretation.proposed');
-    assert.deepEqual(p.add, [], '移出方向 add 恒空');
-    assert.deepEqual(p.remove, ['noreply@taobao.com'], 'remove ⊆ overlay');
-
-    // 不在 overlay 的显式地址不进移出提案（remove 恒为 overlay 子集）。
-    const ctxGhost = makeCtx('interpret-feedback');
-    ctxGhost.input = { text: '把 ghost@nowhere.com 移出降噪' };
-    await run(ctxGhost, { repo });
-    assert.deepEqual(payloadOf(ctxGhost, 'interpretation.proposed').remove, [], '不在名单者不提案');
-
+    assert.deepEqual(p.add, ['good@x.com'], '非法项与同项冲突项均不出现在 add');
+    assert.deepEqual(p.remove, ['keep@a.com'], '冲突项不出现在 remove；remove 只提议真在名单里的');
     assert.equal(statSync(overlay).mtimeMs, mtimeBefore, 'interpret 全程无写');
+
+    // 畸形 shape 在 interpret 侧也不 throw（fail-loud 由 apply 腿承担）。
+    const bad = makeCtx('interpret-feedback');
+    bad.input = { add: 'x' };
+    await run(bad, { repo: senderRepo([]) });
+    assert.deepEqual(payloadOf(bad, 'interpretation.proposed'), { add: [], remove: [] }, '畸形 → 两侧空、不 throw');
   });
 });
 
-test('nf⑩ interpret-feedback: 显式地址不要求在 TOP-N 内、已 canonical；非法显式项 → throw', async () => {
+test('nf⑪ 归一后去重：interpret 侧 A@X.com 与 a@x.com 只算一项；apply 侧同串重复只算一项', async () => {
   await withOverlay(null, async () => {
-    const repo = senderRepo([{ fromEmail: 'noreply@taobao.com', count: 9 }]);
+    const ci = makeCtx('interpret-feedback');
+    ci.input = { add: ['A@X.com', 'a@x.com', '  <a@x.com>  '] };
+    await run(ci, { repo: senderRepo([]) });
+    assert.deepEqual(payloadOf(ci, 'interpretation.proposed').add, ['a@x.com'], '按归一后的值去重');
 
-    const ctx = makeCtx('interpret-feedback');
-    ctx.input = { text: '把 <NEW@Example.COM> 加进降噪' };
-    await run(ctx, { repo });
-    const p = payloadOf(ctx, 'interpretation.proposed');
-    assert.deepEqual(p.add, ['new@example.com'], '从未见过的地址也可加（canonical 形态）');
-    assert.deepEqual(p.remove, [], 'add 方向 remove 恒空');
-
-    // 点名了确切地址就不再跑模糊匹配（否则 "com" 这类通用 token 会顺带命中候选）。
-    const ctxOnly = makeCtx('interpret-feedback');
-    ctxOnly.input = { text: '把 push@weibo.com 加进降噪' };
-    await run(ctxOnly, { repo });
-    assert.deepEqual(payloadOf(ctxOnly, 'interpretation.proposed').add, ['push@weibo.com'], '只取显式项');
-
-    // 版本号不当域名（不误判、不误 throw）。
-    const ctxVer = makeCtx('interpret-feedback');
-    ctxVer.input = { text: '按 v1.2 的说明把 taobao 加进降噪' };
-    await run(ctxVer, { repo });
-    assert.deepEqual(payloadOf(ctxVer, 'interpretation.proposed').add, ['noreply@taobao.com'], 'v1.2 不当显式项');
-
-    // 非 ASCII 域名的显式项 → 响亮失败（v1 不做单侧 IDN 归一）。
-    const ctxIdn = makeCtx('interpret-feedback');
-    ctxIdn.input = { text: '把 用户@例子.com 加进降噪' };
-    await assert.rejects(run(ctxIdn, { repo }), /非法 mailbox\/domain/, '非 ASCII 域名 → throw');
+    const ca = makeCtx('apply-feedback');
+    ca.input = { add: ['a@x.com', 'a@x.com'] };
+    await run(ca, {});
+    const p = payloadOf(ca, 'feedback.applied');
+    assert.deepEqual(p.added, ['a@x.com']);
+    assertReceiptPartition(p, ['a@x.com', 'a@x.com'], []);
   });
 });
 
-test('nf⑪ apply 后即生效于规则引擎：非敏感 → P3；敏感邮件不被降温、仍不自动已读', async () => {
+test('nf⑫ remove 不在名单 → not_present 命中、removed 为空、文件未变', async () => {
+  await withOverlay('keep@a.com\n', async (overlay) => {
+    const before = readFileSync(overlay, 'utf8');
+    const mtimeBefore = statSync(overlay).mtimeMs;
+    const ctx = makeCtx('apply-feedback');
+    ctx.input = { remove: ['ghost@nowhere.com'] };
+    await run(ctx, {});
+    const p = payloadOf(ctx, 'feedback.applied');
+    assert.deepEqual(p.removed, []);
+    assert.deepEqual(p.not_present, ['ghost@nowhere.com']);
+    assert.equal(readFileSync(overlay, 'utf8'), before, '文件未变');
+    assert.equal(statSync(overlay).mtimeMs, mtimeBefore, '不产生写');
+  });
+});
+
+test('nf⑬ apply 后即生效于规则引擎：非敏感 → P3；敏感邮件不被降温、仍不自动已读', async () => {
   await withOverlay(null, async (_overlay, dir) => {
     const ctx = makeCtx('apply-feedback');
     ctx.input = { add: ['nas@home.lan'] };
