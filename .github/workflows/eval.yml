@@ -30,7 +30,7 @@ jobs:
           persist-credentials: false # eval 步骤不需 git 凭据，关闭 token 持久化
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .nvmrc
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
       - run: pnpm eval:phishing
@@ -52,7 +52,7 @@ jobs:
           persist-credentials: false # eval 步骤不需 git 凭据，关闭 token 持久化
       - uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .nvmrc
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
       - id: eval
