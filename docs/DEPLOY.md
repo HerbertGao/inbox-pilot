@@ -63,7 +63,9 @@ far-end（`127.0.0.1:${POSTGRES_HOST_PORT:-5432}`）随宿主实际端口走；�
 
 ## rules.yaml 坏挂载处置
 
-compose 的 `./rules:/app/rules:ro` bind-mount 是无条件的：**挂载存在时完全遮蔽镜像内烘焙的 `COPY rules` 拷贝**。双供给只保护「无挂载」场景，不保护「坏挂载」场景。
+compose 的 `./rules:/app/rules:rw` bind-mount 是无条件的：**挂载存在时完全遮蔽镜像内烘焙的 `COPY rules` 拷贝**。双供给只保护「无挂载」场景，不保护「坏挂载」场景。
+
+挂载是 `rw` 而非 `ro`，因为降噪反馈闭环要在同目录写机器文件 `noise_senders.overlay`（`apply-feedback` 是它的唯一写者，路径从 `RULES_FILE` 派生、不可单独配置）。**app 仍然不写 `rules.yaml`** —— 那条硬约束由写路径自己的撞名闸守，不依赖挂载权限。该 overlay 属运行期状态，已在 `.gitignore` 里，不要提交。
 
 若宿主缺 `./rules/rules.yaml`（tarball 部署、或 checkout 时未带该文件），Docker 会在挂载点自动建一个空目录 → 遮蔽镜像内拷贝 → 触发 `rules-config-load-failed → carry-forward` 退化。
 

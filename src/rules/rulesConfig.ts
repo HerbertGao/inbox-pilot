@@ -51,53 +51,239 @@ export type ActiveRules = {
 const DEFAULT_RULES_PATH = fileURLToPath(new URL('../../rules/rules.yaml', import.meta.url));
 
 // ponytail: 256KB cap on operator-local rules.yaml — bounds sync parse cost; over-limit → carry-forward; raise or stream-parse if operators need huge lists
-const MAX_RULES_FILE_BYTES = 256 * 1024;
+export const MAX_RULES_FILE_BYTES = 256 * 1024;
 
-function resolveRulesPath(): string {
+export function resolveRulesPath(): string {
   const fromEnv = process.env.RULES_FILE;
   return fromEnv !== undefined && fromEnv !== '' ? fromEnv : DEFAULT_RULES_PATH;
 }
 
 /**
- * noise overlay 机器文件路径：默认与 rules.yaml 同目录的 `noise_senders.overlay`，env NOISE_OVERLAY_FILE 覆盖。
+ * noise overlay 机器文件路径：**恒为**与 rules.yaml 同目录的 `noise_senders.overlay`，**不可配置**。
  * apply-feedback（pipeline）**写**、本 loader **读**，共用此单一路径来源；rulesPath 参使 buildAndPublish
  * 传入的 rules.yaml 路径与其 overlay 同目录（测试传 tmp path 时 overlay 亦落 tmp）。
+ *
+ * 路径是**派生**的、从不被配置：只有 `RULES_FILE` 一个旋钮决定两个文件的位置，故它们不可能被指到
+ * 对方身上——「这两条路径是不是同一个文件」那一整类别名闸（软链/硬链/大小写/bind mount）随旋钮一起消失。
  */
 export function resolveNoiseOverlayPath(rulesPath: string = resolveRulesPath()): string {
-  const fromEnv = process.env.NOISE_OVERLAY_FILE;
-  if (fromEnv !== undefined && fromEnv !== '') {
-    return fromEnv;
-  }
   return join(dirname(rulesPath), 'noise_senders.overlay');
 }
 
+// ─────────────── overlay 格式的**唯一所有者**（本模块） ───────────────
+//
+// 同一份 `noise_senders.overlay`，关于它的五个语义问题——「一行是什么」「哪些条目合法」「多大算超限」
+// 「这个文件是哪个」「键存在吗」——此前各被 loader / 提案腿 / 应用腿独立回答 2–3 次。**成对一致不具传递性**：
+// 三个持有者时把 (A,B) 调平必然打破 (B,C)，于是每一次「让某一份让步」的修复都生产出下一处分歧。
+// 所以这些问题在本模块各只有一个答案，pipeline 侧是纯消费者。
+//
+// 由此：loader 接受的行与 remove 能删掉的行共用 `canonicalizeOverlayLine`，故**不存在**「loader 眼里
+// 活着、remove 却删不掉」的条目——包括超长的手改行（长度闸只在 add 侧，见 `checkEntry`）。
+// 注意「哪些条目可加入」比另外几个问题弱：它是一条**政策**（见 isAddableEntry），改它不影响 remove。
+
+/** **add 侧**条目总长上限（信任边界：调用方可绕过 UI 直调，无上限则单行可撑爆 overlay）。 */
+export const MAX_ENTRY_LEN = 254;
+/** 单侧条目数上限：`MAX_ENTRY_LEN` 只界住一行，不界住行数。 */
+export const MAX_ENTRIES_PER_KEY = 500;
 /**
- * 读机器生成的 noise overlay（apply-feedback 写、本 loader 读）：一行一个发件人，trim+lower+丢空归一
- * （同 rules.yaml noise_senders 的 ingest 纪律，使并集去重成立）。绝不崩/绝不泄露：≤256KB（超限忽略）；
- * 缺失→空（overlay 可选、缺失是常态，不记日志）；读错误→空 + 脱敏日志（只 kind、不记内容/路径）。
+ * 单侧**请求**的总字节上限。remove 侧刻意不设单条长度闸（存量行必须可移除），故有界性由请求总量承担：
+ * 无它则 500 条任意长的串能把 `not_present` 回执与 run trace 撑到几百 MB。
+ * **只从第二条起生效**（见 pipeline 两条腿的 ponytail 注）：单条请求恒不被批量闸拦下。
  */
-export function readNoiseOverlay(path: string): string[] {
-  let size: number;
-  try {
-    size = statSync(path).size;
-  } catch {
-    return []; // 不存在等：overlay 可选，缺失是常态（不记日志）。
+export const MAX_REQUEST_BYTES = 64 * 1024;
+
+/**
+ * **overlay「一行是什么」的唯一实现**：`trim` → 转小写；空 → null。**刻意不剥 `<>`**——它与 master 的
+ * loader 逐字节同语义，故存量 overlay 的生效集不因本能力变化（不存在「死行转活、开始静默已读」的迁移）。
+ *
+ * 它是**幂等**的，这是 `L = W` 的前提：`checkEntry` 用「是本函数的不动点」判定一个串是不是合法的行，
+ * 而 loader 输出按定义都是不动点，故 overlay 里的每一行都可被 remove。**这条性质由 rulesConfig.test 的
+ * 不动点断言守着，而不是由「只有一份实现」论证出来**——单一实现只保证不漂移，不保证性质成立。
+ */
+export function canonicalizeOverlayLine(raw: string): string | null {
+  const s = raw.trim().toLowerCase();
+  return s.length > 0 ? s : null;
+}
+
+/**
+ * **用户输入的归一**（与「一行是什么」是两个问题）：`trim` → 剥掉**所有**包裹层 `<>` → 转小写。
+ * 剥到不动点（`while` 而非 `if`）：只剥一层会让输出可能仍以 `<>` 包裹，那个值既不是合法的行、
+ * 又会被写盘，形成「读→写不是不动点」的漂移。输出必为 `canonicalizeOverlayLine` 的不动点。
+ *
+ * 写路径**不做改写、只做收与拒**：这里每多一条「替用户猜他想要的地址」的变换，就多一处
+ * 「写进去的条目 ≠ 用户提交的条目」。`mailto:` 前缀因此归 `isAddableEntry` 拒（见那里的豁免⑤），
+ * 不在此剥掉——剥它会把 local part 真的叫 `mailto` 的发件人改写成另一个地址、静音错的人。
+ */
+export function canonicalizeAddInput(raw: string): string | null {
+  // 归一**之前**判：Unicode 小写会把 U+212A KELVIN 之类折成 ASCII `k`，归一后再查就查不出来了，
+  // 用户输入的 `K.com` 会变成一条针对 `k.com` 的**域级**规则。
+  if (NON_ASCII_RE.test(raw) || CONTROL_CHAR_RE.test(raw)) {
+    return null;
   }
-  if (size > MAX_RULES_FILE_BYTES) {
+  return canonicalizeUserEntry(raw);
+}
+
+export function canonicalizeUserEntry(raw: string): string | null {
+  let s = raw.trim();
+  while (s.length >= 2 && s.startsWith('<') && s.endsWith('>')) {
+    s = s.slice(1, -1).trim();
+  }
+  return canonicalizeOverlayLine(s);
+}
+
+/** 非 ASCII（码位 > U+007F）。控制字符另有一条（它不是本条的子集）。归一**之前**判——`K` 之类会小写成 ASCII。 */
+const NON_ASCII_RE = /[^\u0000-\u007f]/;
+/** 控制字符（用码位转义写；绝不把控制字符本身贴进源码——它在编辑器/剪贴板/JSON 往返里会被静默吃掉）。 */
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
+/**
+ * 匹配侧域名的字母表（`applySafetyRules` 的 `normalizeFromDomain` 产出 `[a-z0-9.-]+`）。
+ * 这里是它的两端锚定版——超出这个字母表的域名条目匹配侧永远比不中。
+ */
+const MATCHABLE_DOMAIN_RE = /^[a-z0-9.-]+$/;
+/** 匹配侧 local part 的字母表（`normalizeFromAddress` 的 `[^\s<>@]+`）。 */
+const MATCHABLE_LOCAL_RE = /^[^\s<>@]+$/;
+
+/**
+ * 一个 canonical 串是否**可加入** —— 判据 = 匹配侧的不动点集**减去一个具名豁免集**（不是等式）。
+ *
+ * 基线抄自 `applySafetyRules` 的两条匹配谓词，两端锚定即得：
+ *   - 地址条目：`normalizeFromAddress` 的 `^[^\s<>@]+@[a-z0-9.-]+`，故本函数是它的不动点判定。
+ *     写进一个非不动点的串（`<a@x.com>`、`a b@x.com`）＝ 一条永不命中的规则 = false-green。
+ *   - 域名条目（无 `@`）：`matchesDomain` 按等值或后缀比 `normalizeFromDomain` 的产出，字母表同上。
+ *
+ * **五条刻意的偏离**（匹配侧产得出、本判据仍拒；rulesConfig.test 的性质用例逐条钉住，新增偏离必须变红）：
+ *   1. 非 ASCII local part（`é@x.com`）—— IDN 裁决：匹配侧比的是 normalizer 产出的 `fromEmail`
+ *      （只小写、不转 punycode），写入侧只归一会写进一个永不命中的条目 = false-green。
+ *   2. 控制字符 local part（`ctrl\u0001@x.com`）—— 地址来自邮件内容侧这个信任边界，控制字符会在
+ *      编辑器/剪贴板/日志往返里被静默吃掉，写进机器文件即不可复核。
+ *   3. 无点的纯域名条目（`nas` / `localhost` / `router`）—— 爆炸半径：`matchesDomain` 按后缀比，
+ *      一条就静音整个后缀。
+ *   4. 裸 TLD（`com`）—— 同 3，一条静音整个 .com。
+ *   5. `mailto:` 前缀（`mailto:a@x.com`，大小写不敏感）—— 带这个前缀的条目匹配侧永不命中，而把它改写成
+ *      `a@x.com` 是在替用户解析自然语言意图，本管道的契约禁止这么做（局部真叫 `mailto` 的发件人会被
+ *      改写成另一个地址、静音错的人）。故拒绝，让调用方自己提交裸地址。
+ *   （1/2/5 同时也挡住地址形态，3/4 只在域名形态出现。长度上限亦只在本函数 = add 侧，见 `checkEntry`。）
+ *
+ * **刻意不比匹配侧更严**：`root@nas`（无点域）、`admin@10.0.0.5`（数字 TLD）匹配侧本来就命中，
+ * 上一版按 RFC dot-atom + 纯字母 TLD 判，把 digest 里的 NAS/路由器/内网 cron 发件人整类挡在门外——
+ * 它们在 digest 表头被展示为可加入，加进去却报错。判据严于匹配侧就会产出这种缺口。
+ */
+export function isAddableEntry(s: string): boolean {
+  if (s.length === 0 || s.length > MAX_ENTRY_LEN) {
+    return false;
+  }
+  if (NON_ASCII_RE.test(s) || CONTROL_CHAR_RE.test(s)) {
+    return false;
+  }
+  if (s.slice(0, 7).toLowerCase() === 'mailto:') {
+    return false;
+  }
+  const at = s.indexOf('@');
+  if (at === -1) {
+    return s.includes('.') && MATCHABLE_DOMAIN_RE.test(s);
+  }
+  return MATCHABLE_LOCAL_RE.test(s.slice(0, at)) && MATCHABLE_DOMAIN_RE.test(s.slice(at + 1));
+}
+
+/**
+ * 两腿共用的条目判据。**方向差异只存在这一处**，结构上无法只改一半。
+ *   - `add`：必须已归一 **且**可加入。
+ *   - `remove`：只需已归一——删除永远是安全方向，overlay 里的存量行不该因判据变严而无法移除。
+ */
+export function checkEntry(item: unknown, direction: 'add' | 'remove'): item is string {
+  // ponytail: 长度闸**只在 add 侧**（在 isAddableEntry 里）。放到这个共用前缀上会让一条 256 字符的存量行
+  //           「loader 认得（正在静音邮件）、remove 却删不掉」——结构性锁死，而契约禁止手改机器文件。
+  //           remove 侧的有界性由**请求总字节**（MAX_REQUEST_BYTES，pipeline 两条腿各累加一次）承担。
+  if (typeof item !== 'string' || canonicalizeOverlayLine(item) !== item) {
+    return false;
+  }
+  return direction === 'remove' || isAddableEntry(item);
+}
+
+/** 读 `input` 的**自有**键（`in` 会走原型链，被污染的 `Object.prototype` 能凭空造出请求）。缺键 → undefined。 */
+export function readOwnKey(input: unknown, key: string): unknown {
+  if (input === null || typeof input !== 'object' || !Object.hasOwn(input, key)) {
+    return undefined;
+  }
+  return (input as Record<string, unknown>)[key];
+}
+
+/** `input` 是否带该自有键（区分「缺键」与「键在但值为 undefined」）。 */
+export function hasOwnKey(input: unknown, key: string): boolean {
+  return input !== null && typeof input === 'object' && Object.hasOwn(input, key);
+}
+
+/** `readOverlayFile` 的读失败语义：loader 要 fail-open（读不到就不静音），写路径要 fail-closed。 */
+export type OverlayReadMode = 'fail-open' | 'fail-closed';
+
+/**
+ * **overlay 读的唯一实现**：尺寸一律以 `statSync().size` 度量（决定这份文件是否被 loader 采纳的就是它；
+ * 若改量解码后的字节数，含无效 UTF-8 的文件会出现「loader 采纳、写路径拒绝」的分叉）。行归一走
+ * `canonicalizeOverlayLine`。
+ *
+ * 失败语义是**参数**而非第二份实现：
+ *   - `fail-open`（loader）：缺失/超限/读错误 → 空集，读不到就不静音，方向安全。
+ *   - `fail-closed`（写路径）：只有**文件不存在**才是空集；超限与读错误一律抛错——把「读不到」当「现有集为空」
+ *     会让随后的全量覆盖静默抹掉整份名单，或让 remove 回执谎报「本就不在」而地址仍在被静默已读。
+ */
+export function readOverlayFile(path: string, mode: OverlayReadMode): string[] {
+  // `throwIfNoEntry:false` **只**压制 ENOENT/ENOTDIR；EACCES/ELOOP/ENAMETOOLONG 照抛。而本函数在
+  // 模块顶层 buildAndPublish 的调用链上——不捕获即 **import 期崩溃**，整个 pipeline 模块加载失败、
+  // daemon 起不来。master 那里是 try/catch，去掉它是回归。
+  // 用普通 statSync + errno 判定：`throwIfNoEntry:false` 会把 **ENOTDIR 也折成 undefined**，
+  // 于是一个非法路径会被当成「空文件」，让 fail-closed 的 remove 成功回执「本就不在名单」。
+  // 只有 ENOENT 才是真正的空集。
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(path);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') {
+      return []; // 文件不存在：overlay 可选，这才是真正的空集（两种模式一致）。
+    }
+    return failOverlayRead(mode, code);
+  }
+  // ponytail: FIFO/字符设备的分支**无测试网** —— 守卫拿掉后测试不是变红而是挂死（同步读永久阻塞），
+  //           无法安全构造。目录形态由下面 readFileSync 的 EISDIR 兜住，此处只为不可测的那一类。
+  if (!stat.isFile()) {
+    // FIFO / 字符设备：size 可为 0 而同步读会永久阻塞，卡死单线程 daemon。
+    return failOverlayRead(mode, 'ENOTFILE');
+  }
+  if (stat.size > MAX_RULES_FILE_BYTES) {
+    if (mode === 'fail-closed') {
+      throw new Error('inbox pipeline: overlay 已超过 loader 上限，拒绝据此改写名单（loader 正整份忽略它）');
+    }
     logSink.warn({ kind: 'noise-overlay-too-large' }, 'noise overlay 超限，忽略 overlay（用现有 noiseSenders）');
     return [];
   }
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
-  } catch {
-    logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
-    return [];
+  } catch (err) {
+    return failOverlayRead(mode, (err as NodeJS.ErrnoException).code);
   }
-  return text
-    .split(/\r?\n/)
-    .map((l) => l.trim().toLowerCase())
-    .filter((l) => l.length > 0);
+  const out: string[] = [];
+  for (const line of text.split(/\r?\n/)) {
+    const s = canonicalizeOverlayLine(line);
+    if (s !== null) {
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** 读失败的两种收场（fail-closed 抛、fail-open 记 kind 并降级为空集）。只回 kind，不回路径/内容。 */
+function failOverlayRead(mode: OverlayReadMode, code: string | undefined): string[] {
+  if (mode === 'fail-closed') {
+    throw new Error(`inbox pipeline: overlay 读取失败，拒绝据此改写名单（kind=${code ?? 'unknown'}）`);
+  }
+  logSink.warn({ kind: 'noise-overlay-read-failed' }, 'noise overlay 读取失败，忽略 overlay（用现有 noiseSenders）');
+  return [];
+}
+
+/** loader 侧的 overlay 读（fail-open）。绝不崩/绝不泄露：只记 kind，不记内容/路径。 */
+export function readNoiseOverlay(path: string): string[] {
+  return readOverlayFile(path, 'fail-open');
 }
 
 // —— zod schema（每项独立校验，使「某项非法仅该项回落、其余生效」成立）——

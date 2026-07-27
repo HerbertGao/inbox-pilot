@@ -11,14 +11,24 @@
 // 注入假时钟/poller，均不依赖真 timing。
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  chmodSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, test } from 'node:test';
 
-import { applySafetyRules } from './applySafetyRules.js';
+import { applySafetyRules, normalizeFromAddress, normalizeFromDomain } from './applySafetyRules.js';
 import { SECURITY_PAYMENT_KEYWORDS } from './lists.js';
 import {
+  readOverlayFile,
+  canonicalizeUserEntry,
+  canonicalizeOverlayLine,
+  checkEntry,
+  isAddableEntry,
+  MAX_ENTRY_LEN,
+  readNoiseOverlay,
+  resolveNoiseOverlayPath,
   getActiveRules,
   reloadRulesConfigForTest,
   resetRulesConfigForTest,
@@ -467,3 +477,246 @@ function captureLogs(fn: () => void): string[] {
   }
   return lines;
 }
+
+// ─────────────── overlay 格式所有权：L ⊆ W 的性质测试 ───────────────
+//
+// 「loader 接受的每一行，写路径都必须能删掉」——这条性质此前靠两处手抄的归一维持，三轮 review 里
+// 因它破裂产生过三类缺陷（谎报 already_present / 静默激活死行 / 存量条目结构性锁死）。
+// 现在 loader 与写路径共用 canonicalizeOverlayLine，故它是构造性事实；本用例是它的回归网。
+
+test('L ⊆ W：readNoiseOverlay 读出的每一行，remove 侧判据必须接受', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-lang-'));
+  const file = join(dir, 'noise_senders.overlay');
+  try {
+    writeFileSync(
+      file,
+      [
+        '<a@b.com>', // 尖括号包裹（旧 writer 可写出）
+        '  A@B.COM  ', // 前后空白 + 大写
+        'root@nas', // 无点域（不可加入，但必须可移除）
+        'admin@10.0.0.5', // 数字 TLD
+        'mailto:a@b.com', // 匹配侧永不命中的形态
+        'plain.domain.example', // 裸域名
+        '', // 空行
+        '   ', // 纯空白行
+        'dup@x.com',
+        'DUP@X.COM', // 归一后重复
+        '<<nested@x.com>>', // 嵌套尖括号 —— 曾是唯一的不幂等族
+        'a'.repeat(300) + '@x.com', // 超 MAX_ENTRY_LEN 的手改行：loader 认得它，remove 就必须能删掉它
+        'a\u0009b@x.com', // 内部控制字符（同上）
+      ].join('\r\n') + '\r\n', // CRLF
+      'utf8',
+    );
+    const lines = readNoiseOverlay(file);
+    assert.ok(lines.length > 0, '语料应产出条目');
+    for (const line of lines) {
+      assert.ok(checkEntry(line, 'remove'), `loader 读出的行必须可被 remove 接受：${JSON.stringify(line)}`);
+      assert.equal(canonicalizeOverlayLine(line), line, `loader 读出的行必须已是归一形态：${JSON.stringify(line)}`);
+    }
+    // 长度闸只在 add 侧，故**没有残余**：超长的手改行照样可移除。闸放到共用前缀上时，
+    // 这一行会「loader 认得（正在静音邮件）、remove 却删不掉」= 结构性锁死。
+    const longLine = 'a'.repeat(300) + '@x.com';
+    assert.ok(lines.includes(longLine), '语料里的超长行必须被 loader 读出（否则下一条断言是空转）');
+    assert.equal(checkEntry(longLine, 'remove'), true, '超长存量行必须可移除');
+    assert.equal(checkEntry(longLine, 'add'), false, '但 add 侧仍受 MAX_ENTRY_LEN 限制');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('可加入判据 == 匹配侧能命中的形态（既不严于它、也不宽于它）', () => {
+  // 拒：匹配侧的归一**产不出**这个串，写进去就是一条永不命中的规则（false-green）。
+  for (const bad of [
+    '<a@x.com>', // 尖括号：normalizeFromAddress 会剥掉，故它本身永远比不中
+    'a b@x.com', // local 含空白：出了 [^\s<>@] 的字母表
+    'a@x com', // 域含空白：出了 [a-z0-9.-] 的字母表
+    'a@x_y.com', // 下划线：同上
+    'a@例子.com', // 非 ASCII：匹配侧不转 punycode（IDN 裁决 ④）
+    'com', // 裸 TLD：一条静音整个 .com
+    'no-dot', // 无 @ 无点：既不是地址也不是域名
+    '', // 空
+    'mailto:alice@example.com', // mailto: 前缀：匹配侧的 From 永远产不出它；改写它属意图解析，写路径不做
+  ]) {
+    assert.equal(isAddableEntry(bad), false, `${bad} 在匹配侧永不命中，必须不可加入`);
+  }
+  // 收：匹配侧**确实命中**这些形态。判据比匹配侧严，就会把真实存在的发件人锁在反馈闭环之外——
+  // root@nas / admin@10.0.0.5 这一整类（NAS、路由器、内网 cron）曾因 RFC dot-atom + 纯字母 TLD 判据
+  // 被整体挡掉，而 digest 表头正把它们展示为可加入。
+  for (const ok of [
+    'a@x.com',
+    'root@nas', // 无点域：normalizeFromAddress 的 [a-z0-9.-]+ 收它
+    'admin@10.0.0.5', // 数字 TLD：同上
+    'a@x.c', // 单字母 TLD：同上
+    'bounces+1=user.com@sendgrid.net', // VERP
+    'srs0=a=b=user@fwd.net', // SRS
+    'ops!tag@x.com',
+    'first.last@company.com',
+    'plain.domain.example', // 域名条目
+  ]) {
+    assert.equal(isAddableEntry(ok), true, `${ok} 匹配侧命中，必须可加入`);
+  }
+});
+
+test('性质：isAddableEntry(s) ≡ 匹配侧可达(s) ∧ ¬豁免(s)（双向等价，穷举短串；oracle 用匹配侧真函数）', () => {
+  // 这条守的是 RC-F1 那一类缺陷：判据与匹配侧的偏离都必须是**声明过的**，而正反例清单只能抽样、
+  // 恰好绕开偏离区就全绿。故按性质穷举，且 oracle 直接 import `applySafetyRules` 的两个归一——
+  // 抄一份正则进测试，匹配侧一改这条网就随之失效，等于没有网。
+  //
+  // 断言是**双向等价**，不是「每条豁免有一个见证」：后者只要求豁免类里有**一个**样本被拒，
+  // 判据把同类的其余成员错误地**收下**照样全绿（政策被削掉一半而测试不红）。
+  //
+  // 码位判定一律走 codePointAt，**绝不把非 ASCII/控制字符写进正则字面量**（它们在编辑器/剪贴板/
+  // JSON 往返里会被静默改写，那时这张网会无声地失效）。
+  const codePoints = (s: string): number[] => [...s].map((c) => c.codePointAt(0) ?? 0);
+  const hasNonAscii = (s: string): boolean => codePoints(s).some((cp) => cp > 0x7f);
+  const hasControl = (s: string): boolean => codePoints(s).some((cp) => cp < 0x20 || cp === 0x7f);
+  /** `isAddableEntry` doc 里逐条声明的豁免（匹配侧产得出、判据仍拒）。 */
+  const exemptions: Array<[string, (s: string) => boolean]> = [
+    ['①非 ASCII local part（IDN 裁决）', hasNonAscii],
+    ['②控制字符（邮件内容侧的信任边界）', hasControl],
+    ['③④无点的域名条目 / 裸 TLD（一条静音整个后缀）', (s) => !s.includes('@') && !s.includes('.')],
+    ['⑤超 MAX_ENTRY_LEN（长度闸只在 add 侧，remove 侧必须收得下存量行）', (s) => s.length > MAX_ENTRY_LEN],
+    ['⑥mailto: 前缀（改写它属意图解析，写路径只收或拒）', (s) => s.slice(0, 7).toLowerCase() === 'mailto:'],
+  ];
+  /** 政策的**完整**声明：匹配侧可达 ∧ 不命中任何一条豁免。`isAddableEntry` 必须与它逐串相等。 */
+  const reachable = (s: string): boolean => normalizeFromAddress(s) === s || normalizeFromDomain(`x@${s}`) === s;
+  const expectedPolicy = (s: string): boolean => reachable(s) && !exemptions.some(([, pred]) => pred(s));
+  // `:` 与 `m` 在字母表里，`mailto:` 族的字符才可达（此前完全不可达 = ⑥那条政策没有网）。
+  const alphabet = ['a', '1', '.', '-', '@', '<', '>', ' ', '_', '!', '+', '=', ':', 'm', '\u00e9', String.fromCodePoint(1)];
+  const mismatches: string[] = []; // 判据与政策声明不符的串（收得太宽 / 拒得太严，两个方向都记这里）
+  const hitExemptions = new Set<string>(); // 每条豁免都得真被样本独占命中（否则这条分类是空转的）
+  let checked = 0;
+  const visit = (s: string): void => {
+    checked++;
+    if (isAddableEntry(s) !== expectedPolicy(s)) {
+      mismatches.push(JSON.stringify(s));
+    }
+    // 只记**独占**见证（恰好命中一条豁免、且匹配侧确实产得出的样本）：同时命中两条的样本会替其中
+    // 一条打掩护；匹配侧本就产不出的样本不构成「豁免」的见证（它根本不在偏离区）。
+    const hit = exemptions.filter(([, pred]) => pred(s));
+    if (hit.length === 1 && reachable(s)) {
+      hitExemptions.add(hit[0][0]);
+    }
+  };
+  const walk = (s: string, depth: number): void => {
+    if (depth === 0) {
+      visit(s);
+      return;
+    }
+    for (const c of alphabet) {
+      walk(s + c, depth - 1);
+    }
+  };
+  for (let d = 1; d <= 4; d++) {
+    walk('', d);
+  }
+  // 两条豁免的最短见证长于 4：⑤要 255+ 字符、⑥要 7 字符的前缀。短串穷举够不着，单独喂。
+  visit('a'.repeat(300) + '@x.com');
+  for (const s of ['mailto:a@b.com', 'mailto:alice@example.com', 'mailto:x.com', 'mailto:@x.com', 'mailto:a@b']) {
+    visit(s);
+  }
+  assert.ok(checked > 20000, `穷举规模应足够（实际 ${checked}）`);
+  assert.deepEqual(
+    mismatches.slice(0, 10),
+    [],
+    'isAddableEntry 必须与「匹配侧可达 − 具名豁免集」逐串相等：宽于它 = 写进永不命中的死条目；' +
+      '严于它 = 把真实发件人锁在闭环之外',
+  );
+  for (const [name] of exemptions) {
+    assert.ok(hitExemptions.has(name), `豁免「${name}」无独占见证样本，这条分类是空转的`);
+  }
+});
+test('不动点性质：canonicalizeOverlayLine 的输出恒为自身的不动点（穷举短串，不依赖语料选得好不好）', () => {
+  // 这条是 L = W 的真正的网。上一轮只有「语料 → 逐行断言」，而语料恰好绕开了唯一的不幂等族
+  // （嵌套尖括号），于是 474 个用例全绿而性质是破的。**性质要被断言，不能被论证。**
+  const alphabet = ['<', '>', ' ', 'a', 'A', '	', '@', '.'];
+  let checked = 0;
+  const walk = (prefix: string, depth: number): void => {
+    if (depth === 0) {
+      const once = canonicalizeOverlayLine(prefix);
+      if (once !== null) {
+        assert.equal(canonicalizeOverlayLine(once), once, `非不动点：${JSON.stringify(prefix)} → ${JSON.stringify(once)}`);
+        assert.ok(checkEntry(once, 'remove'), `行归一的输出必须可被 remove 接受：${JSON.stringify(once)}`);
+      }
+      checked++;
+      return;
+    }
+    for (const c of alphabet) {
+      walk(prefix + c, depth - 1);
+    }
+  };
+  for (let len = 0; len <= 4; len++) {
+    walk('', len);
+  }
+  assert.ok(checked > 4000, `穷举规模应足够（实际 ${checked}）`);
+});
+
+test('不动点性质：canonicalizeUserEntry 的输出恒为行归一的不动点（剥到底，不是只剥一层）', () => {
+  for (const raw of ['<<a@b.com>>', '<<<a@b.com>>>', '< <a@b.com> >', '  <A@B.COM>  ', '<>', '<a', 'a>']) {
+    const out = canonicalizeUserEntry(raw);
+    if (out === null) continue;
+    assert.equal(canonicalizeOverlayLine(out), out, `用户输入归一的输出必须是行的不动点：${JSON.stringify(raw)} → ${JSON.stringify(out)}`);
+  }
+  assert.equal(canonicalizeUserEntry('<<a@b.com>>'), 'a@b.com', '剥到不动点，而非只剥一层');
+  // 写路径**只收或拒、绝不改写**：`mailto:` 前缀原样留着（归一只做 trim/剥 <>/小写），由 isAddableEntry 拒掉。
+  // 剥它就是替用户解析意图——local part 真叫 `mailto` 的发件人会被改写成另一个地址、静音错的人。
+  for (const raw of ['mailto:Alice@Example.com', '<mailto:alice@example.com>', ' MAILTO:alice@example.com ']) {
+    assert.equal(canonicalizeUserEntry(raw), 'mailto:alice@example.com', `mailto: 前缀不得被剥掉：${raw}`);
+    assert.equal(isAddableEntry('mailto:alice@example.com'), false, `带 mailto: 前缀的条目必须被拒：${raw}`);
+  }
+});
+
+test('readOverlayFile：statSync 本身抛错（父目录不可搜索）时不得逃逸 —— fail-open 降级、fail-closed 抛受控错误', () => {
+  // 这条守的是 import 期崩溃：readOverlayFile 在模块顶层 buildAndPublish 的调用链上，
+  // 而 `throwIfNoEntry:false` **只**压制 ENOENT/ENOTDIR，EACCES/ELOOP 照抛。不捕获即整个模块 import 失败。
+  // 注意必须让 **stat 本身**失败（chmod 父目录），chmod 文件只会让 readFileSync 失败，测不到这条路径。
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-stat-'));
+  const sub = join(dir, 'locked');
+  mkdirSync(sub);
+  const file = join(sub, 'noise_senders.overlay');
+  writeFileSync(file, 'keep@a.com\n', 'utf8');
+  chmodSync(sub, 0o000);
+  try {
+    if (readOverlayFile(file, 'fail-open').length !== 0) {
+      return; // root 或该平台不强制目录搜索权限 → 构造不成立，跳过
+    }
+    assert.deepEqual(readOverlayFile(file, 'fail-open'), [], 'loader 侧降级为空集，绝不崩');
+    assert.throws(
+      () => readOverlayFile(file, 'fail-closed'),
+      /overlay 读取失败/,
+      '写路径抛受控错误（只回 kind），而非让原生 fs 错误带着绝对路径逃逸',
+    );
+  } finally {
+    chmodSync(sub, 0o755);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('readOverlayFile：非法路径(ENOTDIR)与非普通文件不得被当作空文件', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-kind-'));
+  const file = join(dir, 'plain');
+  writeFileSync(file, 'a@b.com\n', 'utf8');
+  const throughFile = join(file, 'nested.overlay'); // 把普通文件当目录用 → ENOTDIR
+  try {
+    // ENOTDIR 曾被 throwIfNoEntry:false 折成 undefined → fail-closed 的 remove 会成功回执「本就不在」。
+    assert.deepEqual(readOverlayFile(throughFile, 'fail-open'), [], 'loader 侧降级为空集');
+    assert.throws(() => readOverlayFile(throughFile, 'fail-closed'), /overlay 读取失败/, '写路径必须抛错');
+    // 目录不是普通文件：size 不可信、同步读语义不定。
+    assert.deepEqual(readOverlayFile(dir, 'fail-open'), []);
+    assert.throws(() => readOverlayFile(dir, 'fail-closed'), /overlay 读取失败/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('overlay 路径恒由 rules 路径派生（同目录 noise_senders.overlay），无第二个旋钮', () => {
+  // 「这两条路径是不是同一个文件」那一整类别名闸随可配置旋钮一起消失：只有 RULES_FILE 决定两者位置，
+  // 故它们不可能被指到对方身上——除非 rules 文件自己就叫 noise_senders.overlay（撞名，由 apply 腿拒）。
+  const dir = mkdtempSync(join(tmpdir(), 'overlay-derive-'));
+  try {
+    assert.equal(resolveNoiseOverlayPath(join(dir, 'rules.yaml')), join(dir, 'noise_senders.overlay'));
+    assert.equal(resolveNoiseOverlayPath(join(dir, 'sub', 'r.yaml')), join(dir, 'sub', 'noise_senders.overlay'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

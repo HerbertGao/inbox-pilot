@@ -20,6 +20,7 @@ import { logger } from '../logger.js';
 import type { Classification } from '../classifier/schema.js';
 import type { NormalizedEmail } from '../normalizer/normalizeEmail.js';
 import type { FinalDecision } from '../rules/finalDecision.js';
+import { normalizeFromAddress } from '../rules/applySafetyRules.js';
 import { passesWatermark } from './watermark.js';
 
 /** Gmail authJson 的默认 scope（scopes 缺省回落，避免写 scopes:undefined）。与 oauth.ts 同值、不耦合其重量级依赖。 */
@@ -47,16 +48,12 @@ export type SenderCount = {
 };
 
 /**
- * 归一发件人裸地址用于频率计数（noise-discovery 决策 5）：剥显示名/尖括号得 user@host、小写；
- * 无法定位裸地址 → 空串（调用方丢弃）。复刻 applySafetyRules.ts 的 `normalizeFromAddress` 同款纪律
- * （未导出，此处等价小函数），免同一发件人裂成 `Name <a@x>`/`a@x` 等多变体稀释计数。
+ * 归一发件人裸地址用于频率计数（noise-discovery 决策 5）：**就是匹配侧的 `normalizeFromAddress`**，
+ * 不是它的副本。曾是一份逐字节复制，理由是「原函数未导出」——现已导出，而这个共用已从「免同一发件人
+ * 裂成多变体」升级为**正确性前提**：`isAddableEntry` 的定义就是 `normalizeFromAddress` 的不动点集，
+ * 而 `{text}` 腿的候选出自本函数；两份实现一旦漂移，真阳性候选会被静默丢掉。
  */
-export function normalizeSenderForCount(fromEmail: string): string {
-  const angle = fromEmail.match(/<([^>]+)>/);
-  const raw = (angle ? angle[1]! : fromEmail).trim().toLowerCase();
-  const m = raw.match(/^[^\s<>@]+@[a-z0-9.-]+/);
-  return m ? m[0] : '';
-}
+export { normalizeFromAddress as normalizeSenderForCount };
 
 /**
  * 由一批 `fromEmail` 字段（窗口内全部已处理邮件、含 P0–P4、不去重）聚合归一计数（prisma 与内存共用）：
@@ -65,7 +62,7 @@ export function normalizeSenderForCount(fromEmail: string): string {
 export function tallySenderCounts(fromEmails: readonly string[]): SenderCount[] {
   const counts = new Map<string, number>();
   for (const raw of fromEmails) {
-    const addr = normalizeSenderForCount(raw);
+    const addr = normalizeFromAddress(raw);
     if (addr.length === 0) {
       continue;
     }

@@ -43,7 +43,7 @@ function containsAny(haystackLower: string, keywords: readonly string[]): boolea
  * 本期 fromEmail 由 normalizer/fixture 喂裸地址，此归一是对「敏感域永不自动标已读」硬约束的
  * defense-in-depth，并为 P3/P4 真实 provider 的显示名/尖括号形态预先兜底。
  */
-function normalizeFromDomain(fromEmail: string): string {
+export function normalizeFromDomain(fromEmail: string): string {
   const at = fromEmail.lastIndexOf('@');
   if (at < 0) {
     return '';
@@ -75,7 +75,7 @@ function matchesDomain(fromEmail: string, domains: readonly string[]): boolean {
  * 归一发件人裸地址（剥显示名/尖括号得 user@host、小写）——用于 vip_senders 精确匹配。
  * 如 "Name <U@Example.com>" → "u@example.com"；无法定位裸地址时返回空串（不匹配）。
  */
-function normalizeFromAddress(fromEmail: string): string {
+export function normalizeFromAddress(fromEmail: string): string {
   // 优先取尖括号内地址（显示名形态）；否则取整串。
   const angle = fromEmail.match(/<([^>]+)>/);
   const raw = (angle ? angle[1] : fromEmail).trim().toLowerCase();

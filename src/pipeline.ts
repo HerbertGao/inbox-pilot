@@ -21,13 +21,27 @@
 // STATE_BY_KIND（events.ts）——否则 appendEvent 遇生命周期 kind 会误移状态。外部 pilot 不 import
 // @hangar/core，此约束由命名纪律 + 本注释守（待解问题 R3 CR-n1）。
 
-import { renameSync, writeFileSync } from 'node:fs';
+import { closeSync, constants, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { resolve } from 'node:path';
 
 import type { Logger } from 'pino';
 
 import { loadConfig } from './config/config.js';
-import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo } from './repo/mailRepo.js';
-import { readNoiseOverlay, resolveNoiseOverlayPath } from './rules/rulesConfig.js';
+import { PrismaMailRepo, NOISE_TOPN_WINDOW_DAYS, type MailRepo, type SenderCount } from './repo/mailRepo.js';
+import {
+  canonicalizeOverlayLine,
+  canonicalizeAddInput,
+  checkEntry,
+  hasOwnKey,
+  MAX_ENTRIES_PER_KEY,
+  MAX_REQUEST_BYTES,
+  MAX_RULES_FILE_BYTES,
+  readOverlayFile,
+  readOwnKey,
+  resolveNoiseOverlayPath,
+  resolveRulesPath,
+} from './rules/rulesConfig.js';
 import { loadEnabledAccounts } from './accounts/accountRegistry.js';
 import type { Account } from './providers/provider.js';
 import { ProviderReauthRequired } from './providers/provider.js';
@@ -278,7 +292,8 @@ export async function run(ctx: RunContext, overrides?: RunOverrides): Promise<vo
     await runPoll(ctx, overrides);
     return;
   }
-  // noise-feedback 反馈闭环（跨 repo 契约 add-view-command-path）：interpret 干跑解析（无写）、apply 幂等落 overlay。
+  // noise-feedback 反馈闭环（跨 repo 契约 add-view-command-path + add-view-feedback-remove）：interpret 干跑解析
+  // （无写）、apply 幂等落 overlay。加入与移出**共用同一对 trigger**（撤销是同一意图的反向，不新增 trigger）。
   if (ctx.trigger === 'interpret-feedback') {
     await runInterpretFeedback(ctx, overrides);
     return;
@@ -311,31 +326,173 @@ async function runDigest(ctx: RunContext, overrides?: RunOverrides): Promise<voi
 }
 
 /**
- * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何写、不 throw**。
- * 取最近高频发件人候选（复用 buildDigest 同源的 `repo.countRecentSenders`，窗口 = now - NOISE_TOPN_WINDOW_DAYS，
- * **并同 digest 只取计数降序 TOP-N**），对用户自然语言 text 做**确定性子串匹配**（无 LLM）→ 命中候选地址原文 add，emit interpretation.proposed。
- * 输出恒为候选集子集（零幻觉）；误命中由后续 apply 前的**人工确认**兜住（interpret 只提议、不落地）。
+ * interpret-feedback 触发（noise-feedback 契约）：**干跑解析、无任何域写、不 throw**。emit
+ * `interpretation.proposed { add, remove }`——**两个字段恒在**（无变更即 `[]`，view 逐字段校验 `string[]`，
+ * 缺一个即 `contract_mismatch`）。
+ *
+ * 两个入口，由 input 形状分派：
+ *   - `{ add?, remove? }` **结构化**（本期新增）：方向与地址由调用方（Pi / Claude Code / CLI）给定。
+ *     **pilot 不做自然语言意图解析**——NL→结构化那层归调用方，pilot 只做归一、校验、与 overlay 比对。
+ *   - `{ text }` **既有 NL→add 路径**：仍走 `matchNoiseCandidates` 对 digest TOP-N 的确定性子串匹配。
+ *
+ * **非法项不 throw，只是不出现在 `add`/`remove` 里**（干跑腿保持 `completed`）：hangar-view 的健康态由最近
+ * 一次 run 派生，一次打错字的 `run.failed` 会把健康的 inbox 画成监控墙上的翻车。fail-loud 由 apply 腿承担。
  */
 async function runInterpretFeedback(ctx: RunContext, overrides?: RunOverrides): Promise<void> {
+  const structured = readStructuredFeedback(ctx.input);
+  if (structured !== null) {
+    // **提案就是将实际写入的 diff**：与 overlay 比对（只读）后，add 只留真会新增的、remove 只留真在名单里的，
+    // 并镜像 apply 腿的两道闸（条数、序列化字节）——干跑腿不能 throw，所以超限时截断而非报错，
+    // 使确认页上的每一项都是 apply 一定会接受的。
+    //
+    // overlay 读不到时**不提议**（两侧皆空）：干跑腿此时无法知道 diff，而提议一份 apply 必然拒绝的变更
+    // 会让用户确认后拿到 run.failed。契约只有两个字段、无法表达「overlay 不可用」，故退化为空提案，
+    // 响亮失败由 apply 腿承担（它对同一路径会抛错）。
+    let present: Set<string>;
+    try {
+      present = new Set(readOverlayFile(resolveNoiseOverlayPath(), 'fail-closed'));
+    } catch {
+      // 只记 kind 不记路径/内容。零日志是上一轮的缺陷：这条路径此前既不抛也不记，整条链路无可观测性。
+      ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
+      ctx.emit('interpretation.proposed', { add: [], remove: [] });
+      return;
+    }
+    const addAll = keepValidEntries(structured.add, 'add');
+    const removeAll = keepValidEntries(structured.remove, 'remove');
+    const removeSet = new Set(removeAll); // Set 而非 Array.includes：干跑腿是最不设防的入口，O(n·m) 会同步卡死 daemon
+    const conflicting = new Set(addAll.filter((s) => removeSet.has(s))); // 同项两侧 → 两边都剔除
+    const remove = removeAll.filter((s) => !conflicting.has(s) && present.has(s));
+    const add = fitWithinWriteBudget(
+      addAll.filter((s) => !conflicting.has(s) && !present.has(s)),
+      present,
+      remove,
+    );
+    ctx.emit('interpretation.proposed', { add, remove });
+    return;
+  }
+
   const repo: MailRepo = overrides?.repo ?? new PrismaMailRepo();
   const now: () => number = overrides?.now ?? (() => Date.now());
   const text = readFeedbackText(ctx.input);
   const since = new Date(now() - NOISE_TOPN_WINDOW_DAYS * 24 * 60 * 60 * 1000);
-  const candidates = await repo.countRecentSenders(since); // 只读（无写副作用）。
+  // 只读（无写副作用），但**必须收在 try 里**：干跑腿的契约是「绝不 throw」，而这是它唯一的 DB 触点——
+  // 一次 DB 抖动就会让 interpret-feedback 变成 run.failed，把健康的 inbox 画成监控墙上的翻车。
+  let candidates: SenderCount[];
+  try {
+    candidates = await repo.countRecentSenders(since);
+  } catch {
+    // 只记 kind：不记路径、不记查询参数、不记任何值。
+    ctx.logger.warn({ kind: 'noise-candidates-unavailable' }, '候选查询失败，提案退化为空（干跑腿不 throw）');
+    ctx.emit('interpretation.proposed', { add: [], remove: [] });
+    return;
+  }
   // 只对 digest 展示的 TOP-N 匹配（同 renderNoiseTopN 的 slice(0, NOISE_TOPN)），使 interpret 命中集 == 用户在 digest 看到的那几个。
-  const add = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
-  ctx.emit('interpretation.proposed', { add });
+  const matched = matchNoiseCandidates(text, candidates.slice(0, NOISE_TOPN).map((c) => c.fromEmail));
+  // overlay 读不到时**不提议**（同结构化腿）：契约只有两个字段、无法表达「overlay 不可用」，而提议一份
+  // apply 必然拒绝的变更会让用户确认后拿到 run.failed。响亮失败由 apply 腿承担。
+  let textPresent: Set<string>;
+  try {
+    textPresent = new Set(readOverlayFile(resolveNoiseOverlayPath(), 'fail-closed'));
+  } catch {
+    ctx.logger.warn({ kind: 'noise-overlay-unavailable' }, 'overlay 不可用，提案退化为空（apply 会响亮失败）');
+    ctx.emit('interpretation.proposed', { add: [], remove: [] });
+    return;
+  }
+  // 候选已由匹配侧的 `normalizeFromAddress` 剥 `<>` + 小写（mailRepo 只是 re-export 它），故此处**不做归一**，
+  // 只过滤掉不可加入的候选（apply 腿会对它们抛错）。
+  //
+  // **刻意不与 overlay 差分**：上一版在此按 `present` 过滤，效果是用户点名的那个地址（已在名单里）
+  // 被剔除、而 token 松匹配进来的其它 TOP-N 候选留下——真阳性消失、假阳性留在确认页。
+  // 「已在名单里」由 apply 腿的 `already_present` 桶如实回执，这正是四桶回执存在的理由。
+  // 故 `textPresent` **只**作写预算的字节基线，绝不用来过滤候选。
+  ctx.emit('interpretation.proposed', {
+    add: fitWithinWriteBudget(keepValidEntries(matched, 'add'), textPresent, []),
+    remove: [],
+  });
+}
+
+/**
+ * 截断 add 到「apply 一定会接受」的前缀：镜像 apply 腿的条数闸与序列化字节闸。
+ * 干跑腿不能 throw，所以超预算时少提议，而不是提议一份会被拒的 diff——越过 `MAX_RULES_FILE_BYTES` 后
+ * loader 会把**整份** overlay 静默丢弃，等于所有降噪一次性失效而 run 仍是绿的。
+ */
+function fitWithinWriteBudget(add: readonly string[], present: ReadonlySet<string>, remove: readonly string[]): string[] {
+  const removeSet = new Set(remove);
+  const kept = [...present].filter((s) => !removeSet.has(s));
+  let bytes = kept.reduce((n, s) => n + Buffer.byteLength(s, 'utf8') + 1, 0);
+  const out: string[] = [];
+  for (const s of add) {
+    const next = bytes + Buffer.byteLength(s, 'utf8') + 1;
+    // 条数一项在此不可达（keepValidEntries 已封顶）——保留为与写侧闸门的对齐复述，字节一项才是有效闸。
+    if (out.length >= MAX_ENTRIES_PER_KEY || next > MAX_RULES_FILE_BYTES) {
+      break;
+    }
+    bytes = next;
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * input 形状分派：带 `add`/`remove` 任一**自有**键 → 结构化入口；否则 → 既有 `{text}` 路径。
+ * 用 `Object.hasOwn`（经 `hasOwnKey`）而非 `in`：`in` 走原型链，被污染的 `Object.prototype.add` 能让一个
+ * 只带 `text` 的 input 变成结构化请求、并提议出调用方从未提交的地址。
+ */
+function readStructuredFeedback(input: unknown): { add: unknown; remove: unknown } | null {
+  if (!hasOwnKey(input, 'add') && !hasOwnKey(input, 'remove')) {
+    return null;
+  }
+  return { add: readOwnKey(input, 'add'), remove: readOwnKey(input, 'remove') };
+}
+
+/**
+ * interpret 侧的宽容读取：归一 + **按方向**判据（与 apply 腿共用 `checkEntry`）+ 按归一值去重；
+ * 不合规项/非串**静默丢弃**（干跑腿不 throw）。非数组（`{add:'x'}` 这类畸形）→ 空集，由 apply 腿响亮失败。
+ * 条数上限与**请求总字节**上限在此截断（而非丢弃全部），使提案与 apply 的接受集一致——本腿不 throw，
+ * 所以 apply 腿对超总字节抛错的那条，这里退化为静默截断。
+ */
+function keepValidEntries(raw: unknown, direction: 'add' | 'remove'): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let requestBytes = 0;
+  for (const item of raw) {
+    if (out.length >= MAX_ENTRIES_PER_KEY) {
+      break;
+    }
+    if (typeof item !== 'string') {
+      continue;
+    }
+    // 方向差异贯穿到归一：add 问「你指哪个地址」（剥 <> 得裸地址）；remove 问「你要删哪一行」
+    // （不剥——存量行可能就长成 <x@y> 的样子，剥了就对不上文件里的那一行）。两者输出都是行的不动点。
+    const s = direction === 'add' ? canonicalizeAddInput(item) : canonicalizeOverlayLine(item);
+    if (s === null || seen.has(s) || !checkEntry(s, direction)) {
+      continue;
+    }
+    // remove 侧无单条长度闸（存量行必须可移除），故有界性靠请求总字节：无它则 500 条任意长的串
+    // 能把提案 payload 与 run trace 撑到几百 MB。干跑腿不 throw，超限即静默停收。
+    //
+    // ponytail: **批量闸从第二条起才生效**——守的性质是「loader 接受的任一行 `l`，`{remove:[l]}` 恒被接受」。
+    //           把预算加在第一条上会让一条超长的存量行**不可移除**，正是本能力要消灭的那类结构性锁死。
+    //           将来任何新增的批量闸都必须保留这条豁免。
+    if (out.length > 0) {
+      requestBytes += Buffer.byteLength(s, 'utf8');
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        break;
+      }
+    }
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
 }
 
 /** 从 ctx.input 读反馈自然语言（`{ text: string }`）；非对象/缺 text/非串 → 空串（当空处理）。 */
 function readFeedbackText(input: unknown): string {
-  if (input !== null && typeof input === 'object' && 'text' in input) {
-    const t = (input as { text: unknown }).text;
-    if (typeof t === 'string') {
-      return t;
-    }
-  }
-  return '';
+  const t = readOwnKey(input, 'text');
+  return typeof t === 'string' ? t : '';
 }
 
 /**
@@ -364,24 +521,40 @@ function matchNoiseCandidates(text: string, candidates: readonly string[]): stri
   return out;
 }
 
+
 /**
- * apply-feedback 触发（noise-feedback 契约）：把确认后的 add **幂等**并入 overlay 机器文件、**只写 overlay**。
- * add 过滤为字符串（非串丢弃）+ trim+lower+丢空归一（同 loader ingest，使并集去重成立）；读现有 overlay
- * （缺失/读错误→空，overlay 机器可再生）；`added` = 不在现有集的、`already_present` = 已在的（set-union 幂等）；
- * 原子写 tmp+rename（**绝不碰 rules.yaml**）；emit feedback.applied。重发安全：同一 add 再 apply → added=[]。
+ * apply-feedback 触发（noise-feedback 契约）：把确认后的 `{ add?, remove? }` **幂等**落 overlay 机器文件、
+ * **只写 overlay**。读现有 overlay → 求 **`(existing ∪ add) \ remove`** → **一次** tmp+rename 原子发布
+ * （**绝不碰人工维护的 `rules.yaml`**）→ **恰好 emit 一次** `feedback.applied` 四字段。
+ *
+ * 回执语义：`added`/`removed` = 本次真改了 overlay 的；`already_present`/`not_present` = 请求但本就已在/
+ * 本就不在的。**回执与请求配分**：`added ∪ already_present` == 去重后的 `add`、`removed ∪ not_present` ==
+ * 去重后的 `remove`，四桶两两不交、不含请求外的地址——view 机械校验这条，不符即 `receipt_mismatch`。
+ * 重发同一 apply 安全：两侧退化为空、overlay 连 mtime 都不动。
+ *
+ * 可逆性：add 后再 remove 同一地址，overlay **字节内容**回到 add 之前。**字节等价只对由
+ * `writeNoiseOverlayAtomic` 写出的文件成立**（Set 保插入序、删除不扰动其余行序）；人工编辑过的存量文件
+ * （无尾换行 / CRLF / 空行 / 重复行 / 大写）只保证**集合等价**——写回时按 canonical 形态重新序列化。
+ *
+ * **overlay-only**：生效降噪集是 `rules.yaml ∪ overlay`，本路径只动 overlay。故同时被人工 `rules.yaml`
+ * 命中的地址「移出」后**仍会被降噪**（人工规则要人工改）；「不在名单」也只是不在机器 overlay。
  */
 async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Promise<void> {
-  const add = normalizeFeedbackAdd(ctx.input);
+  // ponytail: 读→写之间**必须无 await** —— 这是单进程内 read-modify-write 原子性的全部依据（无锁）。
+  //           将来在此插入任何 await 会静默打开丢更新窗口而回执照报 added；跨进程并发驱动需 O_EXCL lockfile。
+  const { add, remove } = normalizeFeedbackInput(ctx.input);
   const overlayPath = resolveNoiseOverlayPath();
-  const existing = new Set<string>(readNoiseOverlay(overlayPath));
+  // 路径由 RULES_FILE 派生，故两者相等当且仅当 rules 文件本身就叫 noise_senders.overlay。
+  // 纯字符串比较：别名机制（软链/硬链/大小写/bind mount）在这里没有作用面。
+  if (resolve(overlayPath) === resolve(resolveRulesPath())) {
+    throw new Error('inbox pipeline: rules 文件不能命名为 noise_senders.overlay（它会与机器 overlay 撞名）');
+  }
+  const existing = new Set<string>(readOverlayFile(overlayPath, 'fail-closed'));
   const added: string[] = [];
   const alreadyPresent: string[] = [];
-  const seenInput = new Set<string>();
+  const removed: string[] = [];
+  const notPresent: string[] = [];
   for (const s of add) {
-    if (seenInput.has(s)) {
-      continue; // 同一 add 内去重（避免同一地址重复计入 added/already_present）。
-    }
-    seenInput.add(s);
     if (existing.has(s)) {
       alreadyPresent.push(s);
     } else {
@@ -389,35 +562,148 @@ async function runApplyFeedback(ctx: RunContext, _overrides?: RunOverrides): Pro
       added.push(s);
     }
   }
-  writeNoiseOverlayAtomic(overlayPath, existing);
-  ctx.emit('feedback.applied', { added, already_present: alreadyPresent });
-}
-
-/** 从 ctx.input 读确认后的 add（`{ add: string[] }`）：非数组→空；过滤非串；trim+lower+丢空归一。 */
-function normalizeFeedbackAdd(input: unknown): string[] {
-  const raw =
-    input !== null && typeof input === 'object' && 'add' in input
-      ? (input as { add: unknown }).add
-      : undefined;
-  if (!Array.isArray(raw)) {
-    return [];
+  for (const s of remove) {
+    if (existing.delete(s)) {
+      removed.push(s);
+    } else {
+      notPresent.push(s);
+    }
   }
-  return raw
-    .filter((s): s is string => typeof s === 'string')
-    .map((s) => s.trim().toLowerCase())
-    .filter((s) => s.length > 0);
+  if (added.length > 0 || removed.length > 0) {
+    writeNoiseOverlayAtomic(overlayPath, existing); // 无实际变更不写：重发 apply 连 mtime 都不动。
+  }
+  ctx.emit('feedback.applied', { added, already_present: alreadyPresent, removed, not_present: notPresent });
 }
 
 /**
- * 原子写 overlay（同盘 tmp+rename 原子发布）：写 `<overlay>.tmp` 再 renameSync 覆盖 overlay。
+ * 从 ctx.input 读确认后的 `{ add?, remove? }`——apply 是**独立入口**（可绕过 UI 直调），故重新校验：
+ *   - **缺 key → `[]`，不 throw**：部署序是 inbox 先、view 后，那个窗口里旧 view 发的是 `{add:[…]}` 无
+ *     `remove` key；当非法会让整个窗口的「加」全失败。
+ *   - **key 存在但不是 `string[]` → throw**：当空集会让「忽略畸形输入并回四个空桶」走成功路径。
+ *   - **非 canonical / 非法项 → throw**：归一对合规输入幂等，不幂等即调用方跳过了 interpret。
+ *   - **`add ∩ remove ≠ ∅` → throw**：`(existing ∪ add) \ remove` 会让 remove 悄悄胜出，而回执
+ *     `{added:[X], removed:[X]}` 在读者眼里是「加了又移了」、文件里却没有 X——回执说谎。
+ */
+function normalizeFeedbackInput(input: unknown): { add: string[]; remove: string[] } {
+  // 缺 key 语义只对**普通对象**成立。null / 标量 / 数组此前被当成「两键皆缺」→ 成功回四个空桶，
+  // 而它们根本不符合 `{add?, remove?}` 的形状，属畸形 input，该走抛错那条。
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error(`inbox pipeline: apply-feedback 的 input 必须是 { add?, remove? } 对象（收到 ${Array.isArray(input) ? 'array' : typeof input}）`);
+  }
+  const add = readEntryList(input, 'add');
+  const remove = readEntryList(input, 'remove');
+  const removeSet = new Set(remove);
+  const both = add.filter((s) => removeSet.has(s));
+  if (both.length > 0) {
+    throw new Error(
+      `inbox pipeline: apply-feedback 同一项同时出现在 add 与 remove（拒绝静默裁决），共 ${both.length} 项`,
+    );
+  }
+  return { add, remove };
+}
+
+/**
+ * 读 `input[key]`：**键不存在** → `[]`；键在（含值为 `undefined`）但非数组、条数超限、或含不合规项 → throw；
+ * 保序去重。用 `Object.hasOwn` 而非 `in`：`in` 走原型链，被污染的 `Object.prototype.add` 会让一个 `{}`
+ * 变成带条目的写请求——本腿自称「不信调用方、重新校验」，就不该从原型链取值。
+ *
+ * **两侧的合规判据不同**：`add` 要求完整 `isCanonicalEntry`（归一幂等 ∧ 合法）；`remove` 只要求**归一幂等**，
+ * 不要求合法。否则 master 期写进 overlay 的存量条目（当时只 trim+lower，任何非空串都能进）在新校验器下
+ * 变得**结构性不可移除**——apply 抛错、提案腿静默丢，而契约禁止手改机器文件。删除永远是安全方向。
+ */
+function readEntryList(input: unknown, key: 'add' | 'remove'): string[] {
+  if (!hasOwnKey(input, key)) {
+    return []; // 缺 key = 该方向无变更（部署窗口里旧 view 只发 add）。
+  }
+  const raw = readOwnKey(input, key);
+  if (!Array.isArray(raw)) {
+    throw new Error(`inbox pipeline: apply-feedback 的 ${key} 必须是 string[]（收到 ${typeof raw}）`);
+  }
+  if (raw.length > MAX_ENTRIES_PER_KEY) {
+    throw new Error(
+      `inbox pipeline: apply-feedback 的 ${key} 条目数超上限（${raw.length} > ${MAX_ENTRIES_PER_KEY}）`,
+    );
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let requestBytes = 0;
+  for (const item of raw) {
+    if (!checkEntry(item, key)) {
+      // 只回形状不回值：地址属邮件内容侧，run trace 与邮件 DB 是不同保留策略/访问路径的存储。
+      throw new Error(
+        `inbox pipeline: apply-feedback 的 ${key} 含不合规项（${key === 'add' ? '须为已归一的合法 local@domain 或 domain' : '须为已归一形态'}）：` +
+          `类型=${typeof item}、长度=${typeof item === 'string' ? item.length : 0}`,
+      );
+    }
+    // remove 侧无单条长度闸（存量行必须可移除），故有界性靠**请求总字节**：无它则 500 条任意长的串
+    // 能把 `not_present` 回执与 run trace 撑到几百 MB。只回形状不回值（地址属邮件内容侧）。
+    //
+    // ponytail: **批量闸从第二条起才生效**——守的性质是「loader 接受的任一行 `l`，`{remove:[l]}` 恒被接受」。
+    //           把预算加在第一条上会让一条超长的存量行**不可移除**，正是本能力要消灭的那类结构性锁死。
+    //           将来任何新增的批量闸都必须保留这条豁免。
+    if (out.length > 0) {
+      requestBytes += Buffer.byteLength(item, 'utf8');
+      if (requestBytes > MAX_REQUEST_BYTES) {
+        throw new Error(
+          `inbox pipeline: apply-feedback 的 ${key} 请求总字节超上限（> ${MAX_REQUEST_BYTES} 字节）`,
+        );
+      }
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      out.push(item);
+    }
+  }
+  return out;
+}
+
+/**
+ * 原子写 overlay（同盘 tmp+rename 原子发布）：写 `<overlay>.<pid>.tmp` 再 renameSync 覆盖 overlay。
  * 一行一个发件人（无注释纯机器文件）；空集 → 空文件。**绝不碰 rules.yaml**。
+ *
+ * 三处护栏：**写前对序列化后的字节数设闸**（与 loader 同一常量——越限后 loader 会把**整份** overlay
+ * 静默丢弃，等于所有降噪一次性失效，而 run 仍是绿的）；tmp 名带 pid（固定名会让并发写互踩，且可被预置
+ * 成软链把写入引到别的文件）；`O_NOFOLLOW` + `mode 0o600`（不跟随软链、不把 operator 的 chmod 抹掉）。
+ * 错误只回 kind：Node 的 fs 错误 message 自带绝对路径，而本仓日志纪律是「只 kind、不记路径/内容」。
  */
 function writeNoiseOverlayAtomic(overlayPath: string, entries: Iterable<string>): void {
   const list = [...entries];
   const body = list.length > 0 ? list.join('\n') + '\n' : '';
-  const tmp = overlayPath + '.tmp';
-  writeFileSync(tmp, body, 'utf8');
-  renameSync(tmp, overlayPath);
+  const bytes = Buffer.byteLength(body, 'utf8');
+  if (bytes > MAX_RULES_FILE_BYTES) {
+    throw new Error(
+      `inbox pipeline: overlay 将超过 loader 上限，拒绝写入（${bytes} > ${MAX_RULES_FILE_BYTES} 字节；` +
+        `写下去 loader 会整份忽略，等于所有降噪失效）`,
+    );
+  }
+  // 随机名 + `O_EXCL`：固定名可被预置成 rules.yaml 的**硬链**，那时 `O_TRUNC` 会先把 rules.yaml 截断，
+  // 而 `O_NOFOLLOW` 只挡软链、挡不住硬链。`O_EXCL` 让「路径已存在」直接开失败，不可能截断任何东西。
+  const tmp = `${overlayPath}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  // open 单独一段：**开失败就绝不 unlink**。O_EXCL 下 EEXIST 意味着那个路径上的文件不是本次创建的，
+  // 统一在 catch 里 unlink 会删掉别人的文件。只有开成功之后 tmp 才归本调用所有。
+  let fd: number;
+  try {
+    // openSync 而非 writeFileSync 的 flag 选项：后者的类型只收字符串标志，收不了 O_NOFOLLOW。
+    fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+  } catch (err) {
+    throw new Error(`inbox pipeline: overlay 原子写失败（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`);
+  }
+  try {
+    try {
+      writeFileSync(fd, body, 'utf8');
+      fsyncSync(fd); // rename 可能先于数据落盘：掉电会留下空/截断的 overlay = 整份名单丢失。
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, overlayPath);
+  } catch (err) {
+    try {
+      unlinkSync(tmp); // 失败时不留含地址名单的孤儿 tmp。
+    } catch {
+      /* best-effort */
+    }
+    throw new Error(`inbox pipeline: overlay 原子写失败（kind=${(err as NodeJS.ErrnoException).code ?? 'unknown'}）`);
+  }
 }
 
 /**
