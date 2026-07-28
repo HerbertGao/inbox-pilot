@@ -29,7 +29,19 @@
 
 除 3.7（需按其说明改写 3.6 的豁免项）与 3.14（变异测试，本就要人工注入再复原）外，每一步都是可原样粘贴执行的断言：失败退出非零，**无占位符、无需人工判读**。
 
-**先在仓根跑这一行**：`test -f package.json && test -d src || { echo '不在仓根'; false; }`——下面多条断言是 `! grep …` / `! jq -e …` 形态，而 `grep` 读不到文件时返回 2、`jq` 出错返回 5，`!` 会把这两种**读取失败**一并翻成通过（3.13 因此改用显式 `rc == 1`）。cwd 不对时六条会集体假绿。工具用 `pnpm dlx @herbertgao/openspec-cn@1.6.0`——`openspec-cn` 这个名字在本机解析到哪个发行方/版本取决于 PATH，而 design ② 的全部行为结论与 3.11 依赖的输出串都是版本相关的。
+**先在仓根跑这一段**——只验 cwd 不够，被读的每个文件都要在：
+
+```sh
+for f in package.json .env.example openspec/config.yaml docs/DEPLOY.md \
+         src/config/configSchema.ts src/cli/doctor.ts \
+         openspec/specs/account-cli/spec.md openspec/specs/imap-integration/spec.md \
+         openspec/specs/service-bootstrap/spec.md; do
+  test -r "$f" || { echo "缺文件: $f"; exit 1; }
+done
+test -d src && test -d openspec/changes/archive/2026-07-28-retire-http-and-dead-config
+```
+
+下面多条断言是 `! grep …` / `! jq -e …` 形态，而 `grep` 读不到文件时返回 2、`jq` 出错返回 5，`!` 会把这两种**读取失败**一并翻成通过（3.13 因此改用显式 `rc == 1`）。3.6 的假绿更隐蔽：它把两条 grep 的 stdout 落盘再 `test ! -s`，**文件缺失时 grep 的报错走 stderr、落盘文件仍是空的**，于是判通过——实测把 `openspec/config.yaml` 移走后 3.6 照样绿。cwd 不对或任一文件缺失时会有多条集体假绿。工具用 `pnpm dlx @herbertgao/openspec-cn@1.6.0`——`openspec-cn` 这个名字在本机解析到哪个发行方/版本取决于 PATH，而 design ② 的全部行为结论与 3.11 依赖的输出串都是版本相关的。
 
 **§1/§2 每一步都必须有一条会因它漏做而变红的断言**，对应关系：1.1→3.6 · 1.2→3.1 · 1.3→3.1b · 1.4/1.5/1.6/1.7→3.2 · 1.8→3.4 · 1.9→3.3 · 1.10→3.5 · 2.2/2.3→3.6 · 2.4/2.5→3.5b · 2.6→3.5c。
 

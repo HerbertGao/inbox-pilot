@@ -58,8 +58,10 @@ telegram bot token **走 daemon 进程的 env**，但变量名不是固定的：
 **变量名的真相源是那份 `channels.yaml`，不在本仓**，本仓只按 `TG_BOT_INBOX` 记录当前取值。resolver 按路径
 缓存该文件的内容，所以**改完 `channels.yaml` 要重启 daemon**。
 
-**换占位符名时必须同步 `src/logger.ts` 的 redact 名单**：那份名单是写死成员的，只挡它列出的键名——
-占位符改成别的名字而名单没跟，该变量就不再被脱敏，token 会有进日志的路径，且这条没有任何检查会发现。
+token 值本身只以 `botToken` 这个**对象键**流动（resolver 返回 `{ botToken, chatId }`），而 `src/logger.ts`
+按键名 redact 它，**与占位符叫什么无关**；`src/notify/telegram.ts` 记配置错误时只写变量名、不写值。
+名单里的 `TG_BOT_INBOX` 那类 **env 变量名条目是纵深防御**，挡的是「有人整体打印 env 对象」——`src/` 目前
+没有这条路径。所以换占位符名时**顺手同步那份名单**即可，它是兜底、不是唯一屏障。
 
 **四种缺失全是静默的**，都只回 severity `info`：yaml 缺失或为空、该 app/lane 在 yaml 里没有条目、
 占位符指名的变量未设或为空串。`src/notify/telegram.ts` 只在 `error` 级才记日志，`doctor` 没有通知检查项、
