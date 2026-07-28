@@ -11,7 +11,7 @@ context: |
   - IMAP: imapflow | Gmail: googleapis
   - AI: 只通过 OpenRouter（OpenAI 兼容 SDK），禁止直连 OpenAI/Claude/Gemini
   - Scheduler: node-cron | Config: dotenv + yaml | Validation: zod | Log: pino
-  - HTTP: fastify | 部署: hangar 托管的原生 node 进程（launchd daemon 加载 dist/pipeline.js）；
+  - 部署: hangar 托管的原生 node 进程（launchd daemon 加载 dist/pipeline.js）；
     docker 只剩 docker-compose.yml 里的 postgres（无 Redis）
 
   优先级模型：P0 立即通知不标已读 / P1 入摘要不标已读 / P2 标已读入摘要 /

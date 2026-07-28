@@ -25,7 +25,7 @@ inbox-pilot **不再跑在 docker 里**：pilot 由 hangar 以原生 node 进程
 
 关键区分：`RULES_FILE`（决定读哪个规则文件，**env 形态**）与 `rules.yaml` 的**内容**（**文件形态**）是两回事。
 
-定时（轮询间隔、摘要时刻）**不在 env 里**：它在仓根 `app.yaml` 的 cron 触发器上——`DIGEST_TIMES` 已退役（配置里保留字段声明仅为兼容既有 `.env`，无消费者读取）、`POLL_INTERVAL_SECONDS` 亦无消费者。改定时 = 改 `app.yaml` + 重启 daemon。
+定时（轮询间隔、摘要时刻）**不在 env 里**：它在仓根 `app.yaml` 的 cron 触发器上——`DIGEST_TIMES` 已退役，config schema 里保留它的字段声明只因 `daily-digest` 规范钉住了该声明的形状，无消费者读取。改定时 = 改 `app.yaml` + 重启 daemon。
 
 ### 已知缺口：rules.yaml / overlay 改动要重启 daemon
 
@@ -47,6 +47,30 @@ launchctl kickstart -k gui/$(id -u)/com.herbertgao.hangar-inbox
 
 1. `node dist/cli/inbox-pilot.js doctor`（只读预检：env 校验 + DB 可达性，不写任何东西）。
 2. 等下一次 poll 触发（`*/3`），确认 daemon 日志里这一轮跑完、无 `run.failed`。
+
+HTTP 形态退役后，`doctor --json` 的 `checks` 里不再有 `host_port` 项——按字段名解析该输出的调用方需同步，这是向后不兼容的形状变化。
+
+### 通知凭据来源（doctor 查不到，缺了是静默失败）
+
+telegram bot token **走 daemon 进程的 env**，但变量名不是固定的：`@herbertgao/hangar-notify` 的 resolver
+从 `channels.yaml`（默认 `~/.config/hangar/channels.yaml`，可由 `HANGAR_NOTIFY_CONFIG` 覆盖）里
+`bot: ${VAR}` 占位符取出变量名，再读 `process.env[VAR]`。同一份 yaml 的 `chat` 字段是投递目的地，不经 env。
+**变量名的真相源是那份 `channels.yaml`，不在本仓**，本仓只按 `TG_BOT_INBOX` 记录当前取值。resolver 按路径
+缓存该文件的内容，所以**改完 `channels.yaml` 要重启 daemon**。
+
+token 值本身只以 `botToken` 这个**对象键**流动（resolver 返回 `{ botToken, chatId }`），而 `src/logger.ts`
+按键名 redact 它，**与占位符叫什么无关**；`src/notify/telegram.ts` 记配置错误时只写变量名、不写值。
+名单里的 `TG_BOT_INBOX` 那类 **env 变量名条目是纵深防御**，挡的是「有人整体打印 env 对象」——`src/` 目前
+没有这条路径。所以换占位符名时**顺手同步那份名单**即可，它是兜底、不是唯一屏障。
+
+**四种缺失全是静默的**，都只回 severity `info`：yaml 缺失或为空、该 app/lane 在 yaml 里没有条目、
+占位符指名的变量未设或为空串。`src/notify/telegram.ts` 只在 `error` 级才记日志，`doctor` 没有通知检查项、
+仍返回 0。净效果是 daemon 正常跑、分类正常、P0/P4 一条都发不出去。已经出问题时唯一的旁证是 daemon 日志里的
+pino JSON 字段 `"kind":"notify-skipped-no-channel"`（本仓 pino 无 transport/formatter，日志是 JSON，不会出现
+`kind=` 这种 logfmt 写法），且它只有负向意义——没这一行也可能只是还没来过 P0/P4 邮件。
+
+排查手段在 hangar 那侧（`hangar-notify check`），语义以它自己的文档为准。**本仓没有能证明「通知已配通」的
+检查**，只能证伪、不能证成——这是已知缺口，不由本变更引入也不由它关闭。
 
 env 改动（改 `.env`）与规则/overlay 改动只需最后一步的 `launchctl kickstart`，不需要 build。
 

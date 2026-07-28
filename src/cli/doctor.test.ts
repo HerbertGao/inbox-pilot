@@ -1,25 +1,20 @@
-// doctor 预检离线单测（3.4-3.6，node:test）。注入 DB/openssl/host-port 探测桩 + 捕获 stdout；
-// 全离线、不连真 DB、不 spawn openssl、不真 bind 端口。
-//
-// 覆盖 tasks 3.4-3.6：
-//   - 3.4 非法 DATABASE_URL → runDoctor 返回 1、不崩、报告标该项失败、输出不含 DATABASE_URL 值任何子串；
-//   - 3.5 指向 openai.com 的 OPENROUTER_BASE_URL → runDoctor 返回 1（关键 schema 失败），而非 0；
-//   - 3.6 host-port 检查 detail 为固定标签（free/in-use/skipped）之一、不含原始 HOST 值，
-//         且不发起任何外发带凭据连接（用注入的 checkHostPort 返回固定标签断言无外发）。
+// doctor 只读部署预检离线单测（node:test）。注入 DB/openssl 探测桩 + 捕获 stdout；
+// 全离线、不连真 DB、不 spawn openssl。关键覆盖：
+//   - 非法 DATABASE_URL → runDoctor 返回 1、不崩、报告标该项失败、输出不含 DATABASE_URL 值任何子串；
+//   - 指向 openai.com 的 OPENROUTER_BASE_URL → runDoctor 返回 1（关键 schema 失败），而非 0。
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { runDoctor, type DoctorDeps, type DoctorReport } from './doctor.js';
 
-/** 捕获 stdout 的 println，并提供合法的离线探测桩（DB ok / openssl present / port free）。 */
+/** 捕获 stdout 的 println，并提供合法的离线探测桩（DB ok / openssl present）。 */
 function makeDeps(overrides: Partial<DoctorDeps> = {}): { deps: DoctorDeps; out: string[] } {
   const out: string[] = [];
   const deps: DoctorDeps = {
     println: (l) => out.push(l),
     checkDb: async () => 'ok',
     checkOpenssl: async () => true,
-    checkHostPort: async () => 'free',
     ...overrides,
   };
   return { deps, out };
@@ -125,46 +120,6 @@ test('doctor：OPENROUTER_BASE_URL 指向 openai.com → 返回 1（关键 schem
   );
 });
 
-// ——————————————————————————————————————————————————————————
-// 3.6 host-port detail 为固定标签、不含原始 HOST 值、无外发带凭据连接
-// ——————————————————————————————————————————————————————————
-
-test('doctor：host-port 检查 detail 为固定标签之一、不含原始 HOST 值、无外发连接', async () => {
-  const SECRET_HOST = '203.0.113.77'; // 用作 HOST 的可识别值，断言其不出现在 detail/输出中。
-  await withEnv(
-    { DATABASE_URL: 'postgresql://u:p@localhost:5432/db', HOST: SECRET_HOST, PORT: '4321' },
-    async () => {
-      const { deps, out } = makeDeps();
-      // 注入 checkHostPort：返回固定标签即可——断言它**仅本地探测**（不真连），且 doctor 不把
-      // 原始 HOST 透传进 detail。记录被传入的 host/port 以确认探测对象是服务自身 HOST/PORT。
-      const seen: { host?: string; port?: number } = {};
-      deps.checkHostPort = async (host, port) => {
-        seen.host = host;
-        seen.port = port;
-        return 'in-use';
-      };
-
-      const code = await runDoctor({ json: true }, deps);
-      // host-port 是提示检查、不影响退出码；config+DB 均 ok → 退出 0。
-      assert.equal(code, 0, '提示检查不影响退出码（config/DB 均 ok）');
-
-      const report = JSON.parse(out.join('\n')) as DoctorReport;
-      const hp = report.checks.find((c) => c.name === 'host_port');
-      assert.ok(hp !== undefined, '有 host_port 检查项');
-      // detail 必为固定标签之一。
-      assert.ok(['free', 'in-use', 'skipped'].includes(hp!.detail), 'detail 为固定标签之一');
-      // detail 绝不含原始 HOST 值。
-      assert.ok(!hp!.detail.includes(SECRET_HOST), 'detail 不含原始 HOST 值');
-      // 整个输出绝不含原始 HOST 值（防经其它字段泄露）。
-      assert.ok(!out.join('\n').includes(SECRET_HOST), '整个输出不含原始 HOST 值');
-
-      // 探测对象是服务自身 HOST/PORT（本地 bind 探测，非外发带凭据连接）。
-      assert.equal(seen.host, SECRET_HOST, '探测的是服务自身 HOST');
-      assert.equal(seen.port, 4321, '探测的是服务自身 PORT');
-    },
-  );
-});
-
 test('doctor：config/DB 均 ok 时退出 0；可选凭据缺失（openrouter/openssl）不影响退出码', async () => {
   await withEnv(
     {
@@ -184,6 +139,45 @@ test('doctor：config/DB 均 ok 时退出 0；可选凭据缺失（openrouter/op
       assert.equal(key!.detail, 'missing', 'OPENROUTER_API_KEY 缺失报 missing');
       const ssl = report.checks.find((c) => c.name === 'openssl');
       assert.equal(ssl!.detail, 'missing', 'openssl 缺失报 missing');
+    },
+  );
+});
+
+// ——————————————————————————————————————————————————————————
+// 成功路径的整体输出脱敏：凭据存在时 detail 只回标签、原始值绝不出现在任何字段
+// （幸存的两条整体断言都跑在 config 校验失败路径上；这条补的是 parsed.success === true 那一支）
+// ——————————————————————————————————————————————————————————
+
+test('doctor：凭据存在时 detail 只回标签，成功路径整体输出不含凭据值', async () => {
+  const OR_SECRET = 'sk-or-LEAKSENTINEL-openrouter';
+  const G_SECRET = 'GOCSPX-LEAKSENTINEL-gmail';
+  await withEnv(
+    {
+      DATABASE_URL: 'postgresql://u:p@localhost:5432/db',
+      OPENROUTER_API_KEY: OR_SECRET,
+      GMAIL_CLIENT_ID: 'cid.apps.googleusercontent.com',
+      GMAIL_CLIENT_SECRET: G_SECRET,
+      GMAIL_REDIRECT_URI: 'http://127.0.0.1/oauth2/callback',
+    },
+    async () => {
+      const { deps, out } = makeDeps();
+      const code = await runDoctor({ json: true }, deps);
+      assert.equal(code, 0, 'config/DB 均 ok → 退出 0');
+
+      const text = out.join('\n');
+      const report = JSON.parse(text) as DoctorReport;
+      assert.equal(
+        report.checks.find((c) => c.name === 'openrouter_api_key')!.detail,
+        'set',
+        '凭据存在 → 只回 set 标签',
+      );
+      assert.equal(
+        report.checks.find((c) => c.name === 'gmail_onboarding')!.detail,
+        'available',
+        'Gmail 三件齐全且 redirect_uri 合法 → available',
+      );
+      assert.ok(!text.includes(OR_SECRET), '整体输出不含 OPENROUTER_API_KEY 值');
+      assert.ok(!text.includes(G_SECRET), '整体输出不含 GMAIL_CLIENT_SECRET 值');
     },
   );
 });

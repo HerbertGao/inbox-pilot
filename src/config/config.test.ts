@@ -59,18 +59,10 @@ test('configSchema：OpenRouter 兼容代理 / 自建网关 / openai.com 仿冒�
   }
 });
 
-// ── POLL_INTERVAL_SECONDS：空串/省略 → 默认 180，显式值 → coerce ──
-// （IMAP_* env 键已退役——账号凭据走 DB authJson，不再经 config 解析。）
-
-test('configSchema：POLL_INTERVAL_SECONDS 空串/省略 → 180，显式值 → coerce 为数字', () => {
-  assert.equal(configSchema.parse({ DATABASE_URL: DB }).POLL_INTERVAL_SECONDS, 180);
-  assert.equal(configSchema.parse({ DATABASE_URL: DB, POLL_INTERVAL_SECONDS: '' }).POLL_INTERVAL_SECONDS, 180);
-  assert.equal(configSchema.parse({ DATABASE_URL: DB, POLL_INTERVAL_SECONDS: '60' }).POLL_INTERVAL_SECONDS, 60);
-});
-
 // ── DIGEST_TIMES：字段已退役（add-multi-trigger：摘要调度移到 app.yaml 的 digest 触发器 + hangar
-// daemon），但 configSchema 保留裸 z.string().optional() 声明，使既有 .env 仍设 DIGEST_TIMES 时不触发
-// 严格校验报错。**已无消费者读它**——旧的 '' vs undefined "不调度" 语义已无意义；下列测试仅守住"保留字段
+// daemon），但 configSchema 保留裸 z.string().optional() 声明——保留理由不是「怕严格校验报错」
+// （schema 是裸 z.object、对未知键静默丢弃，结构上不可能严格），而是 openspec/specs/daily-digest/spec.md
+// 「需求:DIGEST_TIMES 配置解析与降级」以 MUST 钉着该字段的声明形状。**已无消费者读它**——旧的 '' vs undefined "不调度" 语义已无意义；下列测试仅守住"保留字段
 // 未被误删、也未被误包 emptyToUndefined"（缺省→undefined / 显式值→原样透传）。
 
 test('configSchema：DIGEST_TIMES env 缺省 → undefined', () => {

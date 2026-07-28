@@ -1,4 +1,4 @@
-// doctor 预检（spec inbox-pilot-cli「需求:doctor 预检」、design「doctor（runDoctor）」、tasks 3.1-3.6）。
+// doctor 只读部署预检（spec account-cli「需求:doctor 只读部署预检」）。
 //
 // 只读、零写入的健康预检：在不触发 loadConfig() 的前提下报告服务是否就绪。
 //
@@ -13,11 +13,9 @@
 //     `issue.input`（含口令的非法 DATABASE_URL 等原始值）/ 原始 `error.issues` / `process.env`；
 //     禁 `JSON.stringify(parsed.error)` 这类会带出 issue.input 的写法。
 //   - DB 可达性失败报固定标签 `unreachable`，绝不打印 Prisma 错误或连接串。
-//   - 凭据检查只回 `set`/`missing`/`unreachable`；host-port 检查 detail 只回固定标签
-//     `free`/`in-use`/`skipped`，绝不回显原始 HOST 值。
+//   - 凭据检查只回 `set`/`missing`/`unreachable`。
 
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
 
 import { PrismaClient } from '@prisma/client';
 
@@ -27,12 +25,9 @@ import { configSchema, isGmailOnboardingAvailable } from '../config/configSchema
 export const DOCTOR_OK = 0;
 export const DOCTOR_FAILURE = 1;
 
-/** DB SELECT 1 探测超时（毫秒）。镜像 main.ts /health 探测的 Promise.race 超时模式：只取消等待、
+/** DB SELECT 1 探测超时（毫秒）。Promise.race 超时模式：只取消等待、
  *  不真正中断底层查询/连接池取用（doctor 是 liveness-only 只读探测，禁止挂起）。 */
 const DB_PROBE_TIMEOUT_MS = 2500;
-
-/** host-port 本地 bind 探测超时（毫秒）。listen 异常未触发时的兜底，禁止挂起。 */
-const PORT_PROBE_TIMEOUT_MS = 1500;
 
 /** openssl 探测超时（毫秒）。 */
 const OPENSSL_PROBE_TIMEOUT_MS = 1500;
@@ -51,16 +46,14 @@ export type DoctorReport = {
 };
 
 /**
- * 可注入依赖（测试用；prod 用真身默认）。把 DB / openssl / host-port 三项外部探测做成可注入，
- * 使测试可离线运行（不连真 DB、不 spawn openssl、不真 bind 端口）。
+ * 可注入依赖（测试用；prod 用真身默认）。把 DB / openssl 两项外部探测做成可注入，
+ * 使测试可离线运行（不连真 DB、不 spawn openssl）。
  */
 export type DoctorDeps = {
   /** DB 可达性探测：`ok` 可达 / `unreachable` 不可达（绝不透传底层 Prisma 错误或连接串）。 */
   checkDb?: () => Promise<'ok' | 'unreachable'>;
   /** openssl 是否存在（spawn `openssl version`）。 */
   checkOpenssl?: () => Promise<boolean>;
-  /** host-port 本地 bind 占用探测：固定标签（探服务自身 HOST/PORT 本地 bind，绝不外发、绝不回显 HOST）。 */
-  checkHostPort?: (host: string, port: number) => Promise<'free' | 'in-use' | 'skipped'>;
   /** 数据行输出（默认 process.stdout.write，附换行）。表格 / JSON 走此（stdout）。 */
   println?: (line: string) => void;
 };
@@ -125,57 +118,12 @@ function defaultCheckOpenssl(): Promise<boolean> {
   });
 }
 
-/**
- * 真身 host-port 本地占用探测：仅本地 `createServer().listen(port, host)` + EADDRINUSE 检测——
- * **非**外发连接、**无**任何带凭据的外发流量。EADDRINUSE → `in-use`；成功 bind（随即关闭）→ `free`；
- * 其它 bind 错误（如 EADDRNOTAVAIL / EACCES，HOST 非本机地址等无定论情形）→ `skipped`。
- * detail 绝不回显原始 HOST 值（调用方据返回的固定标签构造 detail）。
- */
-function defaultCheckHostPort(host: string, port: number): Promise<'free' | 'in-use' | 'skipped'> {
-  return new Promise<'free' | 'in-use' | 'skipped'>((resolve) => {
-    let settled = false;
-    const settle = (label: 'free' | 'in-use' | 'skipped'): void => {
-      if (settled) return;
-      settled = true;
-      resolve(label);
-    };
-    const server = createServer();
-    const timer = setTimeout(() => {
-      try {
-        server.close();
-      } catch {
-        // 忽略。
-      }
-      settle('skipped');
-    }, PORT_PROBE_TIMEOUT_MS);
-    server.once('error', (err: NodeJS.ErrnoException) => {
-      clearTimeout(timer);
-      if (err.code === 'EADDRINUSE') {
-        settle('in-use');
-      } else {
-        // 其它 bind 错误无定论（绝不透传错误对象）→ skipped。
-        settle('skipped');
-      }
-    });
-    server.once('listening', () => {
-      clearTimeout(timer);
-      server.close(() => settle('free'));
-    });
-    try {
-      server.listen(port, host);
-    } catch {
-      clearTimeout(timer);
-      settle('skipped');
-    }
-  });
-}
-
 function defaultPrintln(line: string): void {
   process.stdout.write(`${line}\n`);
 }
 
 /**
- * doctor 预检入口（可注入 DB/openssl/host-port 探测离线可测）。**返回**退出码（0/1），
+ * doctor 只读部署预检入口（可注入 DB/openssl 探测离线可测）。**返回**退出码（0/1），
  * 绝不调用 process.exit（由分发器在自身主模块守卫下退出，使退出码不被重复触发）。
  *
  * 关键 vs 告警模型（3.2）：configSchema.safeParse 任一失败 + DB 不可达为**关键**（失败 → 退出 1）；
@@ -185,7 +133,6 @@ function defaultPrintln(line: string): void {
 export async function runDoctor(opts: { json: boolean }, deps: DoctorDeps = {}): Promise<number> {
   const checkDb = deps.checkDb ?? defaultCheckDb;
   const checkOpenssl = deps.checkOpenssl ?? defaultCheckOpenssl;
-  const checkHostPort = deps.checkHostPort ?? defaultCheckHostPort;
   const println = deps.println ?? defaultPrintln;
 
   const checks: DoctorCheck[] = [];
@@ -252,14 +199,6 @@ export async function runDoctor(opts: { json: boolean }, deps: DoctorDeps = {}):
         ? `set (${JSON.stringify(tz)})`
         : 'unset (defaults to Asia/Shanghai)',
   });
-
-  // —— 提示：host-port 本地占用探测（探服务自身 HOST/PORT 本地 bind；config 校验失败时无 parsed.data，
-  //    跳过）。detail 仅固定标签 free/in-use/skipped，绝不回显原始 HOST 值。仅提示、不影响退出码。 ——
-  let hostPortDetail: 'free' | 'in-use' | 'skipped' = 'skipped';
-  if (parsed.success) {
-    hostPortDetail = await checkHostPort(parsed.data.HOST, parsed.data.PORT);
-  }
-  checks.push({ name: 'host_port', ok: true, detail: hostPortDetail });
 
   // —— 告警/提示：openssl 存在与否（缺失 → 仅提示、不影响退出码）。 ——
   const opensslPresent = await checkOpenssl();
