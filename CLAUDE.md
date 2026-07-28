@@ -19,4 +19,4 @@ inbox-pilot：无 GUI 的 AI 邮件路由器后台服务。
 ## 技术栈
 
 Node.js 24 + TypeScript · PostgreSQL 16 + Prisma · imapflow · googleapis ·
-OpenRouter（OpenAI 兼容 SDK，禁止直连其他模型商）· node-cron · zod · pino · fastify。
+OpenRouter（OpenAI 兼容 SDK，禁止直连其他模型商）· node-cron · zod · pino。

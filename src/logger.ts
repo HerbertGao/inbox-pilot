@@ -36,6 +36,8 @@ export const REDACT_PATHS: string[] = [
       '*.OPENROUTER_API_KEY',
       'GMAIL_CLIENT_SECRET',
       '*.GMAIL_CLIENT_SECRET',
+      // TELEGRAM_BOT_TOKEN 已无 config schema 字段（凭据改由 resolver 从下面 TG_BOT_INBOX 那类
+      // channels.yaml 指名的变量读）。保留仅为兜底：既有 .env 仍设该键时不被整体打印。
       'TELEGRAM_BOT_TOKEN',
       '*.TELEGRAM_BOT_TOKEN',
       // TG_BOT_INBOX 是当前生效的 bot token 来源（resolver 从 env 读取此变量）。

@@ -46,6 +46,8 @@ IMAP 轮询必须 SELECT INBOX、按增量 UID 游标取新邮件（见「增量
 ### 需求:增量 UID 游标避免重复 FETCH
 轮询必须用持久化的增量游标（`mail_accounts.lastSyncCursor`，形如 `<uidValidity>:<uid>`）只取新邮件，避免每轮重复 FETCH 已处理邮件——这是「P0/P1/P4 不标已读、却也不重复扫描」的关键（不靠标已读来抑制重扫）。有效游标轮 SEARCH `UID 游标+1:*`（**不带 seen 过滤**，以保留崩溃重取）；**该增量分支**空结果集即 no-op、游标不变（uidValidity 已匹配、无需重写）。
 
+本节的「轮末 `setCursor`」「下一轮」等语义**以同一账号的轮次串行为前提**——两轮重叠时慢轮的 `setCursor` 会覆盖快轮的高水位，退化轮 floor ④ 还会写 `:0` 触发整箱重扫。**该前提由 `account-registry`「per-account 调度与故障隔离」持有**，本需求不重复约束它。
+
 游标推进规则（**定义在本轮实际取回的 UID 序列上、非 dense 整数区间**——避免 expunge 删除留下的 UID 空洞永久卡死高水位）:取回邮件按 **UID 升序**处理;高水位 = 取回序列中「其及之前所有取回封都已处理」的最高 UID（**经 dedup 早退跳过的 UID 视同已处理**、计入推进），遇首个未成功（失败/跳过/崩溃中断、未 `markProcessed`）的取回 UID 即停在其前。轮末 `setCursor`：**增量轮**写 `<当前uidValidity>:<取回高水位>`。**退化轮（首轮/UIDVALIDITY 变化）**的 floor 按优先级:① 取回全部成功（**含空集**）且 `UIDNEXT`（`mailboxOpen` 给出）为正整数 → `<当前uidValidity>:<UIDNEXT-1>`（当前 UID 上界：当前未读已处理、未来邮件 UID 必 > UIDNEXT-1，既不漏新邮件、也不回扫已读历史）；② 有取回封失败 → `<当前uidValidity>:<取回序列连续高水位>`（失败封下轮重取）；③ `UIDNEXT` 缺失/非正整数（RFC 3501 rev1 允许服务器省略 UIDNEXT）→ 退化为本轮取回连续高水位；④ 连取回高水位也无（空集且无 UIDNEXT）→ `<当前uidValidity>:0`（下轮 `UID 1:*` 一次性全量重扫、dedup 兜底，且已清除 UIDVALIDITY 不一致）。**禁止**写出 `NaN`/非有限游标；**禁止**用旧 UIDVALIDITY 的 prev-uid 作 floor（跨命名空间无意义、会被 `UID prevUid+1:*` 永久跳过低位未读）。退化轮即使取回空集也必须写当前 uidValidity（否则反复 UNSEEN 重扫）；增量分支的「空集 no-op」**仅**适用于 uidValidity 已匹配时。失败/崩溃中断的邮件因游标不越过它，下一轮被重新 FETCH 重试（at-least-once，dedup 经 `processedAt` 保证已处理的不重复）。
 
 首轮（无游标）或邮箱当前 UIDVALIDITY 与游标内记录不一致时，必须退化为 SEARCH UNSEEN 处理当前未读积压、**禁止** FETCH 整箱历史；其稀疏 UID 集同样按上述「取回序列连续高水位」推进。
@@ -90,21 +92,6 @@ IMAP provider 必须实现 `ProviderActions.markRead`，对指定邮件标 `\See
 #### 场景:uid 缺失则 fail-loud
 - **当** 转交 `markRead` 的邮件缺活动 `uid`
 - **那么** `markRead` 必须抛结构化错误（落 `mail_actions=failed`），**禁止**静默 no-op
-
-### 需求:定时轮询调度与单账号不重入
-系统必须用 node-cron 按 `POLL_INTERVAL_SECONDS` 周期触发 IMAP 轮询，并保证**单账号轮询不重入**：cron 回调在进入任何 await 前**同步**获取进程内锁，上一轮尚未结束时新触发必须跳过；锁**必须在 `finally` 中释放**（含轮询抛异常的路径），否则一次轮询异常会永久锁死该账号、再不轮询。
-
-#### 场景:到点触发轮询
-- **当** 距上次轮询已达 `POLL_INTERVAL_SECONDS`
-- **那么** 系统必须发起一次该账号的未读轮询
-
-#### 场景:慢轮询不重入
-- **当** 一轮轮询耗时超过 `POLL_INTERVAL_SECONDS`、下一次 cron 触发到来
-- **那么** 系统必须跳过该次触发，直至上一轮结束
-
-#### 场景:轮询抛异常不锁死后续
-- **当** 某一轮轮询整体抛出异常
-- **那么** 锁必须在 `finally` 中释放，下一次 cron 触发能正常发起轮询（不被永久锁死）
 
 ### 需求:单封失败隔离与重启不重复
 轮询循环必须逐封 normalize + 处理，并对**单封**的 normalize/处理异常 catch+skip（记录后继续），禁止单封失败中断整批轮询。已处理邮件（`processedAt` 非空）在后续轮询中必须经去重被跳过，保证服务重启后不重复处理。

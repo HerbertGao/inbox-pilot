@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 // 无副作用的纯 schema 模块：仅含 zod schema 定义 + 纯校验器（无 `import 'dotenv/config'`、
 // 无 loadConfig()、无 process.exit、无 `export const config`）。需要 schema 的纯路径
-// （如 doctor 预检）可只 import 本模块，不被 config.ts 的导入期 `export const config =
+// （如 doctor 只读部署预检）可只 import 本模块，不被 config.ts 的导入期 `export const config =
 // loadConfig()` 牵连——后者对非法配置在 import 时即 process.exit(1)。
 // loadConfig() 与 `export const config` 仍住在有副作用的 config.ts 里。
 
@@ -52,14 +52,11 @@ export const isValidGmailRedirectUri = (v: string): boolean => {
 };
 
 // 不变式（schema message 不内插被解析的值）：本 schema 内所有自定义 `message` 串
-// 必须是**静态串**、绝不内插被解析的值（如 `` `bad value: ${v}` ``）。doctor 预检对
+// 必须是**静态串**、绝不内插被解析的值（如 `` `bad value: ${v}` ``）。doctor 只读部署预检对
 // `safeParse` 失败的 `issue.message` 做直通（只取 path + message、绝不取 issue.input），
 // 该直通按构造 leak-safe 全靠此处每个 message 不承载密钥字段值——一个未来内插密钥的
 // message 会令该直通悄然开始泄露。新增 / 修改 message 时必须保持静态。
 export const configSchema = z.object({
-  NODE_ENV: z.string().default('development'),
-  HOST: z.string().default('0.0.0.0'),
-  PORT: z.coerce.number().default(3000),
   DATABASE_URL: z
     .string()
     .url('DATABASE_URL 必须是合法的 URL')
@@ -100,19 +97,12 @@ export const configSchema = z.object({
   // 服务崩——仅使 Gmail onboarding 显式失败（沿用「缺键禁用功能」模式）：解析阶段只把
   // 空串归一、保留原值，合法性交由 isValidGmailRedirectUri 供消费方判定。
   GMAIL_REDIRECT_URI: z.preprocess(emptyToUndefined, z.string().optional()),
-  // P2 通知渠道（telegram）：两者都裸 .optional()（无默认），落在 P0「后续阶段
-  // 变量可选」范围内，不破坏「仅 DATABASE_URL 必需」。两者全齐 → notifier 选
-  // telegram；缺则降级记日志（不崩）。凭据只从此处读、禁写死、不入日志
-  // （TELEGRAM_BOT_TOKEN 已在 logger redact 名单，见 src/logger.ts）。
-  // bark 作为后续可选渠道，本期不引入 BARK_*。
-  TELEGRAM_BOT_TOKEN: z.string().optional(),
-  TELEGRAM_CHAT_ID: z.string().optional(),
   // IMAP 账号凭据不走 env——统一存 DB MailAccount.authJson，经 `account add --imap` 写入
-  // （P3 的 IMAP_* env 键 + 一次性迁移脚本已退役）。轮询间隔仍是进程级 env 配置。
-  POLL_INTERVAL_SECONDS: z.preprocess(emptyToUndefined, z.coerce.number().default(180)),
+  // （P3 的 IMAP_* env 键 + 一次性迁移脚本已退役）。
   // DIGEST_TIMES（每日摘要触发时刻列表，如 `12:30,21:30`）：**已退役、不再读**（add-multi-trigger）——
   // 摘要调度移到 `app.yaml` 的 digest 触发器 cron 数组 + hangar daemon，本进程不再解析/调度 DIGEST_TIMES。
-  // **仅保留字段声明**（不删），使既有 `.env` 仍设 `DIGEST_TIMES=...` 时**不**触发 config 严格校验报错；
+  // **仅保留字段声明**（不删）：`openspec/specs/daily-digest/spec.md`「需求:DIGEST_TIMES 配置解析与降级」
+  // 以 MUST 钉着本字段的声明形状（「config 层必须用裸 `z.string().optional()`」），删字段即违反该现行规范。
   // 无消费者读取本值。裸 z.string().optional() 原样透传（保留退役前的宽松形状，不加默认/不归一）。
   DIGEST_TIMES: z.string().optional(),
 });

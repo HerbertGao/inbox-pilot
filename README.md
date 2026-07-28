@@ -28,13 +28,13 @@ cron 轮询未读 → NormalizedEmail → OpenRouter 分类 → 规则引擎兜�
 ## 技术栈
 
 Node.js 24 + TypeScript · PostgreSQL 16 + Prisma · imapflow · googleapis ·
-OpenRouter（OpenAI 兼容 SDK）· node-cron · zod · pino · fastify。
+OpenRouter（OpenAI 兼容 SDK）· node-cron · zod · pino。
 
 ## 快速开始
 
 必需变量仅 `DATABASE_URL`（须为合法 `postgresql://` / `postgres://` 连接串）；缺失或
-scheme 非法即 fail-fast。`.env.example` 里的其余变量（OPENROUTER / GMAIL / TELEGRAM /
-`RULES_FILE` / `TZ`）按需填。`DATABASE_URL` 一律用 `localhost` 形态——postgres 只绑宿主
+scheme 非法即 fail-fast。`.env.example` 里的其余变量（OPENROUTER / GMAIL / `RULES_FILE` /
+`TZ`）按需填；通知凭据的配置方式见 `docs/DEPLOY.md`「通知凭据来源」。`DATABASE_URL` 一律用 `localhost` 形态——postgres 只绑宿主
 loopback。
 
 ### 部署形态

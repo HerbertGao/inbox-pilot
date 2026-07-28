@@ -177,7 +177,6 @@ test('dispatch：DATABASE_URL 存在于 env（dotenv 装载）时 doctor 路由�
         doctorDeps: {
           checkDb: async () => 'ok',
           checkOpenssl: async () => true,
-          checkHostPort: async () => 'free',
           println: (l) => out.push(l),
         },
       });
