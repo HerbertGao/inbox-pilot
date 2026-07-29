@@ -118,10 +118,10 @@ test -d src && test -d openspec/changes/archive/2026-07-28-retire-http-and-dead-
 
 ## 4. 部署（无顺序约束，见 design ③）
 
-- [ ] 4.1 在 `~/inbox-pilot-hangar` 拉取、`pnpm install`、`pnpm build`
-- [ ] 4.2 `pnpm migrate:deploy`（`prisma migrate deploy`）——`service-bootstrap`「运行载体与迁移前置」无条件要求它在重启 daemon **之前**执行，非零退出即中止部署，禁止把 pilot 放到未迁移的库上
-- [ ] 4.3 `launchctl kickstart -k gui/$(id -u)/com.herbertgao.hangar-inbox` 重启 daemon
-- [ ] 4.4 确认日志出现 `daemon started`；跑
+- [x] 4.1 在 `~/inbox-pilot-hangar` 拉取、`pnpm install`、`pnpm build`
+- [x] 4.2 `pnpm migrate:deploy`（`prisma migrate deploy`）——`service-bootstrap`「运行载体与迁移前置」无条件要求它在重启 daemon **之前**执行，非零退出即中止部署，禁止把 pilot 放到未迁移的库上
+- [x] 4.3 `launchctl kickstart -k gui/$(id -u)/com.herbertgao.hangar-inbox` 重启 daemon。**实测补充**：本次执行时该 service 在一次成功 kickstart 之后从 launchd 注册表里消失了（再次 `kickstart` 报 `113 Could not find service`，`launchctl list` 无该项，plist 文件仍在、`.env` 可正常 source、日志无报错）。恢复靠 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.herbertgao.hangar-inbox.plist`。**故 kickstart 之后必须用 `launchctl list \| grep hangar-inbox` 确认 service 仍在册**——只看 `kickstart` 的退出码不足以证明 daemon 活着
+- [x] 4.4 确认日志出现 `daemon started`；跑
       `node dist/cli/inbox-pilot.js doctor --json | jq -e '.ok'` → 退出码 0。
       `.ok` 就是「关键检查全过」（`config` 校验 + DB 可达性），config 失败与 DB 不可达都会让它为 false。**不要**逐项取 `.ok` 输出多个值——`jq -e` 的退出码只看最后一个输出值，而 config 校验失败时 `database` 被记为 `{ok:true, detail:"skipped"}` 排在其后，恰恰在要挡的场景上返回 0。也不要用「全绿」——6 项检查里有 4 项 `ok` 由构造写死为真
-- [ ] 4.5 （非阻塞卫生，何时做都行）在 `ts.mac-mini` 的 `~/inbox-pilot-hangar/.env` 里删掉已退役的键——残留键被 zod 静默丢弃，删不删都不影响启动
+- [x] 4.5 （非阻塞卫生，何时做都行）在 `ts.mac-mini` 的 `~/inbox-pilot-hangar/.env` 里删掉已退役的键——残留键被 zod 静默丢弃，删不删都不影响启动
