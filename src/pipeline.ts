@@ -837,7 +837,7 @@ async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void>
       ctx.emit('account.suspended', { accountId: account.accountId, reason: 'terminal-error' });
       log.warn(
         { kind: 'inbox-account-round-failed', accountId: account.accountId, code: readErrorCode(err) },
-        'gmail 账号本轮意外结束（终态 DB I/O/意外）：本 run suspend、下轮 cron 重试（非持久 disable）',
+        '账号本轮意外结束（终态 DB I/O/意外）：本 run suspend、下轮 cron 重试（非持久 disable）',
       );
       continue;
     }
@@ -999,14 +999,30 @@ async function pollImapAccount(account: ImapAccount, deps: RunDeps): Promise<voi
     const { uidValidity } = await connection.openInbox();
     const parsed = parseImapCursor(await repo.getCursor(accountId));
 
-    if (parsed === null || parsed.uidValidity !== uidValidity) {
-      // 退化轮（首轮 / UIDVALIDITY 变化）本版不实现：其取值规则（floor ①②③④）在
+    if (parsed === null) {
+      // 首轮（无游标）：**必须种一个起算游标**，否则该账号每轮都落回这里、永远不轮询——
+      // 正是本函数要消灭的「enabled 但静默不工作」。种值 = 邮箱现有最大 UID，语义与 `processFrom`
+      // （接入时刻水位线）一致：新接入只处理接入之后的新邮件，不回捞历史积压。
+      // 取 maxUid 与「本轮不处理任何邮件」之间**无窗口**（本轮不搜索、不处理），此后到达的邮件
+      // UID 必 > maxUid、下轮必被增量取回。空邮箱 → maxUid=0 → 下轮 `UID 1:*` 取到届时全部新邮件。
+      const existingUids = await connection.search({ uid: '1:*' });
+      const maxUid = existingUids.length > 0 ? Math.max(...existingUids) : 0;
+      await repo.setCursor(accountId, `${uidValidity}:${maxUid}`);
+      log.info(
+        { kind: 'imap-cursor-seeded', accountId, uidValidity, seededUid: maxUid, existing: existingUids.length },
+        '首轮：种起算游标为邮箱现有最大 UID（只处理此后新邮件），下轮起走增量',
+      );
+      return;
+    }
+
+    if (parsed.uidValidity !== uidValidity) {
+      // UIDVALIDITY 变化（服务端重置 UID 命名空间）本版不实现：其取值规则（floor ①②③④）在
       // `imap-integration` 与 `onboarding-watermark` 之间尚有未收口的互斥，且 163 不返回 UIDNEXT
       // （floor ① 恒不触发）——没有可验证的真实触发场景就写，正是本仓反复出错的那类。
       // 记错、**不写游标**、下轮重试；账号不 suspend。
       log.warn(
-        { kind: 'imap-degraded-round-unsupported', accountId, uidValidity, cursorUidValidity: parsed?.uidValidity ?? null },
-        '退化轮（无游标或 UIDVALIDITY 变化）尚未实现：本轮跳过该账号、不写游标',
+        { kind: 'imap-uidvalidity-changed-unsupported', accountId, uidValidity, cursorUidValidity: parsed.uidValidity },
+        'UIDVALIDITY 变化尚未实现：本轮跳过该账号、不写游标（游标保留，待人工或后续变更处理）',
       );
       return;
     }
@@ -1020,37 +1036,61 @@ async function pollImapAccount(account: ImapAccount, deps: RunDeps): Promise<voi
     let highWater: number | null = null;
     let stopped = false; // 高水位一旦断开，其后即使成功也不再推进（下轮从断点重取）。
 
+    // 高水位必须在**逃逸路径上也落库**：`setCursor` 若只写在循环之后，任何中途逃出的错误
+    // （终态 DB I/O 等）都会让本轮已处理的邮件全部丢失进度、下轮整批重取。故放 finally。
+    try {
     for (const uid of uids) {
       if (deps.now() >= deps.runDeadline) {
         log.warn({ kind: 'imap-run-deadline', accountId }, 'per-run 墙钟兜底：结束本账号本轮（剩余下轮重取）');
         break;
       }
 
-      const fetched = await connection.fetchByUid(uid);
-      if (fetched === null) {
-        // 该 UID 已不存在（expunge）：跳过、不计入推进（高水位停在其前，下轮它已不在搜索结果里）。
+      // IMAP 读侧错误（socket 超时 / 连接断开 / 坏 MIME 使 normalize 抛）在此收敛为**单封失败**，
+      // 与 Gmail 把瞬时读错误归为 `ReadRoundEnd`/`BenignEmailError` 对齐：不逃到账号级。
+      // 逃出去会命中 runPoll 的泛型 catch → emit `account.suspended{reason:'terminal-error'}`，
+      // 把一次瞬时网络抖动报成账号故障。
+      let email: NormalizedEmail;
+      try {
+        const fetched = await connection.fetchByUid(uid);
+        if (fetched === null) {
+          // 该 UID 已不存在（expunge）：跳过、不计入推进（高水位停在其前）。
+          failed += 1;
+          stopped = true;
+          continue;
+        }
+        const messageId = normalizeMessageId(fetched.messageId);
+        email = normalizeEmail({
+          accountId,
+          accountLabel: account.accountLabel,
+          provider: 'imap',
+          // Message-ID 优先（跨重启稳定）；缺失回退 UID 合成键（同一 UIDVALIDITY 期内稳定）。
+          providerMessageId: messageId ?? `imap-uid:${uidValidity}-${uid}`,
+          uid,
+          messageId,
+          subject: fetched.subject,
+          fromName: fetched.fromName,
+          fromEmail: fetched.fromEmail,
+          to: fetched.to,
+          cc: fetched.cc,
+          date: fetched.date,
+          textBody: fetched.textBody ?? '',
+        });
+      } catch (err) {
+        // 只记标量（禁记原始 IMAP 错误 message——其内嵌 host/命令文本不受 key-redact 保护）。
+        log.warn(
+          {
+            kind: 'imap-fetch-failed',
+            accountId,
+            uid,
+            errorName: err instanceof Error ? err.name : 'unknown',
+            errorCode: (err as { code?: unknown })?.code,
+          },
+          '单封 FETCH/normalize 失败：跳过该封、高水位停在其前（下轮重取）',
+        );
         failed += 1;
         stopped = true;
         continue;
       }
-
-      const messageId = normalizeMessageId(fetched.messageId);
-      const email = normalizeEmail({
-        accountId,
-        accountLabel: account.accountLabel,
-        provider: 'imap',
-        // Message-ID 优先（跨重启稳定）；缺失回退 UID 合成键（同一 UIDVALIDITY 期内稳定）。
-        providerMessageId: messageId ?? `imap-uid:${uidValidity}-${uid}`,
-        uid,
-        messageId,
-        subject: fetched.subject,
-        fromName: fetched.fromName,
-        fromEmail: fetched.fromEmail,
-        to: fetched.to,
-        cc: fetched.cc,
-        date: fetched.date,
-        textBody: fetched.textBody ?? '',
-      });
 
       // 去重早退：已处理过的封计入推进（spec「经 dedup 早退跳过的 UID 视同已处理」），不重跑流水线。
       const existing = await repo.findByDedupKey(accountId, email.providerMessageId);
@@ -1098,24 +1138,25 @@ async function pollImapAccount(account: ImapAccount, deps: RunDeps): Promise<voi
       }
     }
 
-    // 游标只增不减：高水位必须严格大于当前游标才写（filter 已挡住反向区间，此为第二层）。
-    if (highWater !== null && highWater > parsed.uid) {
-      await repo.setCursor(accountId, `${uidValidity}:${highWater}`);
+    } finally {
+      // 游标只增不减：高水位必须严格大于当前游标才写（filter 已挡住反向区间，此为第二层）。
+      if (highWater !== null && highWater > parsed.uid) {
+        await repo.setCursor(accountId, `${uidValidity}:${highWater}`);
+      }
+      log.info(
+        {
+          kind: 'imap-poll-round',
+          accountId,
+          isDegraded: false,
+          fetched: uids.length,
+          processed,
+          failed,
+          cursorFrom: parsed.uid,
+          cursorTo: highWater !== null && highWater > parsed.uid ? highWater : parsed.uid,
+        },
+        'imap 轮询完成',
+      );
     }
-
-    log.info(
-      {
-        kind: 'imap-poll-round',
-        accountId,
-        isDegraded: false,
-        fetched: uids.length,
-        processed,
-        failed,
-        cursorFrom: parsed.uid,
-        cursorTo: highWater !== null && highWater > parsed.uid ? highWater : parsed.uid,
-      },
-      'imap 轮询完成',
-    );
   } finally {
     // 用完即关；logout 失败不掩盖上面的原始异常（仅记一条）。
     try {
