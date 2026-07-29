@@ -55,6 +55,8 @@ import {
   type GmailApi,
 } from './providers/gmail/gmailClient.js';
 import { createGmailProvider } from './providers/gmail/gmailActions.js';
+import { createRealImapConnection } from './providers/imap/imapClient.js';
+import { createImapProvider } from './providers/imap/imapActions.js';
 import type { ProviderActions } from './actions/providerActions.js';
 import { toRawEmail } from './providers/gmail/gmailMap.js';
 import { normalizeEmail, type NormalizedEmail } from './normalizer/normalizeEmail.js';
@@ -143,6 +145,7 @@ class BenignEmailError extends Error {
 }
 
 type GmailAccount = Extract<Account, { provider: 'gmail' }>;
+type ImapAccount = Extract<Account, { provider: 'imap' }>;
 
 /** classify seam：默认真实 classifyEmail；测试注入 spy 计调用数（re-poll 复用分类断言，tasks 2.4a）。 */
 type ClassifyFn = (email: NormalizedEmail) => Promise<Classification>;
@@ -725,11 +728,15 @@ async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void>
   const makeProvider =
     overrides?.makeProvider ?? ((accountId: string, gmail: GmailApi) => createGmailProvider(accountId, gmail));
 
-  // §1 scope：Gmail 单账号。加载 enabled 账号、留 gmail。
+  // 加载 enabled 账号，按 provider 分派。**两类都要轮**——此前只留 gmail，使 provider='imap' 的账号
+  // enabled=true、被注册表正常加载、在 account list 里显示为启用，然后在这里被静默丢弃（不报错、不记日志、
+  // doctor 无对应检查项）。下面两处「缺 gmail 条件」的早退也因此必须收窄成「跳过 gmail 分支」，
+  // 不能整轮 return，否则 imap 会跟着一起被跳过。
   const accounts = await loadEnabledAccounts(repo);
   const gmailAccounts = accounts.filter((a): a is GmailAccount => a.provider === 'gmail');
-  if (gmailAccounts.length === 0) {
-    log.info({ kind: 'inbox-no-gmail-accounts' }, '无 enabled gmail 账号：本轮无邮件可处理');
+  const imapAccounts = accounts.filter((a): a is ImapAccount => a.provider === 'imap');
+  if (gmailAccounts.length === 0 && imapAccounts.length === 0) {
+    log.info({ kind: 'inbox-no-accounts' }, '无 enabled 账号：本轮无邮件可处理');
     return;
   }
 
@@ -748,13 +755,14 @@ async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void>
           await repo.updateGmailTokens(id, { refreshToken, scopes: account.scopes });
         },
       }));
-  if (overrides?.makeGmail === undefined && (clientId === undefined || clientSecret === undefined)) {
-    // 缺 gmail app 凭据 → 无法构造 client。非单 run 故障：记日志、run 仍 completed（沿旧「缺键跳过」模式）。
+  // 缺 gmail app 凭据 → 无法构造 client。**只跳过 gmail 分支、不整轮 return**（否则 imap 账号被连坐）。
+  const gmailUsable =
+    overrides?.makeGmail !== undefined || (clientId !== undefined && clientSecret !== undefined);
+  if (!gmailUsable && gmailAccounts.length > 0) {
     log.warn(
       { kind: 'inbox-gmail-app-credentials-missing' },
-      'GMAIL_CLIENT_ID/SECRET 缺失：跳过 gmail 轮询（run 仍 completed）',
+      'GMAIL_CLIENT_ID/SECRET 缺失：跳过 gmail 轮询（imap 照常、run 仍 completed）',
     );
-    return;
   }
 
   const deps: RunDeps = {
@@ -776,7 +784,10 @@ async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void>
   // per-run 内存 suspend set（design D5/§3.3）：本 run 内 break 该账号剩余处理；持久 disable 落 DB（下 run 不再加载）。
   const suspended = new Set<string>();
 
-  for (const account of gmailAccounts) {
+  // 两类账号同处一次 run；gmail 不可用时只落下 gmail 那部分，imap 照常。
+  const pollable: Account[] = [...(gmailUsable ? gmailAccounts : []), ...imapAccounts];
+
+  for (const account of pollable) {
     if (suspended.has(account.accountId)) {
       continue; // 本 run 已 suspend（重复账号条目防御）。
     }
@@ -785,7 +796,11 @@ async function runPoll(ctx: RunContext, overrides?: RunOverrides): Promise<void>
       break;
     }
     try {
-      await pollGmailAccount(account, deps);
+      if (account.provider === 'imap') {
+        await pollImapAccount(account, deps);
+      } else {
+        await pollGmailAccount(account, deps);
+      }
     } catch (err) {
       if (err instanceof ProviderReauthRequired) {
         // 硬 reauth（invalid_grant / scope-403）：**持久** setAccountEnabled(false)（不自愈、防每 tick 猛打
@@ -884,7 +899,22 @@ async function pollGmailAccount(account: GmailAccount, deps: RunDeps): Promise<v
   const toProcess = unprocessed.reverse().slice(0, GET_BUDGET);
 
   const emailDeps: EmailDeps = {
-    gmail,
+    // Gmail 取件端：语义与此前内联在共享链里的那段**逐字一致**（两级读错误分流 §3.1）。
+    fetchNormalized: async (providerMessageId, signal) => {
+      try {
+        const res = await gmail.users.messages.get({ userId: 'me', id: providerMessageId, format: 'full', signal });
+        return normalizeEmail(toRawEmail(res.data, accountId, account.accountLabel));
+      } catch (err) {
+        const cls = classifyReadError(err);
+        if (cls === 'reauth') {
+          throwReauth(accountId, err); // → ProviderReauthRequired（逃出到账号级持久 suspend）。
+        }
+        if (cls === 'end-round') {
+          throw new ReadRoundEnd(); // 429/配额/瞬时 403 → 结束本账号本轮。
+        }
+        throw new BenignEmailError(err); // 良性（坏 MIME/normalize 抛 / 缺 From / 瞬时坏响应 / 5xx message-specific 500）→ 调用方 skip 该封。
+      }
+    },
     provider,
     accountId,
     accountLabel: account.accountLabel,
@@ -918,6 +948,188 @@ async function pollGmailAccount(account: GmailAccount, deps: RunDeps): Promise<v
         return; // 结束本轮（run 仍 completed）。
       }
       throw err; // ProviderReauthRequired → 上抛给 run() 持久 suspend。
+    }
+  }
+}
+
+/** 游标 `<uidValidity>:<uid>` 解析；任何非有限/格式不符 → null（按退化轮处理）。 */
+function parseImapCursor(cursor: string | null): { uidValidity: number; uid: number } | null {
+  const m = /^(\d+):(\d+)$/.exec(cursor ?? '');
+  if (m === null) return null;
+  const uidValidity = Number(m[1]);
+  const uid = Number(m[2]);
+  if (!Number.isSafeInteger(uidValidity) || !Number.isSafeInteger(uid)) return null;
+  return { uidValidity, uid };
+}
+
+/**
+ * Message-ID 规范化：首尾去空白、保留尖括号内内容**逐字**、**不**大小写折叠
+ * （使同一封邮件跨轮产出一致的去重键）。空 / 全空白 → undefined（回退 UID 合成键）。
+ */
+function normalizeMessageId(messageId?: string): string | undefined {
+  const t = messageId?.trim();
+  return t === undefined || t.length === 0 ? undefined : t;
+}
+
+/**
+ * 轮询一个 IMAP 账号（增量轮）。
+ *
+ * **与 Gmail 的两处结构差异，都是 IMAP 协议逼出来的，不是设计选择：**
+ *
+ * 1. **取件必须先于进链**。共享链按 `providerMessageId`（去重键）驱动，而 IMAP 的去重键是
+ *    `Message-ID` 头——FETCH 回来之前根本不知道。Gmail 能在 list 阶段拿到 id 并预过滤，IMAP 不能。
+ *    故本函数自己 fetch/map/normalize，再把已归一的邮件经 `fetchNormalized` 直通给链。
+ *    代价：per-email 超时覆盖不到 fetch 那一段，该段的时间上界由 `createRealImapConnection`
+ *    显式设的 `socketTimeout` 封顶（imapflow 的 fetch 不收 AbortSignal，无法中途取消）。
+ *
+ * 2. **去重早退必须在链外做**。`SEARCH UID N:*` 在无 UID ≥ N 时仍返回**最高** UID
+ *    （RFC 3501；实测 163 对 `9999999999:*` 亦返回最高 UID），所以每一轮都会重新取回最顶那封。
+ *    没有这一步，它会每轮重跑 LLM 分类、重发通知、重标已读。
+ *
+ * **游标推进只认地面真相**：一封是否「已处理」不看链的返回值（链有六个长得一样的 `return` 出口——
+ * 超时、良性错误、多处 fence、notify 耗尽——从调用方看无法区分），而是处理后回库读 `processedAt`。
+ * 高水位停在第一封「未处理」之前，使其下轮被重取（spec「失败邮件下轮重取重试」）。
+ */
+async function pollImapAccount(account: ImapAccount, deps: RunDeps): Promise<void> {
+  const { repo, log } = deps;
+  const accountId = account.accountId;
+  const connection = await createRealImapConnection(account);
+
+  try {
+    const { uidValidity } = await connection.openInbox();
+    const parsed = parseImapCursor(await repo.getCursor(accountId));
+
+    if (parsed === null || parsed.uidValidity !== uidValidity) {
+      // 退化轮（首轮 / UIDVALIDITY 变化）本版不实现：其取值规则（floor ①②③④）在
+      // `imap-integration` 与 `onboarding-watermark` 之间尚有未收口的互斥，且 163 不返回 UIDNEXT
+      // （floor ① 恒不触发）——没有可验证的真实触发场景就写，正是本仓反复出错的那类。
+      // 记错、**不写游标**、下轮重试；账号不 suspend。
+      log.warn(
+        { kind: 'imap-degraded-round-unsupported', accountId, uidValidity, cursorUidValidity: parsed?.uidValidity ?? null },
+        '退化轮（无游标或 UIDVALIDITY 变化）尚未实现：本轮跳过该账号、不写游标',
+      );
+      return;
+    }
+
+    const found = await connection.search({ uid: `${parsed.uid + 1}:*` });
+    // 滤掉 ≤ 游标的 UID：这一行同时消掉 `N:*` 的反向区间（服务器恒返最高 UID）与由它导致的游标倒退。
+    const uids = [...found].filter((u) => u > parsed.uid).sort((a, b) => a - b);
+
+    let processed = 0;
+    let failed = 0;
+    let highWater: number | null = null;
+    let stopped = false; // 高水位一旦断开，其后即使成功也不再推进（下轮从断点重取）。
+
+    for (const uid of uids) {
+      if (deps.now() >= deps.runDeadline) {
+        log.warn({ kind: 'imap-run-deadline', accountId }, 'per-run 墙钟兜底：结束本账号本轮（剩余下轮重取）');
+        break;
+      }
+
+      const fetched = await connection.fetchByUid(uid);
+      if (fetched === null) {
+        // 该 UID 已不存在（expunge）：跳过、不计入推进（高水位停在其前，下轮它已不在搜索结果里）。
+        failed += 1;
+        stopped = true;
+        continue;
+      }
+
+      const messageId = normalizeMessageId(fetched.messageId);
+      const email = normalizeEmail({
+        accountId,
+        accountLabel: account.accountLabel,
+        provider: 'imap',
+        // Message-ID 优先（跨重启稳定）；缺失回退 UID 合成键（同一 UIDVALIDITY 期内稳定）。
+        providerMessageId: messageId ?? `imap-uid:${uidValidity}-${uid}`,
+        uid,
+        messageId,
+        subject: fetched.subject,
+        fromName: fetched.fromName,
+        fromEmail: fetched.fromEmail,
+        to: fetched.to,
+        cc: fetched.cc,
+        date: fetched.date,
+        textBody: fetched.textBody ?? '',
+      });
+
+      // 去重早退：已处理过的封计入推进（spec「经 dedup 早退跳过的 UID 视同已处理」），不重跑流水线。
+      const existing = await repo.findByDedupKey(accountId, email.providerMessageId);
+      if (existing !== null && existing.processedAt !== null) {
+        processed += 1;
+        if (!stopped) highWater = uid;
+        continue;
+      }
+
+      const emailDeps: EmailDeps = {
+        // 已在链外取回：此处直通（IMAP 无法在取件前得到去重键，见函数头注 1）。
+        fetchNormalized: async () => email,
+        provider: createImapProvider(connection),
+        accountId,
+        accountLabel: account.accountLabel,
+        repo,
+        notifier: deps.notifier,
+        classify: deps.classify,
+        ctx: deps.ctx,
+        log,
+        now: deps.now,
+        perEmailTimeoutMs: deps.perEmailTimeoutMs,
+        deadLetterMaxRepolls: deps.deadLetterMaxRepolls,
+        deadLetterStalenessMs: deps.deadLetterStalenessMs,
+        ...(deps.sleep !== undefined ? { sleep: deps.sleep } : {}),
+      };
+
+      await processOneWithTimeout(
+        {
+          providerMessageId: email.providerMessageId,
+          isRevisit: existing !== null,
+          ...(existing !== null ? { existing: { id: existing.id, receivedAt: existing.receivedAt } } : {}),
+        },
+        emailDeps,
+      );
+
+      // 地面真相：回库读 processedAt，而不是信链的返回值（见函数头注）。
+      const after = await repo.findByDedupKey(accountId, email.providerMessageId);
+      if (after !== null && after.processedAt !== null) {
+        processed += 1;
+        if (!stopped) highWater = uid;
+      } else {
+        failed += 1;
+        stopped = true;
+      }
+    }
+
+    // 游标只增不减：高水位必须严格大于当前游标才写（filter 已挡住反向区间，此为第二层）。
+    if (highWater !== null && highWater > parsed.uid) {
+      await repo.setCursor(accountId, `${uidValidity}:${highWater}`);
+    }
+
+    log.info(
+      {
+        kind: 'imap-poll-round',
+        accountId,
+        isDegraded: false,
+        fetched: uids.length,
+        processed,
+        failed,
+        cursorFrom: parsed.uid,
+        cursorTo: highWater !== null && highWater > parsed.uid ? highWater : parsed.uid,
+      },
+      'imap 轮询完成',
+    );
+  } finally {
+    // 用完即关；logout 失败不掩盖上面的原始异常（仅记一条）。
+    try {
+      await connection.logout();
+    } catch (err) {
+      log.warn(
+        {
+          kind: 'imap-logout-failed',
+          accountId,
+          errorName: err instanceof Error ? err.name : 'unknown',
+          errorCode: (err as { code?: unknown })?.code,
+        },
+        'IMAP logout 失败（本轮已结束，下轮新建连接）',
+      );
     }
   }
 }
@@ -970,7 +1182,12 @@ async function fetchListPage(
 }
 
 type EmailDeps = {
-  gmail: GmailApi;
+  /**
+   * 取件端（provider 专属）：取回并归一化为 `NormalizedEmail`，**自带错误分类**——
+   * 需要账号级 suspend 的抛 `ProviderReauthRequired`、需要结束本账号本轮的抛 `ReadRoundEnd`、
+   * 单封良性失败抛 `BenignEmailError`（调用方 skip 该封）。共享链自此往下 provider 无关。
+   */
+  fetchNormalized: (providerMessageId: string, signal: AbortSignal) => Promise<NormalizedEmail>;
   provider: ProviderActions;
   accountId: string;
   accountLabel?: string;
@@ -1056,7 +1273,7 @@ async function processOneEmail(
   deps: EmailDeps,
 ): Promise<void> {
   const { providerMessageId, isRevisit, existing } = item;
-  const { gmail, provider, accountId, accountLabel, repo, notifier, classify, ctx, now } = deps;
+  const { provider, accountId, repo, notifier, classify, ctx, now } = deps;
 
   // —— 死信终态门在**重跑封入口**（get 之前）评估（design D3 §2.3）：仅对已存-未处理封（isRevisit）用**既存行**
   //    的 repollCount + receivedAt 判 `计数≥K ∨ 超 staleness`——门在最开头 ⇒ 封顶所有已落库成因（notify 耗尽 /
@@ -1091,21 +1308,11 @@ async function processOneEmail(
     await repo.incrementRepollCount(rowId); // 未命中 → +1 再跑。
   }
 
-  // —— get → map → normalize（带 best-effort abort signal；两级读错误分层，§3.1）——
-  let email: NormalizedEmail;
-  try {
-    const res = await gmail.users.messages.get({ userId: 'me', id: providerMessageId, format: 'full', signal });
-    email = normalizeEmail(toRawEmail(res.data, accountId, accountLabel));
-  } catch (err) {
-    const cls = classifyReadError(err);
-    if (cls === 'reauth') {
-      throwReauth(accountId, err); // → ProviderReauthRequired（逃出到账号级持久 suspend）。
-    }
-    if (cls === 'end-round') {
-      throw new ReadRoundEnd(); // 429/配额/瞬时 403 → 结束本账号本轮。
-    }
-    throw new BenignEmailError(err); // 良性（坏 MIME/normalize 抛 / 缺 From / 瞬时坏响应 / 5xx message-specific 500）→ 调用方 skip 该封。
-  }
+  // —— get → map → normalize（带 best-effort abort signal）——
+  // 取件端**按 provider 各自实现**并自带错误分类：Gmail 的两级读错误分流（429 → ReadRoundEnd；
+  // 401/scope-403/invalid_grant → ProviderReauthRequired；其余良性 → BenignEmailError）与 IMAP 的
+  // expunge-null 是两套完全不同的错误分类学，强行统一会把两边的分流都拧坏。本链自此往下 provider 无关。
+  const email: NormalizedEmail = await deps.fetchNormalized(providerMessageId, signal);
 
   // fence（get 若曾 hung、超时后晚到 resolve）：释放锁前禁止落库/后续副作用。
   if (fence.aborted) {

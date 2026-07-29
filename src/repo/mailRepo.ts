@@ -248,6 +248,17 @@ export type MailRepo = {
     tokens: { refreshToken: string; scopes?: string[] },
   ): Promise<void>;
 
+  /**
+   * IMAP 增量游标读写（`mail_accounts.lastSyncCursor`，形如 `<uidValidity>:<uid>`）。
+   * 见 `openspec/specs/imap-integration/spec.md`「需求:增量 UID 游标避免重复 FETCH」。
+   *
+   * `setCursor` 只写该列、不触碰其余字段（与 `updateGmailTokens` 同纪律：绝不复活 `enabled`）。
+   * **游标只增不减**由调用方保证——实测 163 对 `SEARCH UID N:*` 在无 UID ≥ N 时仍返回**最高** UID，
+   * 若把它当高水位无条件写回，大量 expunge 后游标会倒退、导致已处理邮件被重扫。
+   */
+  getCursor(accountId: string): Promise<string | null>;
+  setCursor(accountId: string, cursor: string): Promise<void>;
+
   /** 按去重键查已存行（含 processedAt）；未命中返回 null。 */
   findByDedupKey(
     accountId: string,
@@ -577,6 +588,22 @@ export class PrismaMailRepo implements MailRepo {
       scopes: tokens.scopes ?? [GMAIL_MODIFY_SCOPE],
     };
     await prisma.mailAccount.update({ where: { id }, data: { authJson } });
+  }
+
+  async getCursor(accountId: string): Promise<string | null> {
+    const row = await prisma.mailAccount.findUnique({
+      where: { id: accountId },
+      select: { lastSyncCursor: true },
+    });
+    return row?.lastSyncCursor ?? null;
+  }
+
+  async setCursor(accountId: string, cursor: string): Promise<void> {
+    // 只写 lastSyncCursor 一列（同 updateGmailTokens 的纪律：绝不触碰 enabled）。
+    await prisma.mailAccount.update({
+      where: { id: accountId },
+      data: { lastSyncCursor: cursor },
+    });
   }
 
   async findByDedupKey(
