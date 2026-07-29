@@ -23,7 +23,7 @@
     "migrate:deploy": "prisma migrate deploy"
   },
   "dependencies": {
-    "@herbertgao/hangar-notify": "^0.1.0",
+    "@herbertgao/hangar-notify": "^0.2.0",
     "@prisma/client": "^6.1.0",
     "dotenv": "^17.4.2",
     "google-auth-library": "^10.9.0",

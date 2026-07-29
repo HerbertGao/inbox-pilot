@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@herbertgao/hangar-notify':
-        specifier: ^0.1.0
-        version: 0.1.0
+        specifier: ^0.2.0
+        version: 0.2.0
       '@prisma/client':
         specifier: ^6.1.0
         version: 6.19.3(prisma@6.19.3(typescript@7.0.2))(typescript@7.0.2)
@@ -216,8 +216,8 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@herbertgao/hangar-notify@0.1.0':
-    resolution: {integrity: sha512-318inlUtfLPp+Om0z9Us1p4X30z0nm34n+X8tgGVnZz6Z7w5uYMBRfdljtQsQMzbmWgcf5A+RDgkfPSzHC4QPA==}
+  '@herbertgao/hangar-notify@0.2.0':
+    resolution: {integrity: sha512-Z9eUdSMus+HUbYbWhl+zNswR6weybplg78WdYSr/BBE+QcSxfqbGgV/p++DCTGQqMc35PN3ym1bB1NU/hLsTzg==}
     engines: {node: '>=22.18.0'}
     hasBin: true
 
@@ -1041,8 +1041,9 @@ snapshots:
   '@esbuild/win32-x64@0.28.1':
     optional: true
 
-  '@herbertgao/hangar-notify@0.1.0':
+  '@herbertgao/hangar-notify@0.2.0':
     dependencies:
+      dotenv: 17.4.2
       yaml: 2.9.0
       zod: 4.4.3
 
