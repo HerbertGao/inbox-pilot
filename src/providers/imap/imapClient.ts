@@ -188,6 +188,13 @@ export async function createRealImapConnection(
     logger: false,
     // 仅轮询，不需要 IDLE 长连。
     disableAutoIdle: true,
+    // 显式时间上界：per-email 超时的取消手段是 AbortSignal，而 ImapConnection 的方法**不收 signal**
+    // （imapflow 的 fetch/search 无法中途取消），故一次卡住的 IMAP 调用只能靠 socket 层封顶。
+    // 不设时 imapflow 默认是 connect 90s / greeting 16s / socket 300s——单个卡住的 fetch 能把
+    // per-run 墙钟（10min）顶穿，而 hangar 的 in-flight 闸要求 run() 自限时长，挂死会让该 app 再不被调度。
+    connectionTimeout: 15_000,
+    greetingTimeout: 10_000,
+    socketTimeout: 60_000,
   });
   await client.connect();
   return new RealImapConnection(client);

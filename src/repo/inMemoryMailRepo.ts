@@ -68,6 +68,8 @@ type AccountRow = {
   processFrom: Date | null;
   /** 展示别名（notification-mailbox-clarity；NULL → 下游渲染回落 email）。镜像 StoredAccount.label；仅 create 写、update 保留。 */
   label: string | null;
+  /** IMAP 增量游标 `<uidValidity>:<uid>`（imap-integration「增量 UID 游标避免重复 FETCH」）。镜像 mail_accounts.lastSyncCursor。 */
+  lastSyncCursor: string | null;
 };
 
 /**
@@ -129,6 +131,19 @@ export class InMemoryMailRepo implements MailRepo {
     };
   }
 
+  async getCursor(accountId: string): Promise<string | null> {
+    return this.accountsById.get(accountId)?.lastSyncCursor ?? null;
+  }
+
+  async setCursor(accountId: string, cursor: string): Promise<void> {
+    // 只写 lastSyncCursor 一列（同 updateGmailTokens 的纪律）。
+    const row = this.accountsById.get(accountId);
+    if (row === undefined) {
+      throw new Error(`InMemoryMailRepo.setCursor: 未知 accountId ${accountId}`);
+    }
+    row.lastSyncCursor = cursor;
+  }
+
   async upsertAccount(input: AccountWriteInput): Promise<void> {
     // 水位线 get-before-set（onboarding-watermark 决策 7，顺序 load-bearing）：读必须先于下面的 .set，
     // 因 .set 会整行替换、clobber 既有 processFrom。existing 存在（update/re-auth）⇒ 保留 existing.processFrom、
@@ -144,6 +159,10 @@ export class InMemoryMailRepo implements MailRepo {
     // existing（update/re-auth）⇒ 保留 existing.label、**忽略 input**（Prisma 经省略字段达成相同语义）；
     // 不存在（create）⇒ input.label ?? null。
     const label = existing !== undefined ? existing.label : input.label ?? null;
+    // IMAP 游标同一 preserve 路径（Prisma 侧经省略 lastSyncCursor 字段达成相同语义）：
+    // existing（update/re-auth）⇒ 保留既有游标；create ⇒ null（首轮走退化轮）。
+    // 重授权若清掉游标，下一轮会退化成整箱重扫——故此处必须 preserve，不能跟着 authJson 一起重置。
+    const lastSyncCursor = existing !== undefined ? existing.lastSyncCursor : null;
     // 主键 upsert：显式 id（覆盖 cuid）、authJson 含真实凭据、email 非空、enabled 默认 true。
     this.accountsById.set(input.id, {
       id: input.id,
@@ -153,6 +172,7 @@ export class InMemoryMailRepo implements MailRepo {
       enabled: input.enabled ?? true,
       processFrom,
       label,
+      lastSyncCursor,
     });
   }
 
