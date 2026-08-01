@@ -24,8 +24,8 @@ importers:
         specifier: ^173.0.0
         version: 173.0.0
       imapflow:
-        specifier: ^1.4.7
-        version: 1.4.7
+        specifier: ^1.6.3
+        version: 1.6.3
       node-cron:
         specifier: ^4.6.0
         version: 4.6.0
@@ -659,11 +659,11 @@ packages:
     resolution: {integrity: sha512-IKXpvIzjnC9XTAUbVBcMfGS0EPaIXtW6v+zr+RRp+hqULEpo0owZax6wyRwPOJbWbzjYspQwusTsfVr0ifh4uQ==}
     engines: {node: '>=0.10.0'}
 
-  imapflow@1.4.7:
-    resolution: {integrity: sha512-nK03WfN16inwm0//0Q70T21G0g4H9ArMVyzKDRjAshOVV8iw71PP9HTpAXNmWB9giZWfPiS+ltHByi37cqwSgg==}
+  imapflow@1.6.3:
+    resolution: {integrity: sha512-SJEB5fYyvEiTjrdoRK2Gts22TWQjc5lLcc/VxW/2FABj/pWPBsjyvKVQGsiR92rtz6jmqygKjfIoPHhlN6BLWQ==}
 
-  ip-address@10.2.0:
-    resolution: {integrity: sha512-/+S6j4E9AHvW9SWMSEY9Xfy66O5PWvVEJ08O0y5JGyEKQpojb0K0GKpz/v5HJ/G0vi3D2sjGK78119oXZeE0qA==}
+  ip-address@10.4.0:
+    resolution: {integrity: sha512-oSK96Grm3aP6OrS263xVxbNDGVL7rzBtYdpGqlDG8iQdoenDoTs/nkki+DflYbAEE8Xl6o5YxhxlrKvI3nqKXQ==}
     engines: {node: '>= 12'}
 
   is-fullwidth-code-point@3.0.0:
@@ -731,10 +731,6 @@ packages:
   node-fetch@3.3.2:
     resolution: {integrity: sha512-dRB78srN/l6gqWulah9SrxeYnxeddIG30+GOqK/9OlLVyLg3HPnr6SqOWTWOXKRwC2eGYCkZ59NNuSgvSrpgOA==}
     engines: {node: ^12.20.0 || ^14.13.1 || >=16.0.0}
-
-  nodemailer@9.0.3:
-    resolution: {integrity: sha512-n+YP+NKwR5zRWa60k3GiQ6Q3B4KXCoAw40dAKeCtYn020iNN74aWK2liXIC3ZEATeGql7we3tE3t8QwhY0eskw==}
-    engines: {node: '>=6.0.0'}
 
   nypm@0.6.7:
     resolution: {integrity: sha512-s3ds97SD5pd1dULE+tHUk1DrV0cSHOnsfpcdGATJ8JpBo21DoKqN9exTH4/2nhPQNOLomBdTFMicN94S4DrZrQ==}
@@ -1490,7 +1486,7 @@ snapshots:
     dependencies:
       safer-buffer: 2.1.2
 
-  imapflow@1.4.7:
+  imapflow@1.6.3:
     dependencies:
       '@zone-eu/mailsplit': 5.4.14
       encoding-japanese: 2.2.0
@@ -1498,11 +1494,10 @@ snapshots:
       libbase64: 1.3.0
       libmime: 5.4.1
       libqp: 2.1.1
-      nodemailer: 9.0.3
       pino: 10.3.1
       socks: 2.8.9
 
-  ip-address@10.2.0: {}
+  ip-address@10.4.0: {}
 
   is-fullwidth-code-point@3.0.0: {}
 
@@ -1565,8 +1560,6 @@ snapshots:
       data-uri-to-buffer: 4.0.1
       fetch-blob: 3.2.0
       formdata-polyfill: 4.0.10
-
-  nodemailer@9.0.3: {}
 
   nypm@0.6.7:
     dependencies:
@@ -1703,7 +1696,7 @@ snapshots:
 
   socks@2.8.9:
     dependencies:
-      ip-address: 10.2.0
+      ip-address: 10.4.0
       smart-buffer: 4.2.0
 
   sonic-boom@4.2.1:
