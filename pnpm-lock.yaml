@@ -30,8 +30,8 @@ importers:
         specifier: ^4.6.0
         version: 4.6.0
       openai:
-        specifier: ^6.48.0
-        version: 6.48.0(zod@4.4.3)
+        specifier: ^7.4.0
+        version: 7.4.0(zod@4.4.3)
       pino:
         specifier: ^10.3.1
         version: 10.3.1
@@ -748,8 +748,9 @@ packages:
     resolution: {integrity: sha512-0eJJY6hXLGf1udHwfNftBqH+g73EU4B504nZeKpz1sYRKafAghwxEJunB2O7rDZkL4PGfsMVnTXZ2EjibbqcsA==}
     engines: {node: '>=14.0.0'}
 
-  openai@6.48.0:
-    resolution: {integrity: sha512-KhVp+FyV50QrXNextvL9hIU5l6ox5HYuKQjGVk7lIqprgJol90+dQXWONV6S1lRWsKA1bXjrow8RsUT14M1hNA==}
+  openai@7.4.0:
+    resolution: {integrity: sha512-+C9Muit5x8j9R8ej8ZzVgKcrVDtqFqTy9gxFdov0EItLgU68zrJtF9ZeT0cyqJQW9S3PCJkdFgADtRGquRBtew==}
+    engines: {node: '>=22.0.0'}
     peerDependencies:
       '@aws-sdk/credential-provider-node': '>=3.972.0 <4'
       '@smithy/hash-node': '>=4.3.0 <5'
@@ -1573,7 +1574,7 @@ snapshots:
 
   on-exit-leak-free@2.1.2: {}
 
-  openai@6.48.0(zod@4.4.3):
+  openai@7.4.0(zod@4.4.3):
     optionalDependencies:
       zod: 4.4.3
 
